@@ -1,0 +1,17 @@
+[package]
+name = "asn1-editor"
+version = "0.1.0"
+edition = "2021"
+description = "TUI ASN.1 (BER/DER) viewer and hex editor"
+license = "MIT OR Apache-2.0"
+
+[lib]
+name = "asn1_editor"
+path = "src/lib.rs"
+
+[[bin]]
+name = "asn1-editor"
+path = "src/main.rs"
+
+[dependencies]
+ratatui = "0.29"
