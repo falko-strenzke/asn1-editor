@@ -38,6 +38,7 @@ the edited data in the same outer format.
 | `↑`/`k`, `↓`/`j`, `PgUp`/`PgDn`, `g`, `G` | navigate the tree |
 | `←`/`h`, `→`/`l`, `Enter`/`Space` | collapse / expand / toggle |
 | `e` | edit the selected element's content octets as hex |
+| `E` | change the selected element's type (opens the type-picker, keeps the value) |
 | `i` | insert a new element after the selected one (type-picker dialog, then value) |
 | `I` | insert a new element as first child of the selected constructed element |
 | `d` `d` | delete the selected element (press twice to confirm) |
@@ -63,6 +64,12 @@ After confirming, only the value is entered in the hex editor (empty by
 default); identifier and length octets are generated, and the lengths of
 all enclosing elements are recomputed automatically — as for every other
 edit operation.
+
+`E` opens the same dialog for the **selected element**, pre-populated with
+its current class, form and tag. Confirming a different type re-tags the
+element in place while keeping its content octets (switching to a
+constructed form requires the content to be valid ASN.1); the value itself
+is edited separately with `e`.
 
 ## License
 

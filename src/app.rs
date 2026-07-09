@@ -54,33 +54,52 @@ pub const PICKER_CLASSES: [(&str, Class); 4] = [
     ("Private", Class::Private),
 ];
 
-/// Universal tag numbers offered by the picker's tag column.
-pub const PICKER_UNIVERSAL: [(u32, &str); 17] = [
+/// Universal tag numbers offered by the picker's tag column (all named
+/// universal types, so an existing element's type can always be shown).
+pub const PICKER_UNIVERSAL: [(u32, &str); 26] = [
     (1, "BOOLEAN"),
     (2, "INTEGER"),
     (3, "BIT STRING"),
     (4, "OCTET STRING"),
     (5, "NULL"),
     (6, "OBJECT IDENTIFIER"),
+    (7, "ObjectDescriptor"),
+    (8, "EXTERNAL"),
+    (9, "REAL"),
     (10, "ENUMERATED"),
+    (11, "EMBEDDED PDV"),
     (12, "UTF8String"),
     (16, "SEQUENCE"),
     (17, "SET"),
     (18, "NumericString"),
     (19, "PrintableString"),
+    (20, "TeletexString"),
+    (21, "VideotexString"),
     (22, "IA5String"),
     (23, "UTCTime"),
     (24, "GeneralizedTime"),
+    (25, "GraphicString"),
     (26, "VisibleString"),
+    (27, "GeneralString"),
+    (28, "UniversalString"),
     (30, "BMPString"),
 ];
+
+/// What the type-picker dialog acts on.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum PickerTarget {
+    /// Insert a new element at `index` of `parent`'s children.
+    Insert { parent: Vec<usize>, index: usize },
+    /// Change the type of the existing element at `path`, keeping its
+    /// content octets.
+    Retag { path: Vec<usize> },
+}
 
 /// State of the "choose ASN.1 type" popup shown by the insert actions.
 /// One column per bit field of the identifier octet: class (bits 8-7),
 /// form (bit 6, primitive/constructed) and tag number (bits 5-1).
 pub struct PickerState {
-    pub parent: Vec<usize>,
-    pub index: usize,
+    pub target: PickerTarget,
     /// Active column: 0 = class, 1 = form, 2 = tag.
     pub column: usize,
     pub class_idx: usize,
@@ -93,10 +112,9 @@ pub struct PickerState {
 }
 
 impl PickerState {
-    fn new(parent: Vec<usize>, index: usize) -> Self {
+    fn new(target: PickerTarget) -> Self {
         PickerState {
-            parent,
-            index,
+            target,
             column: 2,
             class_idx: 0,
             form_idx: 0,
@@ -329,13 +347,39 @@ impl App {
                 (parent.to_vec(), last + 1)
             }
         };
-        self.mode = Mode::TypePicker(PickerState::new(parent, index));
+        self.mode = Mode::TypePicker(PickerState::new(PickerTarget::Insert { parent, index }));
         self.status = "choose the type of the new element".to_string();
+    }
+
+    /// 'E' opens the type-picker dialog for the selected element,
+    /// pre-populated with its current type; confirming changes the
+    /// identifier octets while keeping the content octets.
+    pub fn start_retag(&mut self) {
+        let Some(row) = self.rows.get(self.selected) else { return };
+        let path = row.path.clone();
+        let Some(node) = self.selected_node() else { return };
+        let mut p = PickerState::new(PickerTarget::Retag { path });
+        p.class_idx = PICKER_CLASSES
+            .iter()
+            .position(|(_, c)| *c == node.class)
+            .unwrap_or(0);
+        p.form_idx = usize::from(node.constructed);
+        if node.class == Class::Universal {
+            p.univ_idx = PICKER_UNIVERSAL
+                .iter()
+                .position(|(t, _)| *t == node.tag)
+                .unwrap_or(0);
+        } else {
+            p.tag_digits = node.tag.to_string();
+        }
+        let name = node.type_name();
+        self.mode = Mode::TypePicker(p);
+        self.status = format!("change type of {} — the value bytes are kept", name);
     }
 
     pub fn cancel_picker(&mut self) {
         self.mode = Mode::Browse;
-        self.status = "insert cancelled".to_string();
+        self.status = "cancelled".to_string();
     }
 
     /// Move between picker columns (class / form / tag).
@@ -382,21 +426,65 @@ impl App {
         }
     }
 
-    /// Enter in the picker: proceed to value entry for the chosen type.
+    /// Enter in the picker: proceed to value entry (insert) or apply the
+    /// new type to the existing element (retag).
     pub fn picker_confirm(&mut self) {
         let Mode::TypePicker(ref p) = self.mode else { return };
         let (class, constructed, tag) = (p.class(), p.constructed(), p.tag());
-        let kind = EditKind::Insert {
-            parent: p.parent.clone(),
-            index: p.index,
-            class,
-            constructed,
-            tag,
-        };
-        self.mode = Mode::Edit(EditState { kind, digits: Vec::new(), cursor: 0, scroll: 0 });
+        match p.target.clone() {
+            PickerTarget::Insert { parent, index } => {
+                let kind = EditKind::Insert { parent, index, class, constructed, tag };
+                self.mode =
+                    Mode::Edit(EditState { kind, digits: Vec::new(), cursor: 0, scroll: 0 });
+                self.status = format!(
+                    "value for new {} — hex content octets (may stay empty), Enter inserts",
+                    ber::type_name_of(class, tag),
+                );
+            }
+            PickerTarget::Retag { path } => self.apply_retag(&path, class, constructed, tag),
+        }
+    }
+
+    /// Give the element at `path` a new identifier (class/form/tag). The
+    /// content octets are preserved; when switching to constructed form
+    /// they must parse as a TLV series.
+    fn apply_retag(&mut self, path: &[usize], class: Class, constructed: bool, tag: u32) {
+        let Some(node) = node_at_mut(&mut self.roots, path) else { return };
+        if node.class == class && node.constructed == constructed && node.tag == tag {
+            self.mode = Mode::Browse;
+            self.status = "type unchanged".to_string();
+            return;
+        }
+        let content = node.content_octets();
+        if constructed {
+            match ber::parse_forest(&content, 0) {
+                Ok(children) => {
+                    node.children = children;
+                    node.value.clear();
+                }
+                Err(e) => {
+                    // Stay in the picker so another choice can be made.
+                    self.status = format!(
+                        "cannot switch to constructed: content is not valid ASN.1 ({})",
+                        e
+                    );
+                    return;
+                }
+            }
+        } else {
+            node.value = content;
+            node.children.clear();
+        }
+        node.encapsulates = false; // re-detected during rebuild()
+        node.class = class;
+        node.constructed = constructed;
+        node.tag = tag;
+        self.mode = Mode::Browse;
+        self.dirty = true;
+        self.rebuild();
         self.status = format!(
-            "value for new {} — hex content octets (may stay empty), Enter inserts",
-            ber::type_name_of(class, tag),
+            "type changed to {} — 's' writes the file",
+            ber::type_name_of(class, tag)
         );
     }
 
@@ -883,6 +971,96 @@ mod tests {
         type_value(&mut app, "0A");
         assert_eq!(ber::encode_forest(&app.roots), [0x02, 0x01, 0x0A]);
         assert_eq!(app.rows.len(), 1);
+    }
+
+    #[test]
+    fn retag_prepopulates_picker_with_current_type() {
+        // SEQUENCE { INTEGER 1 }
+        let data = [0x30, 0x03, 0x02, 0x01, 0x01];
+        let mut app = test_app(&data);
+        app.start_retag();
+        let Mode::TypePicker(ref p) = app.mode else { panic!("picker not open") };
+        assert_eq!(p.class(), Class::Universal);
+        assert!(p.constructed());
+        assert_eq!(p.tag(), ber::TAG_SEQUENCE);
+        assert_eq!(p.target, PickerTarget::Retag { path: vec![0] });
+    }
+
+    #[test]
+    fn retag_integer_to_enumerated_keeps_value() {
+        let data = [0x02, 0x01, 0x2A];
+        let mut app = test_app(&data);
+        app.start_retag();
+        pick_universal(&mut app, ber::TAG_ENUMERATED);
+        assert!(app.dirty);
+        assert_eq!(ber::encode_forest(&app.roots), [0x0A, 0x01, 0x2A]);
+    }
+
+    #[test]
+    fn retag_universal_to_context_specific() {
+        let data = [0x02, 0x01, 0x2A];
+        let mut app = test_app(&data);
+        app.start_retag();
+        {
+            let Mode::TypePicker(ref mut p) = app.mode else { panic!() };
+            p.class_idx = 2; // Context-specific
+            p.form_idx = 0;
+            p.tag_digits = "0".to_string();
+        }
+        app.picker_confirm();
+        assert_eq!(ber::encode_forest(&app.roots), [0x80, 0x01, 0x2A]);
+    }
+
+    #[test]
+    fn retag_primitive_to_constructed_parses_content() {
+        // OCTET STRING whose content is a valid NULL TLV.
+        let data = [0x04, 0x02, 0x05, 0x00];
+        let mut app = test_app(&data);
+        app.select(0);
+        app.start_retag();
+        pick_universal(&mut app, ber::TAG_SEQUENCE);
+        assert_eq!(ber::encode_forest(&app.roots), [0x30, 0x02, 0x05, 0x00]);
+        assert!(app.node_at(&[0]).unwrap().constructed);
+    }
+
+    #[test]
+    fn retag_constructed_to_primitive_keeps_content_octets() {
+        // SEQUENCE { NULL } -> primitive OCTET STRING with the same
+        // content bytes. The form column keeps the element's current
+        // (constructed) form for types where both are legal, so the test
+        // switches it to primitive like a user would.
+        let data = [0x30, 0x02, 0x05, 0x00];
+        let mut app = test_app(&data);
+        app.select(0);
+        app.start_retag();
+        {
+            let Mode::TypePicker(ref mut p) = app.mode else { panic!() };
+            p.form_idx = 0; // primitive
+        }
+        pick_universal(&mut app, ber::TAG_OCTET_STRING);
+        assert_eq!(ber::encode_forest(&app.roots), [0x04, 0x02, 0x05, 0x00]);
+    }
+
+    #[test]
+    fn retag_to_constructed_rejects_invalid_content() {
+        // INTEGER 42: content "2A" is not a TLV series.
+        let data = [0x02, 0x01, 0x2A];
+        let mut app = test_app(&data);
+        app.start_retag();
+        pick_universal(&mut app, ber::TAG_SEQUENCE);
+        assert!(matches!(app.mode, Mode::TypePicker(_)), "must stay in the picker");
+        assert!(!app.dirty);
+        assert_eq!(ber::encode_forest(&app.roots), data);
+    }
+
+    #[test]
+    fn retag_unchanged_type_is_not_dirty() {
+        let data = [0x02, 0x01, 0x2A];
+        let mut app = test_app(&data);
+        app.start_retag();
+        app.picker_confirm(); // picker pre-populated with the current type
+        assert!(matches!(app.mode, Mode::Browse));
+        assert!(!app.dirty);
     }
 
     #[test]

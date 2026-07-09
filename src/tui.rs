@@ -26,7 +26,7 @@ use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph};
 use ratatui::{DefaultTerminal, Frame};
 
 use crate::app::{
-    App, EditKind, Mode, EDIT_BYTES_PER_LINE, EDIT_DIGITS_PER_LINE, PICKER_CLASSES,
+    App, EditKind, Mode, PickerTarget, EDIT_BYTES_PER_LINE, EDIT_DIGITS_PER_LINE, PICKER_CLASSES,
     PICKER_UNIVERSAL,
 };
 use crate::ber::{
@@ -92,6 +92,7 @@ fn handle_browse_key(app: &mut App, key: KeyEvent) -> bool {
         KeyCode::Right | KeyCode::Char('l') => app.expand_or_child(),
         KeyCode::Enter | KeyCode::Char(' ') => app.toggle_expand(),
         KeyCode::Char('e') => app.start_edit(),
+        KeyCode::Char('E') => app.start_retag(),
         KeyCode::Char('i') => app.start_insert(false),
         KeyCode::Char('I') => app.start_insert(true),
         KeyCode::Char('d') => app.delete_selected(),
@@ -327,10 +328,14 @@ fn draw_picker(frame: &mut Frame, app: &App, area: Rect) {
         height,
     };
     frame.render_widget(Clear, popup);
+    let title = match p.target {
+        PickerTarget::Insert { .. } => " INSERT — choose ASN.1 type ",
+        PickerTarget::Retag { .. } => " EDIT TYPE — choose new ASN.1 type ",
+    };
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::new().fg(Color::Yellow))
-        .title(" INSERT — choose ASN.1 type ");
+        .title(title);
     let inner = block.inner(popup);
     frame.render_widget(block, popup);
     let [cols_area, preview_area] =
@@ -558,7 +563,7 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
     let dirty = if app.dirty { " [modified]" } else { "" };
     let hints = match app.mode {
         Mode::Browse => {
-            "q quit  ↑↓ move  ←→ fold  ⏎ toggle  e edit  i/I insert  d delete  J/K reorder  s save  [ ] scroll"
+            "q quit  ↑↓ move  ←→ fold  ⏎ toggle  e edit  E type  i/I insert  d delete  J/K reorder  s save  [ ] scroll"
         }
         Mode::TypePicker(_) => "←→ column  ↑↓ select  0-9 tag number  ⏎ continue  Esc cancel",
         Mode::Edit(_) => "Enter apply  Esc cancel",
