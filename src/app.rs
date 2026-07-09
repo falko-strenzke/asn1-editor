@@ -20,7 +20,19 @@ pub struct Row {
     pub depth: usize,
 }
 
+/// What the hex editor is operating on.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum EditKind {
+    /// Replace the selected node's content octets.
+    Content,
+    /// Insert one or more new elements, typed as complete TLV encodings,
+    /// at position `index` of `parent`'s children (`parent` empty = top
+    /// level).
+    Insert { parent: Vec<usize>, index: usize },
+}
+
 pub struct EditState {
+    pub kind: EditKind,
     /// Hex digits typed so far (no spaces, upper/lower as typed).
     pub digits: Vec<char>,
     /// Cursor position in `digits` (0..=len).
@@ -49,6 +61,8 @@ pub struct App {
     pub dirty: bool,
     /// Set after the first 'q' while there are unsaved changes.
     pub quit_confirm: bool,
+    /// Set after the first 'd'; the second 'd' actually deletes.
+    pub delete_confirm: bool,
     /// Scroll offset of the content pane in browse mode.
     pub content_scroll: u16,
 }
@@ -74,6 +88,7 @@ impl App {
             status: format!("loaded {} bytes ({})", total_len, container.describe()),
             dirty: false,
             quit_confirm: false,
+            delete_confirm: false,
             content_scroll: 0,
         };
         app.rebuild_rows();
@@ -174,9 +189,100 @@ impl App {
             .chars()
             .filter(|c| !c.is_whitespace())
             .collect();
-        self.mode = Mode::Edit(EditState { digits, cursor: 0, scroll: 0 });
+        self.mode = Mode::Edit(EditState { kind: EditKind::Content, digits, cursor: 0, scroll: 0 });
         self.status =
             "editing content octets — type hex digits, Enter applies, Esc cancels".to_string();
+    }
+
+    /// 'i' inserts after the selected element; 'I' (`as_child`) inserts as
+    /// the first child of the selected constructed element. The new
+    /// element is typed in the hex editor as a complete TLV encoding.
+    pub fn start_insert(&mut self, as_child: bool) {
+        let (parent, index) = if self.rows.is_empty() {
+            (Vec::new(), 0) // empty document: insert the first top-level element
+        } else {
+            let path = self.rows[self.selected].path.clone();
+            if as_child {
+                let Some(node) = self.selected_node() else { return };
+                if !node.constructed && !node.encapsulates {
+                    self.status =
+                        "cannot insert a child into a primitive element (use 'i' for a sibling)"
+                            .to_string();
+                    return;
+                }
+                (path, 0)
+            } else {
+                let (last, parent) = path.split_last().expect("row paths are non-empty");
+                (parent.to_vec(), last + 1)
+            }
+        };
+        self.mode = Mode::Edit(EditState {
+            kind: EditKind::Insert { parent, index },
+            digits: Vec::new(),
+            cursor: 0,
+            scroll: 0,
+        });
+        self.status =
+            "inserting: type the complete TLV encoding (tag, length, value) in hex".to_string();
+    }
+
+    /// Move the selected element up (-1) or down (+1) among its siblings.
+    pub fn move_selected(&mut self, delta: isize) {
+        let Some(row) = self.rows.get(self.selected).cloned() else { return };
+        let (&last, parent) = row.path.split_last().expect("row paths are non-empty");
+        let sibling_count = if parent.is_empty() {
+            self.roots.len()
+        } else {
+            node_at(&self.roots, parent).map(|p| p.children.len()).unwrap_or(0)
+        };
+        let target = last as isize + delta;
+        if target < 0 || target >= sibling_count as isize {
+            self.status = "element is already at the edge of its parent".to_string();
+            return;
+        }
+        let target = target as usize;
+        if parent.is_empty() {
+            self.roots.swap(last, target);
+        } else if let Some(p) = node_at_mut(&mut self.roots, parent) {
+            p.children.swap(last, target);
+        }
+        self.dirty = true;
+        self.rebuild();
+        let mut new_path = parent.to_vec();
+        new_path.push(target);
+        if let Some(i) = self.rows.iter().position(|r| r.path == new_path) {
+            self.select(i);
+        }
+        self.status = "element moved — 's' writes the file".to_string();
+    }
+
+    /// Delete the selected element (two-step: the first call only arms the
+    /// confirmation, the second call within the same selection deletes).
+    pub fn delete_selected(&mut self) {
+        let Some(row) = self.rows.get(self.selected).cloned() else { return };
+        if !self.delete_confirm {
+            self.delete_confirm = true;
+            self.status = format!(
+                "delete {} at offset {}? press d again to confirm",
+                self.selected_node().map(|n| n.type_name()).unwrap_or_default(),
+                self.selected_node().map(|n| n.offset).unwrap_or_default(),
+            );
+            return;
+        }
+        self.delete_confirm = false;
+        let (&last, parent) = row.path.split_last().expect("row paths are non-empty");
+        if parent.is_empty() {
+            self.roots.remove(last);
+        } else if let Some(p) = node_at_mut(&mut self.roots, parent) {
+            p.children.remove(last);
+        }
+        self.dirty = true;
+        self.rebuild();
+        self.status = if self.rows.is_empty() {
+            "element deleted — document is now empty ('i' inserts, 's' writes)".to_string()
+        } else {
+            "element deleted — 's' writes the file".to_string()
+        };
     }
 
     pub fn cancel_edit(&mut self) {
@@ -198,6 +304,11 @@ impl App {
                 return;
             }
         };
+
+        if let EditKind::Insert { parent, index } = edit.kind.clone() {
+            self.commit_insert(&bytes, parent, index);
+            return;
+        }
 
         let Some(node) = self.selected_node_mut() else { return };
         if node.constructed {
@@ -226,6 +337,46 @@ impl App {
         self.dirty = true;
         self.rebuild();
         self.status = "value updated — 's' writes the file".to_string();
+    }
+
+    /// Apply an `EditKind::Insert` edit: the typed bytes must be one or
+    /// more complete TLV encodings; they become new children of `parent`
+    /// starting at `index`.
+    fn commit_insert(&mut self, bytes: &[u8], parent: Vec<usize>, index: usize) {
+        let new_nodes = match ber::parse_forest(bytes, 0) {
+            Ok(nodes) if !nodes.is_empty() => nodes,
+            Ok(_) => {
+                self.status =
+                    "nothing to insert — type a complete TLV encoding (e.g. 0500 for NULL)"
+                        .to_string();
+                return;
+            }
+            Err(e) => {
+                self.status = format!("rejected: not a valid TLV encoding ({})", e);
+                return;
+            }
+        };
+        let count = new_nodes.len();
+        if parent.is_empty() {
+            self.roots.splice(index..index, new_nodes);
+        } else {
+            let Some(p) = node_at_mut(&mut self.roots, &parent) else { return };
+            p.children.splice(index..index, new_nodes);
+            p.expanded = true; // make the insertion visible
+        }
+        self.mode = Mode::Browse;
+        self.dirty = true;
+        self.rebuild();
+        let mut path = parent;
+        path.push(index);
+        if let Some(i) = self.rows.iter().position(|r| r.path == path) {
+            self.select(i);
+        }
+        self.status = format!(
+            "inserted {} element{} — 's' writes the file",
+            count,
+            if count == 1 { "" } else { "s" }
+        );
     }
 
     /// Re-encode the whole tree and re-parse it so that every offset,
@@ -341,6 +492,7 @@ mod tests {
         let mut app = test_app(&data);
         app.select(1);
         app.mode = Mode::Edit(EditState {
+            kind: EditKind::Content,
             digits: "010203".chars().collect(),
             cursor: 0,
             scroll: 0,
@@ -362,6 +514,7 @@ mod tests {
         let mut app = test_app(&data);
         app.select(0);
         app.mode = Mode::Edit(EditState {
+            kind: EditKind::Content,
             digits: "05".chars().collect(), // truncated TLV
             cursor: 0,
             scroll: 0,
@@ -373,12 +526,122 @@ mod tests {
     }
 
     #[test]
+    fn delete_needs_confirmation_and_reencodes_parent() {
+        // SEQUENCE { INTEGER 1, NULL }
+        let data = [0x30, 0x05, 0x02, 0x01, 0x01, 0x05, 0x00];
+        let mut app = test_app(&data);
+        app.select(2); // NULL
+        app.delete_selected();
+        assert!(!app.dirty, "first 'd' must only arm the confirmation");
+        assert_eq!(ber::encode_forest(&app.roots), data);
+        app.delete_selected();
+        assert!(app.dirty);
+        assert_eq!(ber::encode_forest(&app.roots), [0x30, 0x03, 0x02, 0x01, 0x01]);
+    }
+
+    #[test]
+    fn delete_last_root_leaves_empty_document() {
+        let data = [0x05, 0x00];
+        let mut app = test_app(&data);
+        app.delete_selected();
+        app.delete_selected();
+        assert!(app.rows.is_empty());
+        assert!(app.selected_node().is_none());
+        assert_eq!(ber::encode_forest(&app.roots), Vec::<u8>::new());
+    }
+
+    #[test]
+    fn reorder_swaps_siblings_and_follows_selection() {
+        // SEQUENCE { INTEGER 1, NULL }
+        let data = [0x30, 0x05, 0x02, 0x01, 0x01, 0x05, 0x00];
+        let mut app = test_app(&data);
+        app.select(1); // INTEGER
+        app.move_selected(1);
+        assert_eq!(ber::encode_forest(&app.roots), [0x30, 0x05, 0x05, 0x00, 0x02, 0x01, 0x01]);
+        // Selection follows the moved element.
+        assert_eq!(app.rows[app.selected].path, vec![0, 1]);
+        // Moving past the last sibling is a no-op.
+        app.move_selected(1);
+        assert_eq!(ber::encode_forest(&app.roots), [0x30, 0x05, 0x05, 0x00, 0x02, 0x01, 0x01]);
+    }
+
+    #[test]
+    fn insert_sibling_after_selected() {
+        // SEQUENCE { INTEGER 1 }
+        let data = [0x30, 0x03, 0x02, 0x01, 0x01];
+        let mut app = test_app(&data);
+        app.select(1); // INTEGER
+        app.start_insert(false);
+        let Mode::Edit(ref mut edit) = app.mode else { panic!("not in edit mode") };
+        edit.digits = "0500".chars().collect(); // NULL
+        app.commit_edit();
+        assert!(app.dirty);
+        assert_eq!(
+            ber::encode_forest(&app.roots),
+            [0x30, 0x05, 0x02, 0x01, 0x01, 0x05, 0x00]
+        );
+        // Selection lands on the inserted element.
+        assert_eq!(app.rows[app.selected].path, vec![0, 1]);
+        assert!(app.selected_node().unwrap().is_universal(ber::TAG_NULL));
+    }
+
+    #[test]
+    fn insert_child_into_empty_constructed() {
+        let data = [0x30, 0x00]; // SEQUENCE {}
+        let mut app = test_app(&data);
+        app.start_insert(true);
+        let Mode::Edit(ref mut edit) = app.mode else { panic!("not in edit mode") };
+        edit.digits = "020107".chars().collect(); // INTEGER 7
+        app.commit_edit();
+        assert_eq!(ber::encode_forest(&app.roots), [0x30, 0x03, 0x02, 0x01, 0x07]);
+    }
+
+    #[test]
+    fn insert_child_into_primitive_is_refused() {
+        let data = [0x02, 0x01, 0x01];
+        let mut app = test_app(&data);
+        app.start_insert(true);
+        assert!(matches!(app.mode, Mode::Browse));
+    }
+
+    #[test]
+    fn insert_rejects_incomplete_tlv() {
+        let data = [0x30, 0x03, 0x02, 0x01, 0x01];
+        let mut app = test_app(&data);
+        app.select(1);
+        app.start_insert(false);
+        let Mode::Edit(ref mut edit) = app.mode else { panic!("not in edit mode") };
+        edit.digits = "05".chars().collect(); // missing length octet
+        app.commit_edit();
+        assert!(matches!(app.mode, Mode::Edit(_)), "invalid insert must stay in edit mode");
+        assert!(!app.dirty);
+        assert_eq!(ber::encode_forest(&app.roots), data);
+    }
+
+    #[test]
+    fn insert_into_empty_document() {
+        let data = [0x05, 0x00];
+        let mut app = test_app(&data);
+        app.delete_selected();
+        app.delete_selected();
+        assert!(app.rows.is_empty());
+        app.start_insert(false);
+        let Mode::Edit(ref mut edit) = app.mode else { panic!("not in edit mode") };
+        // Two top-level elements at once.
+        edit.digits = "02010A0500".chars().collect();
+        app.commit_edit();
+        assert_eq!(ber::encode_forest(&app.roots), [0x02, 0x01, 0x0A, 0x05, 0x00]);
+        assert_eq!(app.rows.len(), 2);
+    }
+
+    #[test]
     fn edit_octet_string_redetects_encapsulation() {
         let data = [0x04, 0x02, 0xAA, 0xBB];
         let mut app = test_app(&data);
         app.select(0);
         // New content is a complete nested INTEGER.
         app.mode = Mode::Edit(EditState {
+            kind: EditKind::Content,
             digits: "02021234".chars().collect(),
             cursor: 0,
             scroll: 0,

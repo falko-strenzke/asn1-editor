@@ -186,9 +186,37 @@ The re-parse in step 3 cannot fail for tree shapes produced in step 2 (our
 own encoder output is always parseable); if it ever did, the previous tree
 is kept and an internal error is shown.
 
-Tag, class and structure edits (insert/delete/re-tag nodes) are out of
-scope for v1; the same value-edit mechanism naturally extends to them
-because a constructed node's full content can already be replaced.
+### Structural edits: insert, delete, reorder
+
+Beyond value edits, the tree structure itself can be changed. All three
+operations mutate the node forest in place and then run the same
+`rebuild()` pipeline as value edits, so enclosing lengths and all offsets
+are recomputed by the one existing mechanism:
+
+* **Insert** (`i` = new sibling after the selection, `I` = new first child
+  of a constructed/encapsulating element): opens the hex editor in
+  `EditKind::Insert` mode. The input is not content octets but one or more
+  **complete TLV encodings** (e.g. `0500` for NULL); it must parse as a
+  valid TLV series, otherwise the insert is rejected non-destructively.
+  Several elements can be inserted at once. This is also how the tag or
+  class of an element is changed in practice: insert the replacement,
+  delete the original (or edit the parent's full content with `e`).
+  Inserting into an empty document (or an empty constructed element) is
+  supported; a collapsed parent is auto-expanded so the insertion is
+  visible, and the selection lands on the first inserted element.
+* **Delete** (`d` twice): removes the selected element and its subtree.
+  The first `d` arms a confirmation shown in the status bar (any other key
+  disarms it); the second `d` deletes. Deleting the last top-level element
+  leaves a valid empty document.
+* **Reorder** (`J`/`K`): swaps the selected element with its next/previous
+  sibling; the selection follows the moved element. Moving past the first
+  or last sibling is a no-op with a status message.
+
+A structural edit inside an *encapsulating* OCTET/BIT STRING can change
+what the encapsulation heuristic sees (e.g. two items no longer "fill the
+value exactly" as one); after the rebuild such a node is then displayed as
+a plain primitive value again — consistent with what dumpasn1 would show
+for the resulting bytes.
 
 ## 8. Input containers
 
@@ -239,6 +267,10 @@ Built with ratatui 0.29 (bundled crossterm backend, `ratatui::init()` /
 | `→`/`l` | expand node, or enter first child |
 | `Enter`/`Space` | toggle fold |
 | `e` | edit selected element's content octets (hex) |
+| `i` | insert new element(s) after the selection, typed as full TLV hex |
+| `I` | insert new element(s) as first child of a constructed element |
+| `d` `d` | delete selected element (first press arms a confirmation) |
+| `J` / `K` | move selected element down / up among its siblings |
 | `Enter` / `Esc` | (edit mode) apply / cancel |
 | `s` | save (re-encode + re-wrap container) |
 | `[` / `]` | scroll content pane |
@@ -291,8 +323,9 @@ certificate bundle (`[0]` constructed, empty SET, deep nesting).
   to DER framing; a byte-preserving mode would require storing original
   header bytes.
 * No undo stack (single-level: quit without saving).
-* Editing changes values only; inserting/deleting siblings or changing
-  tags requires editing the parent's full content in hex.
+* No direct re-tagging of an element; change a tag by inserting a
+  replacement TLV and deleting the original, or by editing the parent's
+  full content in hex.
 * OID names come from a small built-in table; parsing `dumpasn1.cfg` for
   full name coverage would be a natural extension.
 * Value display for exotic universal types (REAL, EMBEDDED PDV, …) falls

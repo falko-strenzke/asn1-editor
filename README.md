@@ -38,6 +38,10 @@ the edited data in the same outer format.
 | `↑`/`k`, `↓`/`j`, `PgUp`/`PgDn`, `g`, `G` | navigate the tree |
 | `←`/`h`, `→`/`l`, `Enter`/`Space` | collapse / expand / toggle |
 | `e` | edit the selected element's content octets as hex |
+| `i` | insert a new element after the selected one (typed as full TLV hex) |
+| `I` | insert a new element as first child of the selected constructed element |
+| `d` `d` | delete the selected element (press twice to confirm) |
+| `J` / `K` | move the selected element down / up among its siblings |
 | `Enter` / `Esc` | apply / cancel the edit |
 | `s` | save |
 | `[` / `]` | scroll the content pane |
@@ -47,3 +51,9 @@ Editing notes: the hex editor works on the element's *content octets*
 (for BIT STRING including the leading unused-bits octet). Lengths of all
 enclosing elements are recomputed automatically. Content of constructed
 elements must remain valid ASN.1, otherwise the edit is rejected.
+
+Inserting (`i`/`I`) opens the same hex editor, but the input is one or
+more *complete TLV encodings* (tag, length, value — e.g. `0500` for NULL,
+`020107` for INTEGER 7); it is validated before being spliced into the
+tree. Delete, insert and reorder all re-encode the enclosing lengths
+automatically, like value edits.

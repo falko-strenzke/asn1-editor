@@ -11,7 +11,7 @@ use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph};
 use ratatui::{DefaultTerminal, Frame};
 
-use crate::app::{App, Mode, EDIT_BYTES_PER_LINE, EDIT_DIGITS_PER_LINE};
+use crate::app::{App, EditKind, Mode, EDIT_BYTES_PER_LINE, EDIT_DIGITS_PER_LINE};
 use crate::ber::{
     self, Class, Node, TAG_BIT_STRING, TAG_BOOLEAN, TAG_GENERALIZED_TIME, TAG_INTEGER, TAG_NULL,
     TAG_OID, TAG_UTC_TIME,
@@ -51,6 +51,9 @@ fn handle_browse_key(app: &mut App, key: KeyEvent) -> bool {
     if key.code != KeyCode::Char('q') {
         app.quit_confirm = false;
     }
+    if key.code != KeyCode::Char('d') {
+        app.delete_confirm = false;
+    }
     match key.code {
         KeyCode::Char('q') => {
             if !app.dirty || app.quit_confirm {
@@ -69,6 +72,11 @@ fn handle_browse_key(app: &mut App, key: KeyEvent) -> bool {
         KeyCode::Right | KeyCode::Char('l') => app.expand_or_child(),
         KeyCode::Enter | KeyCode::Char(' ') => app.toggle_expand(),
         KeyCode::Char('e') => app.start_edit(),
+        KeyCode::Char('i') => app.start_insert(false),
+        KeyCode::Char('I') => app.start_insert(true),
+        KeyCode::Char('d') => app.delete_selected(),
+        KeyCode::Char('K') => app.move_selected(-1),
+        KeyCode::Char('J') => app.move_selected(1),
         KeyCode::Char('s') => app.save(),
         KeyCode::Char('[') => app.content_scroll = app.content_scroll.saturating_sub(4),
         KeyCode::Char(']') => app.content_scroll = app.content_scroll.saturating_add(4),
@@ -379,16 +387,23 @@ fn draw_content_edit(frame: &mut Frame, app: &mut App, area: Rect) {
         lines.push(Line::from(spans));
     }
 
-    lines.push(Line::from(Span::styled(
-        "[Enter] apply   [Esc] cancel   [←→↑↓] move   type hex digits to insert",
-        Style::new().dim(),
-    )));
+    let (title, hint) = match edit.kind {
+        EditKind::Content => (
+            " EDIT — content octets (hex) ",
+            "[Enter] apply   [Esc] cancel   [←→↑↓] move   type hex digits to insert",
+        ),
+        EditKind::Insert { .. } => (
+            " INSERT — new element(s) as complete TLV (hex) ",
+            "[Enter] insert   [Esc] cancel   type tag, length and value — e.g. 0500 for NULL",
+        ),
+    };
+    lines.push(Line::from(Span::styled(hint, Style::new().dim())));
 
     let para = Paragraph::new(lines).block(
         Block::default()
             .borders(Borders::ALL)
             .border_style(Style::new().fg(Color::Yellow))
-            .title(" EDIT — content octets (hex) "),
+            .title(title),
     );
     frame.render_widget(para, area);
 }
@@ -396,7 +411,9 @@ fn draw_content_edit(frame: &mut Frame, app: &mut App, area: Rect) {
 fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
     let dirty = if app.dirty { " [modified]" } else { "" };
     let hints = match app.mode {
-        Mode::Browse => "q quit  ↑↓ move  ←→ fold  ⏎ toggle  e edit  s save  [ ] scroll",
+        Mode::Browse => {
+            "q quit  ↑↓ move  ←→ fold  ⏎ toggle  e edit  i/I insert  d delete  J/K reorder  s save  [ ] scroll"
+        }
         Mode::Edit(_) => "Enter apply  Esc cancel",
     };
     let line = Line::from(vec![
