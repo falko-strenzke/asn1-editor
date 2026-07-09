@@ -77,15 +77,27 @@ pub struct Node {
     pub expanded: bool,
 }
 
+/// Type label using dumpasn1's naming, for any class/tag combination.
+pub fn type_name_of(class: Class, tag: u32) -> String {
+    match class {
+        Class::Universal => universal_tag_name(tag).to_string(),
+        Class::Application => format!("[APPLICATION {}]", tag),
+        Class::ContextSpecific => format!("[{}]", tag),
+        Class::Private => format!("[PRIVATE {}]", tag),
+    }
+}
+
+/// Encode just the identifier octets of a tag (used for previews).
+pub fn identifier_octets(class: Class, tag: u32, constructed: bool) -> Vec<u8> {
+    let mut out = Vec::new();
+    write_identifier(class, tag, constructed, &mut out);
+    out
+}
+
 impl Node {
     /// Type label using dumpasn1's naming.
     pub fn type_name(&self) -> String {
-        match self.class {
-            Class::Universal => universal_tag_name(self.tag).to_string(),
-            Class::Application => format!("[APPLICATION {}]", self.tag),
-            Class::ContextSpecific => format!("[{}]", self.tag),
-            Class::Private => format!("[PRIVATE {}]", self.tag),
-        }
+        type_name_of(self.class, self.tag)
     }
 
     pub fn is_universal(&self, tag: u32) -> bool {

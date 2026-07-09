@@ -38,7 +38,7 @@ the edited data in the same outer format.
 | `↑`/`k`, `↓`/`j`, `PgUp`/`PgDn`, `g`, `G` | navigate the tree |
 | `←`/`h`, `→`/`l`, `Enter`/`Space` | collapse / expand / toggle |
 | `e` | edit the selected element's content octets as hex |
-| `i` | insert a new element after the selected one (typed as full TLV hex) |
+| `i` | insert a new element after the selected one (type-picker dialog, then value) |
 | `I` | insert a new element as first child of the selected constructed element |
 | `d` `d` | delete the selected element (press twice to confirm) |
 | `J` / `K` | move the selected element down / up among its siblings |
@@ -52,11 +52,17 @@ Editing notes: the hex editor works on the element's *content octets*
 enclosing elements are recomputed automatically. Content of constructed
 elements must remain valid ASN.1, otherwise the edit is rejected.
 
-Inserting (`i`/`I`) opens the same hex editor, but the input is one or
-more *complete TLV encodings* (tag, length, value — e.g. `0500` for NULL,
-`020107` for INTEGER 7); it is validated before being spliced into the
-tree. Delete, insert and reorder all re-encode the enclosing lengths
-automatically, like value edits.
+Inserting (`i`/`I`) first opens a popup dialog to choose the ASN.1 type,
+with one column per bit field of the identifier octet: **class**
+(universal / application / context-specific / private, bits 8-7), **form**
+(primitive / constructed, bit 6) and **tag number** (bits 5-1; a list of
+the named universal types, or a typed number for the other classes).
+Illegal form combinations (e.g. primitive SEQUENCE) are ruled out
+automatically and the resulting identifier octets are previewed live.
+After confirming, only the value is entered in the hex editor (empty by
+default); identifier and length octets are generated, and the lengths of
+all enclosing elements are recomputed automatically — as for every other
+edit operation.
 
 ## License
 

@@ -19,7 +19,7 @@ use std::path::PathBuf;
 
 use ratatui::widgets::ListState;
 
-use crate::ber::{self, Node};
+use crate::ber::{self, Class, Node};
 use crate::input::{self, Container};
 
 /// Bytes per line in the hex editor; the cursor moves in units of hex digits.
@@ -39,10 +39,107 @@ pub struct Row {
 pub enum EditKind {
     /// Replace the selected node's content octets.
     Content,
-    /// Insert one or more new elements, typed as complete TLV encodings,
-    /// at position `index` of `parent`'s children (`parent` empty = top
-    /// level).
-    Insert { parent: Vec<usize>, index: usize },
+    /// Insert a new element with the type chosen in the picker dialog at
+    /// position `index` of `parent`'s children (`parent` empty = top
+    /// level). Only the value (content octets) is typed; identifier and
+    /// length octets are generated.
+    Insert { parent: Vec<usize>, index: usize, class: Class, constructed: bool, tag: u32 },
+}
+
+/// Choices of the type-picker dialog, one entry per class-bits value.
+pub const PICKER_CLASSES: [(&str, Class); 4] = [
+    ("Universal", Class::Universal),
+    ("Application", Class::Application),
+    ("Context-specific", Class::ContextSpecific),
+    ("Private", Class::Private),
+];
+
+/// Universal tag numbers offered by the picker's tag column.
+pub const PICKER_UNIVERSAL: [(u32, &str); 17] = [
+    (1, "BOOLEAN"),
+    (2, "INTEGER"),
+    (3, "BIT STRING"),
+    (4, "OCTET STRING"),
+    (5, "NULL"),
+    (6, "OBJECT IDENTIFIER"),
+    (10, "ENUMERATED"),
+    (12, "UTF8String"),
+    (16, "SEQUENCE"),
+    (17, "SET"),
+    (18, "NumericString"),
+    (19, "PrintableString"),
+    (22, "IA5String"),
+    (23, "UTCTime"),
+    (24, "GeneralizedTime"),
+    (26, "VisibleString"),
+    (30, "BMPString"),
+];
+
+/// State of the "choose ASN.1 type" popup shown by the insert actions.
+/// One column per bit field of the identifier octet: class (bits 8-7),
+/// form (bit 6, primitive/constructed) and tag number (bits 5-1).
+pub struct PickerState {
+    pub parent: Vec<usize>,
+    pub index: usize,
+    /// Active column: 0 = class, 1 = form, 2 = tag.
+    pub column: usize,
+    pub class_idx: usize,
+    /// 0 = primitive, 1 = constructed (may be overridden, see `forced_form`).
+    pub form_idx: usize,
+    /// Selection in the universal-type list (class = Universal).
+    pub univ_idx: usize,
+    /// Typed tag number (classes other than Universal).
+    pub tag_digits: String,
+}
+
+impl PickerState {
+    fn new(parent: Vec<usize>, index: usize) -> Self {
+        PickerState {
+            parent,
+            index,
+            column: 2,
+            class_idx: 0,
+            form_idx: 0,
+            univ_idx: 0,
+            tag_digits: String::new(),
+        }
+    }
+
+    pub fn class(&self) -> Class {
+        PICKER_CLASSES[self.class_idx].1
+    }
+
+    pub fn tag(&self) -> u32 {
+        if self.class() == Class::Universal {
+            PICKER_UNIVERSAL[self.univ_idx].0
+        } else {
+            self.tag_digits.parse().unwrap_or(0)
+        }
+    }
+
+    /// Some universal types only exist in one form: SEQUENCE/SET are
+    /// always constructed, the scalar types always primitive. Returns the
+    /// mandated form, or None when both are legal (string types in BER).
+    pub fn forced_form(&self) -> Option<bool> {
+        if self.class() != Class::Universal {
+            return None;
+        }
+        match self.tag() {
+            ber::TAG_SEQUENCE | ber::TAG_SET => Some(true),
+            1 | 2 | 5 | 6 | 9 | 10 | 13 | 23 | 24 => Some(false),
+            _ => None,
+        }
+    }
+
+    /// Effective constructed bit after applying `forced_form`.
+    pub fn constructed(&self) -> bool {
+        self.forced_form().unwrap_or(self.form_idx == 1)
+    }
+
+    /// Identifier octets of the current choice, for the live preview.
+    pub fn identifier_preview(&self) -> Vec<u8> {
+        ber::identifier_octets(self.class(), self.tag(), self.constructed())
+    }
 }
 
 pub struct EditState {
@@ -57,6 +154,8 @@ pub struct EditState {
 
 pub enum Mode {
     Browse,
+    /// Type-picker popup of the insert actions.
+    TypePicker(PickerState),
     Edit(EditState),
 }
 
@@ -209,8 +308,8 @@ impl App {
     }
 
     /// 'i' inserts after the selected element; 'I' (`as_child`) inserts as
-    /// the first child of the selected constructed element. The new
-    /// element is typed in the hex editor as a complete TLV encoding.
+    /// the first child of the selected constructed element. Both open the
+    /// type-picker dialog; the value is typed afterwards.
     pub fn start_insert(&mut self, as_child: bool) {
         let (parent, index) = if self.rows.is_empty() {
             (Vec::new(), 0) // empty document: insert the first top-level element
@@ -230,14 +329,75 @@ impl App {
                 (parent.to_vec(), last + 1)
             }
         };
-        self.mode = Mode::Edit(EditState {
-            kind: EditKind::Insert { parent, index },
-            digits: Vec::new(),
-            cursor: 0,
-            scroll: 0,
-        });
-        self.status =
-            "inserting: type the complete TLV encoding (tag, length, value) in hex".to_string();
+        self.mode = Mode::TypePicker(PickerState::new(parent, index));
+        self.status = "choose the type of the new element".to_string();
+    }
+
+    pub fn cancel_picker(&mut self) {
+        self.mode = Mode::Browse;
+        self.status = "insert cancelled".to_string();
+    }
+
+    /// Move between picker columns (class / form / tag).
+    pub fn picker_move_column(&mut self, delta: isize) {
+        if let Mode::TypePicker(ref mut p) = self.mode {
+            p.column = (p.column as isize + delta).rem_euclid(3) as usize;
+        }
+    }
+
+    /// Move the selection inside the active picker column.
+    pub fn picker_move_selection(&mut self, delta: isize) {
+        let Mode::TypePicker(ref mut p) = self.mode else { return };
+        let step = |v: usize, max: usize| -> usize {
+            (v as isize + delta).clamp(0, max as isize - 1) as usize
+        };
+        match p.column {
+            0 => p.class_idx = step(p.class_idx, PICKER_CLASSES.len()),
+            1 => p.form_idx = step(p.form_idx, 2),
+            _ => {
+                if p.class() == Class::Universal {
+                    p.univ_idx = step(p.univ_idx, PICKER_UNIVERSAL.len());
+                } else {
+                    // Up/down also adjusts the numeric tag.
+                    let tag = (p.tag_digits.parse::<i64>().unwrap_or(0) + delta as i64).max(0);
+                    p.tag_digits = tag.to_string();
+                }
+            }
+        }
+    }
+
+    /// Digit input for the tag-number field (non-universal classes).
+    pub fn picker_digit(&mut self, c: char) {
+        if let Mode::TypePicker(ref mut p) = self.mode {
+            if p.class() != Class::Universal && p.tag_digits.len() < 8 {
+                p.tag_digits.push(c);
+                p.column = 2;
+            }
+        }
+    }
+
+    pub fn picker_backspace(&mut self) {
+        if let Mode::TypePicker(ref mut p) = self.mode {
+            p.tag_digits.pop();
+        }
+    }
+
+    /// Enter in the picker: proceed to value entry for the chosen type.
+    pub fn picker_confirm(&mut self) {
+        let Mode::TypePicker(ref p) = self.mode else { return };
+        let (class, constructed, tag) = (p.class(), p.constructed(), p.tag());
+        let kind = EditKind::Insert {
+            parent: p.parent.clone(),
+            index: p.index,
+            class,
+            constructed,
+            tag,
+        };
+        self.mode = Mode::Edit(EditState { kind, digits: Vec::new(), cursor: 0, scroll: 0 });
+        self.status = format!(
+            "value for new {} — hex content octets (may stay empty), Enter inserts",
+            ber::type_name_of(class, tag),
+        );
     }
 
     /// Move the selected element up (-1) or down (+1) among its siblings.
@@ -319,8 +479,8 @@ impl App {
             }
         };
 
-        if let EditKind::Insert { parent, index } = edit.kind.clone() {
-            self.commit_insert(&bytes, parent, index);
+        if let EditKind::Insert { parent, index, class, constructed, tag } = edit.kind.clone() {
+            self.commit_insert(&bytes, parent, index, class, constructed, tag);
             return;
         }
 
@@ -353,29 +513,51 @@ impl App {
         self.status = "value updated — 's' writes the file".to_string();
     }
 
-    /// Apply an `EditKind::Insert` edit: the typed bytes must be one or
-    /// more complete TLV encodings; they become new children of `parent`
-    /// starting at `index`.
-    fn commit_insert(&mut self, bytes: &[u8], parent: Vec<usize>, index: usize) {
-        let new_nodes = match ber::parse_forest(bytes, 0) {
-            Ok(nodes) if !nodes.is_empty() => nodes,
-            Ok(_) => {
-                self.status =
-                    "nothing to insert — type a complete TLV encoding (e.g. 0500 for NULL)"
-                        .to_string();
-                return;
-            }
-            Err(e) => {
-                self.status = format!("rejected: not a valid TLV encoding ({})", e);
-                return;
-            }
+    /// Apply an `EditKind::Insert` edit: build the new element from the
+    /// picked type and the typed content octets, and splice it into
+    /// `parent` at `index`. Identifier and length octets are generated by
+    /// the encoder; the length is derived from the value automatically.
+    fn commit_insert(
+        &mut self,
+        bytes: &[u8],
+        parent: Vec<usize>,
+        index: usize,
+        class: Class,
+        constructed: bool,
+        tag: u32,
+    ) {
+        let mut node = Node {
+            class,
+            tag,
+            constructed,
+            indefinite: false,
+            offset: 0,      // recomputed by rebuild()
+            header_len: 0,  // recomputed by rebuild()
+            content_len: bytes.len(),
+            value: Vec::new(),
+            children: Vec::new(),
+            encapsulates: false,
+            expanded: true,
         };
-        let count = new_nodes.len();
+        if constructed {
+            match ber::parse_forest(bytes, 0) {
+                Ok(children) => node.children = children,
+                Err(e) => {
+                    self.status = format!(
+                        "rejected: content of a constructed element must be valid ASN.1 ({})",
+                        e
+                    );
+                    return;
+                }
+            }
+        } else {
+            node.value = bytes.to_vec();
+        }
         if parent.is_empty() {
-            self.roots.splice(index..index, new_nodes);
+            self.roots.insert(index, node);
         } else {
             let Some(p) = node_at_mut(&mut self.roots, &parent) else { return };
-            p.children.splice(index..index, new_nodes);
+            p.children.insert(index, node);
             p.expanded = true; // make the insertion visible
         }
         self.mode = Mode::Browse;
@@ -387,9 +569,8 @@ impl App {
             self.select(i);
         }
         self.status = format!(
-            "inserted {} element{} — 's' writes the file",
-            count,
-            if count == 1 { "" } else { "s" }
+            "inserted {} — 's' writes the file",
+            ber::type_name_of(class, tag)
         );
     }
 
@@ -579,16 +760,43 @@ mod tests {
         assert_eq!(ber::encode_forest(&app.roots), [0x30, 0x05, 0x05, 0x00, 0x02, 0x01, 0x01]);
     }
 
+    /// Select a universal type in the (open) picker by tag number.
+    fn pick_universal(app: &mut App, tag: u32) {
+        let Mode::TypePicker(ref mut p) = app.mode else { panic!("picker not open") };
+        p.univ_idx = PICKER_UNIVERSAL
+            .iter()
+            .position(|(t, _)| *t == tag)
+            .expect("tag offered by picker");
+        app.picker_confirm();
+    }
+
+    fn type_value(app: &mut App, hex: &str) {
+        let Mode::Edit(ref mut edit) = app.mode else { panic!("not in edit mode") };
+        edit.digits = hex.chars().collect();
+        app.commit_edit();
+    }
+
+    #[test]
+    fn insert_opens_type_picker() {
+        let data = [0x30, 0x03, 0x02, 0x01, 0x01];
+        let mut app = test_app(&data);
+        app.select(1);
+        app.start_insert(false);
+        assert!(matches!(app.mode, Mode::TypePicker(_)));
+        app.cancel_picker();
+        assert!(matches!(app.mode, Mode::Browse));
+        assert_eq!(ber::encode_forest(&app.roots), data);
+    }
+
     #[test]
     fn insert_sibling_after_selected() {
-        // SEQUENCE { INTEGER 1 }
+        // SEQUENCE { INTEGER 1 }, insert a NULL behind the INTEGER.
         let data = [0x30, 0x03, 0x02, 0x01, 0x01];
         let mut app = test_app(&data);
         app.select(1); // INTEGER
         app.start_insert(false);
-        let Mode::Edit(ref mut edit) = app.mode else { panic!("not in edit mode") };
-        edit.digits = "0500".chars().collect(); // NULL
-        app.commit_edit();
+        pick_universal(&mut app, ber::TAG_NULL);
+        type_value(&mut app, ""); // empty value is the default
         assert!(app.dirty);
         assert_eq!(
             ber::encode_forest(&app.roots),
@@ -604,9 +812,9 @@ mod tests {
         let data = [0x30, 0x00]; // SEQUENCE {}
         let mut app = test_app(&data);
         app.start_insert(true);
-        let Mode::Edit(ref mut edit) = app.mode else { panic!("not in edit mode") };
-        edit.digits = "020107".chars().collect(); // INTEGER 7
-        app.commit_edit();
+        pick_universal(&mut app, ber::TAG_INTEGER);
+        type_value(&mut app, "07");
+        // Length octets of element and parent were derived automatically.
         assert_eq!(ber::encode_forest(&app.roots), [0x30, 0x03, 0x02, 0x01, 0x07]);
     }
 
@@ -619,14 +827,45 @@ mod tests {
     }
 
     #[test]
-    fn insert_rejects_incomplete_tlv() {
+    fn picker_forces_constructed_for_sequence() {
+        let data = [0x02, 0x01, 0x01];
+        let mut app = test_app(&data);
+        app.start_insert(false);
+        {
+            let Mode::TypePicker(ref mut p) = app.mode else { panic!() };
+            p.form_idx = 0; // user left "Primitive" selected
+        }
+        pick_universal(&mut app, ber::TAG_SEQUENCE);
+        type_value(&mut app, "");
+        // Encoded with the constructed bit set: 0x30, not 0x10.
+        assert_eq!(ber::encode_forest(&app.roots), [0x02, 0x01, 0x01, 0x30, 0x00]);
+    }
+
+    #[test]
+    fn picker_context_specific_tag_number() {
+        let data = [0x30, 0x00];
+        let mut app = test_app(&data);
+        app.start_insert(true);
+        {
+            let Mode::TypePicker(ref mut p) = app.mode else { panic!() };
+            p.class_idx = 2; // Context-specific
+            p.form_idx = 1; // Constructed
+            p.tag_digits = "3".to_string();
+            assert_eq!(ber::hex_pairs(&p.identifier_preview()), "A3");
+        }
+        app.picker_confirm();
+        type_value(&mut app, "0500"); // [3] { NULL }
+        assert_eq!(ber::encode_forest(&app.roots), [0x30, 0x04, 0xA3, 0x02, 0x05, 0x00]);
+    }
+
+    #[test]
+    fn insert_constructed_rejects_invalid_content() {
         let data = [0x30, 0x03, 0x02, 0x01, 0x01];
         let mut app = test_app(&data);
         app.select(1);
         app.start_insert(false);
-        let Mode::Edit(ref mut edit) = app.mode else { panic!("not in edit mode") };
-        edit.digits = "05".chars().collect(); // missing length octet
-        app.commit_edit();
+        pick_universal(&mut app, ber::TAG_SEQUENCE);
+        type_value(&mut app, "0501"); // truncated TLV as content
         assert!(matches!(app.mode, Mode::Edit(_)), "invalid insert must stay in edit mode");
         assert!(!app.dirty);
         assert_eq!(ber::encode_forest(&app.roots), data);
@@ -640,12 +879,10 @@ mod tests {
         app.delete_selected();
         assert!(app.rows.is_empty());
         app.start_insert(false);
-        let Mode::Edit(ref mut edit) = app.mode else { panic!("not in edit mode") };
-        // Two top-level elements at once.
-        edit.digits = "02010A0500".chars().collect();
-        app.commit_edit();
-        assert_eq!(ber::encode_forest(&app.roots), [0x02, 0x01, 0x0A, 0x05, 0x00]);
-        assert_eq!(app.rows.len(), 2);
+        pick_universal(&mut app, ber::TAG_INTEGER);
+        type_value(&mut app, "0A");
+        assert_eq!(ber::encode_forest(&app.roots), [0x02, 0x01, 0x0A]);
+        assert_eq!(app.rows.len(), 1);
     }
 
     #[test]

@@ -22,10 +22,13 @@ use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind};
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph};
+use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph};
 use ratatui::{DefaultTerminal, Frame};
 
-use crate::app::{App, EditKind, Mode, EDIT_BYTES_PER_LINE, EDIT_DIGITS_PER_LINE};
+use crate::app::{
+    App, EditKind, Mode, EDIT_BYTES_PER_LINE, EDIT_DIGITS_PER_LINE, PICKER_CLASSES,
+    PICKER_UNIVERSAL,
+};
 use crate::ber::{
     self, Class, Node, TAG_BIT_STRING, TAG_BOOLEAN, TAG_GENERALIZED_TIME, TAG_INTEGER, TAG_NULL,
     TAG_OID, TAG_UTC_TIME,
@@ -51,11 +54,14 @@ fn event_loop(terminal: &mut DefaultTerminal, app: &mut App) -> io::Result<()> {
         if key.kind != KeyEventKind::Press {
             continue;
         }
-        let editing = matches!(app.mode, Mode::Edit(_));
-        if editing {
-            handle_edit_key(app, key);
-        } else if handle_browse_key(app, key) {
-            return Ok(());
+        match app.mode {
+            Mode::Edit(_) => handle_edit_key(app, key),
+            Mode::TypePicker(_) => handle_picker_key(app, key),
+            Mode::Browse => {
+                if handle_browse_key(app, key) {
+                    return Ok(());
+                }
+            }
         }
     }
 }
@@ -97,6 +103,20 @@ fn handle_browse_key(app: &mut App, key: KeyEvent) -> bool {
         _ => {}
     }
     false
+}
+
+fn handle_picker_key(app: &mut App, key: KeyEvent) {
+    match key.code {
+        KeyCode::Esc => app.cancel_picker(),
+        KeyCode::Enter => app.picker_confirm(),
+        KeyCode::Left | KeyCode::Char('h') | KeyCode::BackTab => app.picker_move_column(-1),
+        KeyCode::Right | KeyCode::Char('l') | KeyCode::Tab => app.picker_move_column(1),
+        KeyCode::Up | KeyCode::Char('k') => app.picker_move_selection(-1),
+        KeyCode::Down | KeyCode::Char('j') => app.picker_move_selection(1),
+        KeyCode::Char(c) if c.is_ascii_digit() => app.picker_digit(c),
+        KeyCode::Backspace => app.picker_backspace(),
+        _ => {}
+    }
 }
 
 fn handle_edit_key(app: &mut App, key: KeyEvent) {
@@ -146,6 +166,9 @@ fn draw(frame: &mut Frame, app: &mut App) {
     draw_tree(frame, app, left);
     draw_content(frame, app, right);
     draw_status(frame, app, status);
+    if matches!(app.mode, Mode::TypePicker(_)) {
+        draw_picker(frame, app, main);
+    }
 }
 
 fn class_style(node: &Node) -> Style {
@@ -285,9 +308,114 @@ fn hex_dump_lines(bytes: &[u8]) -> Vec<Line<'static>> {
 
 fn draw_content(frame: &mut Frame, app: &mut App, area: Rect) {
     match &app.mode {
-        Mode::Browse => draw_content_browse(frame, app, area),
         Mode::Edit(_) => draw_content_edit(frame, app, area),
+        _ => draw_content_browse(frame, app, area),
     }
+}
+
+/// Centered popup for choosing the type of a new element: one column per
+/// bit field of the identifier octet (class, form, tag number).
+fn draw_picker(frame: &mut Frame, app: &App, area: Rect) {
+    let Mode::TypePicker(ref p) = app.mode else { return };
+
+    let width = 64.min(area.width);
+    let height = (PICKER_UNIVERSAL.len() as u16 + 5).min(area.height);
+    let popup = Rect {
+        x: area.x + (area.width.saturating_sub(width)) / 2,
+        y: area.y + (area.height.saturating_sub(height)) / 2,
+        width,
+        height,
+    };
+    frame.render_widget(Clear, popup);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::new().fg(Color::Yellow))
+        .title(" INSERT — choose ASN.1 type ");
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+    let [cols_area, preview_area] =
+        Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(inner);
+    let [class_col, form_col, tag_col] = Layout::horizontal([
+        Constraint::Length(20),
+        Constraint::Length(16),
+        Constraint::Min(20),
+    ])
+    .areas(cols_area);
+
+    let header = |text: &str, active: bool| {
+        let style = if active {
+            Style::new().fg(Color::Yellow).underlined().bold()
+        } else {
+            Style::new().underlined()
+        };
+        Line::from(Span::styled(text.to_string(), style))
+    };
+    let item = |text: &str, selected: bool, active_col: bool, disabled: bool| {
+        let mut style = Style::new();
+        if disabled {
+            style = style.dim().crossed_out();
+        } else if selected && active_col {
+            style = style.add_modifier(Modifier::REVERSED).bold();
+        } else if selected {
+            style = style.bold().fg(Color::Yellow);
+        }
+        Line::from(Span::styled(format!(" {} ", text), style))
+    };
+
+    // Column 0: class bits (8-7).
+    let mut class_lines = vec![header("Class (bits 8-7)", p.column == 0)];
+    for (i, (name, _)) in PICKER_CLASSES.iter().enumerate() {
+        class_lines.push(item(name, i == p.class_idx, p.column == 0, false));
+    }
+    frame.render_widget(Paragraph::new(class_lines), class_col);
+
+    // Column 1: form bit (6). A forced form disables the other choice.
+    let effective_form = usize::from(p.constructed());
+    let mut form_lines = vec![header("Form (bit 6)", p.column == 1)];
+    for (i, name) in ["Primitive", "Constructed"].iter().enumerate() {
+        let disabled = p.forced_form().is_some() && i != effective_form;
+        form_lines.push(item(name, i == effective_form, p.column == 1, disabled));
+    }
+    frame.render_widget(Paragraph::new(form_lines), form_col);
+
+    // Column 2: tag number (bits 5-1).
+    let mut tag_lines = vec![header("Tag number (bits 5-1)", p.column == 2)];
+    if p.class() == Class::Universal {
+        // Scroll window so the selection stays visible.
+        let visible = (tag_col.height as usize).saturating_sub(1).max(1);
+        let start = p.univ_idx.saturating_sub(visible.saturating_sub(1));
+        for (i, (tag, name)) in PICKER_UNIVERSAL.iter().enumerate().skip(start).take(visible) {
+            tag_lines.push(item(
+                &format!("{:2}  {}", tag, name),
+                i == p.univ_idx,
+                p.column == 2,
+                false,
+            ));
+        }
+    } else {
+        tag_lines.push(item(
+            &format!("number: {}_", p.tag_digits),
+            true,
+            p.column == 2,
+            false,
+        ));
+        tag_lines.push(Line::from(Span::styled(
+            " type digits, ↑↓ adjusts",
+            Style::new().dim(),
+        )));
+    }
+    frame.render_widget(Paragraph::new(tag_lines), tag_col);
+
+    let preview = Line::from(vec![
+        Span::styled("identifier octets: ", Style::new().dim()),
+        Span::styled(ber::hex_pairs(&p.identifier_preview()), Style::new().bold()),
+        Span::styled(
+            format!("  ({})", ber::type_name_of(p.class(), p.tag())),
+            Style::new().dim(),
+        ),
+        Span::styled("   ⏎ continue  Esc cancel", Style::new().dim()),
+    ]);
+    frame.render_widget(Paragraph::new(preview), preview_area);
 }
 
 fn draw_content_browse(frame: &mut Frame, app: &App, area: Rect) {
@@ -403,12 +531,16 @@ fn draw_content_edit(frame: &mut Frame, app: &mut App, area: Rect) {
 
     let (title, hint) = match edit.kind {
         EditKind::Content => (
-            " EDIT — content octets (hex) ",
+            " EDIT — content octets (hex) ".to_string(),
             "[Enter] apply   [Esc] cancel   [←→↑↓] move   type hex digits to insert",
         ),
-        EditKind::Insert { .. } => (
-            " INSERT — new element(s) as complete TLV (hex) ",
-            "[Enter] insert   [Esc] cancel   type tag, length and value — e.g. 0500 for NULL",
+        EditKind::Insert { class, tag, constructed, .. } => (
+            format!(
+                " INSERT — value for new {} (hex{}) ",
+                ber::type_name_of(class, tag),
+                if constructed { ", must be valid TLVs, may stay empty" } else { ", may stay empty" },
+            ),
+            "[Enter] insert   [Esc] cancel   length octets are computed automatically",
         ),
     };
     lines.push(Line::from(Span::styled(hint, Style::new().dim())));
@@ -428,6 +560,7 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
         Mode::Browse => {
             "q quit  ↑↓ move  ←→ fold  ⏎ toggle  e edit  i/I insert  d delete  J/K reorder  s save  [ ] scroll"
         }
+        Mode::TypePicker(_) => "←→ column  ↑↓ select  0-9 tag number  ⏎ continue  Esc cancel",
         Mode::Edit(_) => "Enter apply  Esc cancel",
     };
     let line = Line::from(vec![
