@@ -57,3 +57,7 @@ more *complete TLV encodings* (tag, length, value — e.g. `0500` for NULL,
 `020107` for INTEGER 7); it is validated before being spliced into the
 tree. Delete, insert and reorder all re-encode the enclosing lengths
 automatically, like value edits.
+
+## License
+
+Licensed under the [Apache License, Version 2.0](LICENSE).
