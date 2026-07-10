@@ -772,9 +772,12 @@ impl App {
         );
     }
 
-    /// The "type specific" menu entry: pick the most natural editor for
-    /// the selected element's universal type.
-    fn start_edit_type_specific(&mut self) {
+    /// The "type specific" edit mode ('e' and the corresponding menu
+    /// entry): pick the most natural editor for the selected element's
+    /// universal type. For NULL and constructed elements there is no
+    /// single natural value; a status message is shown and the mode is
+    /// left unchanged (browse or menu).
+    pub fn start_edit_type_specific(&mut self) {
         let Some(node) = self.selected_node() else { return };
         if node.constructed {
             self.status =

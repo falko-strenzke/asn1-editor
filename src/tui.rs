@@ -108,7 +108,7 @@ fn handle_browse_key(app: &mut App, key: KeyEvent) -> bool {
         KeyCode::Left | KeyCode::Char('h') => app.collapse_or_parent(),
         KeyCode::Right | KeyCode::Char('l') => app.expand_or_child(),
         KeyCode::Enter | KeyCode::Char(' ') => app.toggle_expand(),
-        KeyCode::Char('e') => app.start_edit(),
+        KeyCode::Char('e') => app.start_edit_type_specific(),
         KeyCode::Char('E') => app.open_edit_menu(),
         KeyCode::Char('i') => app.start_insert(false),
         KeyCode::Char('I') => app.start_insert(true),
@@ -492,7 +492,10 @@ fn draw_content_browse(frame: &mut Frame, app: &App, area: Rect) {
         lines.push(Line::default());
         let content = node.content_octets();
         lines.push(Line::from(Span::styled(
-            format!("Content octets ({} bytes) — 'e' to edit as hex:", content.len()),
+            format!(
+                "Content octets ({} bytes) — 'e' edits, 'E' for all edit modes:",
+                content.len()
+            ),
             Style::new().underlined(),
         )));
         lines.extend(hex_dump_lines(&content));
@@ -729,7 +732,7 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
     let dirty = if app.dirty { " [modified]" } else { "" };
     let hints = match app.mode {
         Mode::Browse => {
-            "q quit  ↑↓ move  ←→ fold  ⏎ toggle  e hex-edit  E edit-menu  i/I insert  d delete  J/K reorder  s save  [ ] scroll"
+            "q quit  ↑↓ move  ←→ fold  ⏎ toggle  e edit  E edit-menu  i/I insert  d delete  J/K reorder  s save  [ ] scroll"
         }
         Mode::TypePicker(_) => "←→ column  ↑↓ select  0-9 tag number  ⏎ continue  Esc cancel",
         Mode::EditMenu(_) => "↑↓ or 1-5 select  ⏎ choose  Esc cancel",

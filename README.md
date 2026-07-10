@@ -37,7 +37,7 @@ the edited data in the same outer format.
 |-----|--------|
 | `↑`/`k`, `↓`/`j`, `PgUp`/`PgDn`, `g`, `G` | navigate the tree |
 | `←`/`h`, `→`/`l`, `Enter`/`Space` | collapse / expand / toggle |
-| `e` | edit the selected element's content octets as hex |
+| `e` | edit the selected element's value in its natural, type-specific form |
 | `E` | open the edit menu: tag type / hex / base64 / raw binary / type specific |
 | `i` | insert a new element after the selected one (type-picker dialog, then value) |
 | `I` | insert a new element as first child of the selected constructed element |
@@ -48,8 +48,10 @@ the edited data in the same outer format.
 | `[` / `]` | scroll the content pane |
 | `q` | quit (`q q` discards unsaved changes) |
 
-Editing notes: the hex editor works on the element's *content octets*
-(for BIT STRING including the leading unused-bits octet). Lengths of all
+Editing notes: `e` opens the type-specific editor directly (mode 5 of the
+menu below); for OCTET/BIT STRINGs and unknown types that is the hex
+editor. All value editors work on the element's *content octets* (for
+BIT STRING including the leading unused-bits octet). Lengths of all
 enclosing elements are recomputed automatically. Content of constructed
 elements must remain valid ASN.1, otherwise the edit is rejected.
 

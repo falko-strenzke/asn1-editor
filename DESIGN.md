@@ -190,8 +190,9 @@ is kept and an internal error is shown.
 
 ### The edit menu and value editors
 
-`e` opens the hex editor directly; `E` opens a popup menu
-(`Mode::EditMenu`) with five editing modes, also selectable with `1`-`5`:
+`e` opens the type-specific editor directly (mode 5 below); `E` opens a
+popup menu (`Mode::EditMenu`) with five editing modes, also selectable
+with `1`-`5`:
 
 1. **Tag type** — the type-picker dialog with a `Retag` target (below).
 2. **Hex** — `Editor::Hex`, a 16-bytes-per-line hex grid.
@@ -316,8 +317,9 @@ Built with ratatui 0.29 (bundled crossterm backend, `ratatui::init()` /
 * **Right pane — content.** Type/class/tag, offset, header and content
   length, decoded value (integers, OIDs dotted, strings, times, unused
   bits) and a `hexdump -C`-style dump of the content octets.
-* **Edit mode** (`e` for hex directly, `E` for the edit menu): the right
-  pane becomes one of the value editors of §7 — hex grid, text line
+* **Edit mode** (`e` for the type-specific editor, `E` for the edit
+  menu): the right pane becomes one of the value editors of §7 — hex grid,
+  text line
   (base64 / raw / number / OID / boolean / text) or the date/time form —
   with insert-at-cursor semantics and a live feedback line (resulting byte
   count, or the validation error in red). `Enter` applies (§7), `Esc`
@@ -334,7 +336,7 @@ Built with ratatui 0.29 (bundled crossterm backend, `ratatui::init()` /
 | `←`/`h` | collapse node, or jump to parent |
 | `→`/`l` | expand node, or enter first child |
 | `Enter`/`Space` | toggle fold |
-| `e` | edit selected element's content octets (hex) |
+| `e` | edit selected element's value (type-specific editor) |
 | `E` | edit menu: tag type / hex / base64 / raw binary / type specific |
 | `i` | insert new element after the selection (type-picker dialog, then value) |
 | `I` | insert new element as first child of a constructed element |
