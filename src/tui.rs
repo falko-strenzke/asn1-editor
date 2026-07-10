@@ -785,7 +785,7 @@ fn editor_title_hint(edit: &EditState) -> (String, &'static str) {
         },
         Editor::DateTime(_) => (
             " EDIT — date / time ".to_string(),
-            "[←→/Tab] field   [↑↓] adjust   digits type   [Enter] apply   [Esc] cancel",
+            "[←→/Tab] field   [↑↓] adjust   digits overwrite the field   [Enter] apply   [Esc] cancel",
         ),
     }
 }

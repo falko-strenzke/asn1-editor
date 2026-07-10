@@ -239,6 +239,10 @@ pub struct DateTimeEditor {
     pub fields: [String; 6],
     pub active: usize,
     pub generalized: bool,
+    /// True while the active field has not been typed into since it was
+    /// focused: the first typed digit then replaces the (pre-filled)
+    /// content instead of appending to an already-full field.
+    pub pristine: bool,
 }
 
 impl Editor {
@@ -273,6 +277,10 @@ impl Editor {
             }
             Editor::DateTime(d) => {
                 if c.is_ascii_digit() {
+                    if d.pristine {
+                        d.fields[d.active].clear();
+                        d.pristine = false;
+                    }
                     let max = if d.active == 0 { 4 } else { 2 };
                     if d.fields[d.active].len() < max {
                         d.fields[d.active].push(c);
@@ -298,6 +306,7 @@ impl Editor {
             }
             Editor::DateTime(d) => {
                 d.fields[d.active].pop();
+                d.pristine = false; // further digits append
             }
         }
     }
@@ -314,7 +323,10 @@ impl Editor {
                     t.buf.remove(t.cursor);
                 }
             }
-            Editor::DateTime(d) => d.fields[d.active].clear(),
+            Editor::DateTime(d) => {
+                d.fields[d.active].clear();
+                d.pristine = false;
+            }
         }
     }
 
@@ -329,6 +341,7 @@ impl Editor {
             }
             Editor::DateTime(d) => {
                 d.active = (d.active as isize + delta).rem_euclid(6) as usize;
+                d.pristine = true; // newly focused field: typing replaces
             }
         }
     }
@@ -344,6 +357,7 @@ impl Editor {
             Editor::DateTime(d) => {
                 let v = d.fields[d.active].parse::<i64>().unwrap_or(0) - delta as i64;
                 d.fields[d.active] = v.max(0).to_string();
+                d.pristine = true; // typing after adjusting starts fresh
             }
         }
     }
@@ -352,7 +366,10 @@ impl Editor {
         match self {
             Editor::Hex(h) => h.cursor = 0,
             Editor::Text(t) => t.cursor = 0,
-            Editor::DateTime(d) => d.active = 0,
+            Editor::DateTime(d) => {
+                d.active = 0;
+                d.pristine = true;
+            }
         }
     }
 
@@ -360,7 +377,10 @@ impl Editor {
         match self {
             Editor::Hex(h) => h.cursor = h.digits.len(),
             Editor::Text(t) => t.cursor = t.buf.len(),
-            Editor::DateTime(d) => d.active = 5,
+            Editor::DateTime(d) => {
+                d.active = 5;
+                d.pristine = true;
+            }
         }
     }
 
@@ -502,6 +522,7 @@ fn datetime_from_value(value: &[u8], generalized: bool) -> DateTimeEditor {
         ],
         active: 0,
         generalized,
+        pristine: true,
     };
     let Ok(s) = std::str::from_utf8(value) else { return default };
     let Some(digits) = s.strip_suffix('Z') else { return default };
@@ -527,6 +548,7 @@ fn datetime_from_value(value: &[u8], generalized: bool) -> DateTimeEditor {
         ],
         active: 0,
         generalized,
+        pristine: true,
     }
 }
 
@@ -1659,6 +1681,30 @@ mod tests {
         d.fields[1] = "12".to_string(); // month
         app.commit_edit();
         assert_eq!(&ber::encode_forest(&app.roots)[2..], b"261209115028Z");
+    }
+
+    #[test]
+    fn type_specific_datetime_typing_replaces_prefilled_field() {
+        let data = *b"\x17\x0d260709115028Z"; // UTCTime
+        let mut app = test_app(&data);
+        choose_edit_mode(&mut app, 4);
+        {
+            let Mode::Edit(ref mut edit) = app.mode else { panic!() };
+            // Year is pre-filled to its full width ("2026"); typing must
+            // replace it, not be silently dropped.
+            edit.editor.insert_char('1');
+            edit.editor.insert_char('9');
+            edit.editor.insert_char('9');
+            edit.editor.insert_char('9');
+            // Move to the month field and type: also replaces.
+            edit.editor.move_horizontal(1);
+            edit.editor.insert_char('3');
+            let Editor::DateTime(ref d) = edit.editor else { panic!() };
+            assert_eq!(d.fields[0], "1999");
+            assert_eq!(d.fields[1], "3");
+        }
+        app.commit_edit();
+        assert_eq!(&ber::encode_forest(&app.roots)[2..], b"990309115028Z");
     }
 
     #[test]
