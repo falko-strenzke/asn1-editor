@@ -15,7 +15,7 @@
 use std::path::PathBuf;
 use std::process::ExitCode;
 
-use asn1_editor::{app::App, ber, dump, input, tui};
+use asn1_editor::{app::App, ber, dump, input, spec, tui};
 
 const USAGE: &str = "\
 Usage: asn1-editor [OPTIONS] <FILE>
@@ -80,7 +80,16 @@ fn main() -> ExitCode {
     }
 
     let out_path = out_path.unwrap_or_else(|| path.clone());
-    let app = App::new(path, out_path, container, roots, der.len());
+    let mut app = App::new(path, out_path, container, roots, der.len());
+    if let Some(dir) = spec::default_spec_dir() {
+        let (db, errors) = spec::load_dir(&dir);
+        for e in &errors {
+            eprintln!("warning: spec parse error: {}", e);
+        }
+        if !db.is_empty() {
+            app.set_spec_db(db);
+        }
+    }
     match tui::run(app) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => fail(&format!("terminal error: {}", e)),

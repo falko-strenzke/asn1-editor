@@ -288,15 +288,36 @@ fn draw_tree(frame: &mut Frame, app: &mut App, area: Rect) {
             } else {
                 "  "
             };
-            let line = Line::from(vec![
-                Span::raw(format!("{}{}", "  ".repeat(row.depth), marker)),
-                Span::styled(node.type_name(), class_style(node)),
-                Span::styled(summary(node), Style::new().dim()),
-            ]);
-            ListItem::new(line)
+            let mut spans =
+                vec![Span::raw(format!("{}{}", "  ".repeat(row.depth), marker))];
+            let label = app.label_at(&row.path);
+            if let Some(field) = label.and_then(|l| l.field.as_deref()) {
+                spans.push(Span::styled(
+                    format!("{}: ", field),
+                    Style::new().fg(Color::LightCyan).italic(),
+                ));
+            }
+            spans.push(Span::styled(node.type_name(), class_style(node)));
+            spans.push(Span::styled(summary(node), Style::new().dim()));
+            if let Some(l) = label {
+                // Show the spec type name when it adds information beyond
+                // the raw ASN.1 type already printed.
+                if l.type_name != node.type_name() {
+                    spans.push(Span::styled(
+                        format!("  ·{}", l.type_name),
+                        Style::new().fg(Color::LightGreen).dim(),
+                    ));
+                }
+            }
+            ListItem::new(Line::from(spans))
         })
         .collect();
-    let title = format!(" Structure — {} ", app.path.display());
+    let ident_note = app
+        .ident
+        .as_ref()
+        .map(|i| format!(" — {}", i.type_name))
+        .unwrap_or_default();
+    let title = format!(" Structure — {}{} ", app.path.display(), ident_note);
     let list = List::new(items)
         .block(Block::default().borders(Borders::ALL).title(title))
         .highlight_style(Style::new().add_modifier(Modifier::REVERSED));
@@ -612,6 +633,22 @@ fn draw_content_browse(frame: &mut Frame, app: &App, area: Rect) {
             Span::styled("Type    ", Style::new().dim()),
             Span::styled(node.type_name(), class_style(node)),
         ]));
+        if let Some(row) = app.rows.get(app.selected) {
+            if let Some(label) = app.label_at(&row.path) {
+                let ident = app.ident.as_ref().expect("label implies identification");
+                let field = label.field.as_deref().unwrap_or("-");
+                lines.push(Line::from(vec![
+                    Span::styled("Spec    ", Style::new().dim()),
+                    Span::styled(field.to_string(), Style::new().fg(Color::LightCyan)),
+                    Span::raw(" : "),
+                    Span::styled(label.type_name.clone(), Style::new().fg(Color::LightGreen)),
+                    Span::styled(
+                        format!("   (document: {}, {})", ident.type_name, ident.source),
+                        Style::new().dim(),
+                    ),
+                ]));
+            }
+        }
         let ids = ber::identifier_octets(node.class, node.tag, node.constructed);
         lines.push(Line::from(vec![
             Span::styled("Tag     ", Style::new().dim()),

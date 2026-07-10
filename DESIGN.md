@@ -27,9 +27,14 @@ Goals:
   file back in the same outer format.
 * Structural output parity with `dumpasn1` (`--dump` mode).
 
-Non-goals (see §9):
+* Identify well-known structures by matching against ASN.1 specification
+  modules in `specs/asn1/` (bundled: RFC 5280 → X.509 certificates and
+  CRLs) and annotate the tree with the spec's field and type names (§8).
 
-* Schema-aware editing (no ASN.1 module compiler).
+Non-goals (see §13):
+
+* Schema-aware *editing* (specs annotate and identify, but edits are not
+  constrained by them).
 * Preserving non-canonical BER encodings (indefinite lengths,
   non-minimal length octets) across a save.
 
@@ -61,17 +66,21 @@ src/
   ber.rs     TLV parser + encoder + Node model + value-decoding helpers
   dump.rs    dumpasn1-style text output (used by --dump and the tests)
   input.rs   container detection (raw / PEM / base64 / hex) + re-wrapping
+  spec.rs    ASN.1 specification parser + structural matcher/labeler
   app.rs     application state: tree, flattened rows, selection, edit logic
   tui.rs     ratatui event loop and rendering (no business logic)
 tests/
   dumpasn1_compat.rs  structural comparison against the dumpasn1 binary,
                       plus a parse→encode round-trip test over testdata/
-testdata/  DER samples (EC cert, RSA cert, EC private key, PKCS#7)
+  spec_rfc5280.rs     spec parsing + identification of the DER test files
+specs/asn1/  ASN.1 specification modules (rfc5280: certificates + CRLs)
+testdata/  DER samples (EC cert, RSA cert, EC key, PKCS#7, CRL)
 ```
 
-Dependency rule: `ber.rs` depends on nothing; `dump.rs`/`input.rs` depend
-only on `ber.rs`; `app.rs` depends on `ber.rs` + `input.rs`; `tui.rs`
-renders `app.rs`. The only external dependency is `ratatui`.
+Dependency rule: `ber.rs` depends on nothing; `dump.rs`/`input.rs`/
+`spec.rs` depend only on `ber.rs`; `app.rs` depends on `ber.rs` +
+`input.rs` + `spec.rs`; `tui.rs` renders `app.rs`. The only external
+dependency is `ratatui`.
 
 ## 4. Data model
 
@@ -285,7 +294,87 @@ value exactly" as one); after the rebuild such a node is then displayed as
 a plain primitive value again — consistent with what dumpasn1 would show
 for the resulting bytes.
 
-## 8. Input containers
+## 8. ASN.1 specifications (`src/spec.rs`, `specs/asn1/`)
+
+The editor can identify well-known structures and annotate the tree with
+the names from their ASN.1 definition.
+
+### Specification files
+
+`specs/asn1/` holds ASN.1 modules in 1988 syntax. `specs/asn1/rfc5280`
+contains the two modules of RFC 5280 Appendix A (PKIX1Explicit88 and
+PKIX1Implicit88), extracted verbatim from the RFC text (de-paginated,
+otherwise unmodified). Additional files dropped into the directory are
+parsed automatically; parse failures are reported as warnings and the
+file is skipped. The directory is located via `$ASN1_EDITOR_SPECS`, then
+`./specs/asn1`, then `specs/asn1` next to an ancestor of the executable.
+
+### The specification parser
+
+A tokenizer (ASN.1 comments `--…--`/`--…EOL`, identifiers with hyphens,
+`::=`, braces/brackets/parens) feeds a recursive-descent parser for the
+'88 subset used by such modules:
+
+* module headers with `DEFINITIONS [EXPLICIT|IMPLICIT] TAGS ::= BEGIN … END`
+  (the tagging default is recorded per type definition);
+* `IMPORTS`/`EXPORTS` sections (skipped);
+* type assignments `Name ::= Type` with SEQUENCE/SET (fields), SEQUENCE
+  OF/SET OF (incl. `SIZE` constraints before `OF`), CHOICE, tagged types
+  `[n]`, `[APPLICATION n]` … with optional IMPLICIT/EXPLICIT, OPTIONAL and
+  DEFAULT components, ANY (DEFINED BY), and all universal primitive types;
+* value assignments (OID constants, integer bounds like `ub-name`) are
+  parsed and discarded;
+* constraints (`(SIZE (1..MAX))`, value ranges), named INTEGER values and
+  named BIT STRING bits are skipped — they do not affect structure.
+
+The result is a flat database of `TypeDef`s from all files; references
+resolve across modules (so PKIX1Implicit88's imports from PKIX1Explicit88
+work), and unknown references match like ANY, keeping partial spec sets
+usable.
+
+### Structural matching and identification
+
+At load time (and after every edit `rebuild()`), a document consisting of
+exactly one top-level element is matched against **every** type
+definition:
+
+* primitives check the universal tag; SEQUENCE/SET require the
+  corresponding constructed universal tag; SEQUENCE OF/SET OF require all
+  children to match the element type;
+* SEQUENCE/SET components are matched in order with backtracking over
+  OPTIONAL/DEFAULT components;
+* CHOICE tries each alternative;
+* tagged types check class and tag number. EXPLICIT tags must wrap
+  exactly one element which is matched against the inner type; IMPLICIT
+  tags re-check the inner type's body against the same element. The
+  module's tagging default applies where no keyword is given, and an
+  IMPLICIT tag on a type that resolves to an untagged CHOICE or ANY is
+  treated as EXPLICIT (X.680 rule);
+* ANY matches any single element.
+
+Every successful (sub-)match records a label `(field name, type name)`
+for the node's path; choices append the alternative name (e.g.
+`Time.utcTime`). The candidate whose match labels the **most nodes**
+wins; matches labeling fewer than two nodes (e.g. a bare `ANY`) are
+discarded as noise. With the RFC 5280 modules loaded, X.509 certificates
+identify as `Certificate` and CRLs as `CertificateList`.
+
+The identification is recomputed after every edit, so a document can gain
+or lose its labels as edits make it conform or not conform to a spec.
+
+### Display
+
+* Tree pane: `field: ` prefixes (cyan italic) and ` ·TypeName` suffixes
+  (green, shown when the spec name adds information beyond the raw ASN.1
+  type); the identified document type in the pane title.
+* Content pane: a `Spec` line with the selected element's field and type
+  name plus the overall document type and source file.
+
+Not yet done (future work): resolving `ANY DEFINED BY` and OCTET STRING
+extension bodies via OID tables (e.g. labeling the contents of X.509
+extensions), and value-level checks (constraints are ignored).
+
+## 9. Input containers
 
 `input::load` detects, in order: PEM (`-----BEGIN <label>-----`, first
 block), raw BER/DER (must parse), hex text, base64. The decoded-from
@@ -293,7 +382,7 @@ container is remembered and `s`ave re-wraps the new DER the same way
 (PEM label preserved, 64-column base64). `-o FILE` redirects the save
 target; by default the input file is overwritten.
 
-## 9. TUI
+## 10. TUI
 
 Built with ratatui 0.29 (bundled crossterm backend, `ratatui::init()` /
 `restore()` with automatic panic-hook cleanup).
@@ -380,7 +469,7 @@ Built with ratatui 0.29 (bundled crossterm backend, `ratatui::init()` /
 | `[` / `]` | scroll content pane |
 | `q` | quit (`q q` to discard unsaved changes) |
 
-## 10. Verification against dumpasn1
+## 11. Verification against dumpasn1
 
 Two layers, both in `tests/dumpasn1_compat.rs` and run by `cargo test`:
 
@@ -410,7 +499,7 @@ encapsulation, long INTEGER hex blocks), SEC1 EC private key (context
 tags `[0]`/`[1]`, OCTET STRING that must *not* encapsulate), PKCS#7
 certificate bundle (`[0]` constructed, empty SET, deep nesting).
 
-## 11. Error handling
+## 12. Error handling
 
 * Parse errors carry the absolute offset and are fatal at load time
   (reported on stderr).
@@ -421,7 +510,7 @@ certificate bundle (`[0]` constructed, empty SET, deep nesting).
   set.
 * Quitting with unsaved changes requires a second `q`.
 
-## 12. Limitations and future work
+## 13. Limitations and future work
 
 * Re-encoding normalizes BER (indefinite lengths, redundant length octets)
   to DER framing; a byte-preserving mode would require storing original

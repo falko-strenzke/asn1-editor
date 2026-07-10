@@ -21,6 +21,7 @@ use ratatui::widgets::ListState;
 
 use crate::ber::{self, Class, Node};
 use crate::input::{self, Container};
+use crate::spec::{self, Identification, Label, SpecDb};
 
 /// Bytes per line in the hex editor; the cursor moves in units of hex digits.
 pub const EDIT_BYTES_PER_LINE: usize = 16;
@@ -585,6 +586,10 @@ pub struct App {
     pub delete_confirm: bool,
     /// Scroll offset of the content pane in browse mode.
     pub content_scroll: u16,
+    /// Loaded ASN.1 specifications (may be empty).
+    pub spec_db: SpecDb,
+    /// Result of matching the document against the specifications.
+    pub ident: Option<Identification>,
 }
 
 impl App {
@@ -610,9 +615,32 @@ impl App {
             quit_confirm: false,
             delete_confirm: false,
             content_scroll: 0,
+            spec_db: SpecDb::default(),
+            ident: None,
         };
         app.rebuild_rows();
         app
+    }
+
+    /// Install the specification database and identify the document.
+    pub fn set_spec_db(&mut self, db: SpecDb) {
+        self.spec_db = db;
+        self.identify();
+        if let Some(ref ident) = self.ident {
+            self.status = format!(
+                "{} — identified as {} ({})",
+                self.status, ident.type_name, ident.source
+            );
+        }
+    }
+
+    fn identify(&mut self) {
+        self.ident = spec::identify(&self.spec_db, &self.roots);
+    }
+
+    /// Spec label of the node at `path`, if the document was identified.
+    pub fn label_at(&self, path: &[usize]) -> Option<&Label> {
+        self.ident.as_ref().and_then(|i| i.labels.get(path))
     }
 
     pub fn node_at(&self, path: &[usize]) -> Option<&Node> {
@@ -1195,6 +1223,8 @@ impl App {
             }
         }
         self.rebuild_rows();
+        // Edits can make the document gain or lose conformance to a spec.
+        self.identify();
         if let Some(path) = sel_path {
             if let Some(i) = self.rows.iter().position(|r| r.path == path) {
                 self.select(i);

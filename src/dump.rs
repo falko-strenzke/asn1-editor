@@ -49,6 +49,8 @@ const OID_NAMES: &[(&[u64], &str)] = &[
     (&[2, 5, 29, 15], "keyUsage"),
     (&[2, 5, 29, 17], "subjectAltName"),
     (&[2, 5, 29, 19], "basicConstraints"),
+    (&[2, 5, 29, 20], "cRLNumber"),
+    (&[2, 5, 29, 31], "cRLDistributionPoints"),
     (&[2, 5, 29, 35], "authorityKeyIdentifier"),
     (&[2, 5, 29, 37], "extKeyUsage"),
 ];

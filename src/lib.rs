@@ -23,4 +23,5 @@ pub mod app;
 pub mod ber;
 pub mod dump;
 pub mod input;
+pub mod spec;
 pub mod tui;

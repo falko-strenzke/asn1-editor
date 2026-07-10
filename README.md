@@ -31,6 +31,29 @@ asn1-editor --dump cert.der      # dumpasn1-style dump to stdout, no TUI
 Input may be raw BER/DER, PEM, bare base64, or hex text; saving re-wraps
 the edited data in the same outer format.
 
+## ASN.1 specifications
+
+On startup, every file in `specs/asn1/` is parsed as an ASN.1 module
+(1988 syntax) and the opened document is structurally matched against
+every type definition. When a definition fits the whole structure — with
+the bundled RFC 5280 modules that identifies X.509 certificates
+(`Certificate`) and CRLs (`CertificateList`) — the tree is augmented with
+the field and type names from the specification:
+
+```
+▾ SEQUENCE (3 elem)  ·Certificate
+  ▾ tbsCertificate: SEQUENCE (8 elem)  ·TBSCertificate
+    ▾ version: [0] (1 elem)
+        INTEGER 2  ·Version
+      serialNumber: INTEGER 70 60 96 41 …
+```
+
+The content pane shows the selected element's spec name on a `Spec` line,
+and the identified document type appears in the tree title. Additional
+specification files dropped into `specs/asn1/` are picked up
+automatically (the directory is looked up next to the executable, in the
+current directory, or via `$ASN1_EDITOR_SPECS`).
+
 ## Keys
 
 | Key | Action |
