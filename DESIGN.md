@@ -314,9 +314,26 @@ Built with ratatui 0.29 (bundled crossterm backend, `ratatui::init()` /
 * **Left pane — tree.** One row per visible node: fold marker (`▸`/`▾`),
   indentation by depth, type name (colored by tag class; bold when
   constructed/encapsulating) and a short decoded value preview.
-* **Right pane — content.** Type/class/tag, offset, header and content
-  length, decoded value (integers, OIDs dotted, strings, times, unused
-  bits) and a `hexdump -C`-style dump of the content octets.
+* **Right pane — content.** At the top, the build-up of the tag is shown
+  graphically: a bit-field diagram of the identifier octet with the bit
+  positions (8..1), the actual bit values, each field's width in bits and
+  its decoded meaning —
+
+  ```
+  Type    SEQUENCE
+  Tag     identifier octet: 30
+  ┌ 8 7 ───────────┬ 6 ──────────┬ 5 4 3 2 1 ──────────┐
+  │ 0 0            │ 1           │ 1 0 0 0 0           │
+  │ class (2 bits) │ P/C (1 bit) │ tag number (5 bits) │
+  │ universal      │ constructed │ 16 = SEQUENCE       │
+  └────────────────┴─────────────┴─────────────────────┘
+  ```
+
+  For high tag numbers (long form, tag ≥ 31) the continuation octets are
+  broken down as well (bit 8 = more-octets flag, bits 7-1 = tag bits),
+  followed by the resulting tag number. Below the diagram: offset, header
+  and content length, decoded value (integers, OIDs dotted, strings,
+  times, unused bits) and a `hexdump -C`-style dump of the content octets.
 * **Edit mode** (`e` for the type-specific editor, `E` for the edit
   menu): the right pane becomes one of the value editors of §7 — hex grid,
   text line

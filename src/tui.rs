@@ -447,32 +447,134 @@ fn draw_picker(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(Paragraph::new(preview), preview_area);
 }
 
+/// Text rows of the tag bit-field diagram: which bits of the identifier
+/// octet(s) hold which field, how wide each field is, and what it decodes
+/// to. Row order: top border, bit values, field labels, decoded meaning,
+/// bottom border, then one row per continuation octet (long form).
+pub fn tag_layout_strings(node: &Node) -> Vec<String> {
+    let ids = ber::identifier_octets(node.class, node.tag, node.constructed);
+    let b0 = ids[0];
+    let bit = |i: u8| (b0 >> i) & 1;
+    let class_name = match node.class {
+        Class::Universal => "universal",
+        Class::Application => "application",
+        Class::ContextSpecific => "context-specific",
+        Class::Private => "private",
+    };
+    let form = if node.constructed { "constructed" } else { "primitive" };
+    let long_form = ids.len() > 1;
+    let tag_decoded = if long_form {
+        "31 = long form ↓".to_string()
+    } else if node.class == Class::Universal {
+        format!("{} = {}", node.tag, ber::universal_tag_name(node.tag))
+    } else {
+        format!("{}", node.tag)
+    };
+
+    // One entry per column: [bit positions, bit values, label, decoded].
+    let cols: [[String; 4]; 3] = [
+        [
+            " 8 7 ".into(),
+            format!(" {} {} ", bit(7), bit(6)),
+            " class (2 bits) ".into(),
+            format!(" {} ", class_name),
+        ],
+        [
+            " 6 ".into(),
+            format!(" {} ", bit(5)),
+            " P/C (1 bit) ".into(),
+            format!(" {} ", form),
+        ],
+        [
+            " 5 4 3 2 1 ".into(),
+            format!(" {} {} {} {} {} ", bit(4), bit(3), bit(2), bit(1), bit(0)),
+            " tag number (5 bits) ".into(),
+            format!(" {} ", tag_decoded),
+        ],
+    ];
+    let widths: Vec<usize> =
+        cols.iter().map(|c| c.iter().map(|s| s.chars().count()).max().unwrap()).collect();
+
+    let border = |left: char, mid: char, right: char, cells: Option<&[String; 3]>| {
+        let mut out = String::from(left);
+        for (i, w) in widths.iter().enumerate() {
+            let content = cells.map(|c| c[i].as_str()).unwrap_or("");
+            out.push_str(content);
+            out.extend(std::iter::repeat_n('─', w - content.chars().count()));
+            out.push(if i < 2 { mid } else { right });
+        }
+        out
+    };
+    let row = |get: fn(&[String; 4]) -> &String| {
+        let mut out = String::from("│");
+        for (i, col) in cols.iter().enumerate() {
+            let cell = get(col);
+            out.push_str(cell);
+            out.extend(std::iter::repeat_n(' ', widths[i] - cell.chars().count()));
+            out.push('│');
+        }
+        out
+    };
+
+    let tops: [String; 3] = [cols[0][0].clone(), cols[1][0].clone(), cols[2][0].clone()];
+    let mut lines = vec![
+        border('┌', '┬', '┐', Some(&tops)),
+        row(|c| &c[1]),
+        row(|c| &c[2]),
+        row(|c| &c[3]),
+        border('└', '┴', '┘', None),
+    ];
+    if long_form {
+        for (i, &b) in ids[1..].iter().enumerate() {
+            lines.push(format!(
+                "octet {}:  {} {:07b}   (bit 8 = {}, bits 7-1 = tag bits)",
+                i + 2,
+                b >> 7,
+                b & 0x7F,
+                if b & 0x80 != 0 { "1: more octets follow" } else { "0: last octet" },
+            ));
+        }
+        lines.push(format!("tag number = {}", node.tag));
+    }
+    lines
+}
+
 fn draw_content_browse(frame: &mut Frame, app: &App, area: Rect) {
     let mut lines: Vec<Line> = Vec::new();
     if let Some(node) = app.selected_node() {
-        let class = match node.class {
-            Class::Universal => "universal",
-            Class::Application => "application",
-            Class::ContextSpecific => "context-specific",
-            Class::Private => "private",
-        };
         lines.push(Line::from(vec![
             Span::styled("Type    ", Style::new().dim()),
             Span::styled(node.type_name(), class_style(node)),
+        ]));
+        let ids = ber::identifier_octets(node.class, node.tag, node.constructed);
+        lines.push(Line::from(vec![
+            Span::styled("Tag     ", Style::new().dim()),
             Span::raw(format!(
-                "   class: {}, tag: {}, {}",
-                class,
-                node.tag,
-                if node.constructed { "constructed" } else { "primitive" }
+                "identifier octet{}: {}",
+                if ids.len() == 1 { "" } else { "s" },
+                ber::hex_pairs(&ids)
             )),
         ]));
+        for (i, text) in tag_layout_strings(node).into_iter().enumerate() {
+            // Bit values (row 1) and decoded meaning (row 3) stand out;
+            // borders and labels stay dim.
+            let style = match i {
+                1 => Style::new().bold(),
+                0 | 2 | 4 => Style::new().dim(),
+                _ => Style::new(), // decoded row and long-form octet rows
+            };
+            lines.push(Line::from(Span::styled(text, style)));
+        }
+        let plural = |n: usize| if n == 1 { "" } else { "s" };
         lines.push(Line::from(vec![
             Span::styled("Offset  ", Style::new().dim()),
             Span::raw(format!(
-                "{}   header: {} bytes   content: {} bytes{}",
+                "{}   header: {} byte{}   content: {} byte{}{}",
                 node.offset,
                 node.header_len,
+                plural(node.header_len),
                 node.content_len,
+                plural(node.content_len),
                 if node.indefinite { "   (indefinite length)" } else { "" }
             )),
         ]));
@@ -493,8 +595,9 @@ fn draw_content_browse(frame: &mut Frame, app: &App, area: Rect) {
         let content = node.content_octets();
         lines.push(Line::from(Span::styled(
             format!(
-                "Content octets ({} bytes) — 'e' edits, 'E' for all edit modes:",
-                content.len()
+                "Content octets ({} byte{}) — 'e' edits, 'E' for all edit modes:",
+                content.len(),
+                if content.len() == 1 { "" } else { "s" }
             ),
             Style::new().underlined(),
         )));
@@ -744,4 +847,56 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
         Span::styled(format!("| {}", hints), Style::new().dim()),
     ]);
     frame.render_widget(Paragraph::new(line), area);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::ber::parse_forest;
+
+    #[test]
+    fn tag_layout_for_sequence() {
+        let forest = parse_forest(&[0x30, 0x00], 0).unwrap();
+        let rows = tag_layout_strings(&forest[0]);
+        assert_eq!(rows.len(), 5);
+        // Bit positions embedded in the top border.
+        assert!(rows[0].contains(" 8 7 ") && rows[0].contains(" 6 ") && rows[0].contains(" 5 4 3 2 1 "));
+        // 0x30 = 00 1 10000.
+        assert!(rows[1].contains("│ 0 0 ") && rows[1].contains("│ 1 ") && rows[1].contains("│ 1 0 0 0 0 "));
+        // Field sizes in bits.
+        assert!(rows[2].contains("class (2 bits)"));
+        assert!(rows[2].contains("P/C (1 bit)"));
+        assert!(rows[2].contains("tag number (5 bits)"));
+        // Decoded meaning.
+        assert!(rows[3].contains("universal"));
+        assert!(rows[3].contains("constructed"));
+        assert!(rows[3].contains("16 = SEQUENCE"));
+        // All box rows are equally wide.
+        let w = rows[0].chars().count();
+        assert!(rows[1..5].iter().all(|r| r.chars().count() == w));
+    }
+
+    #[test]
+    fn tag_layout_for_context_primitive() {
+        let forest = parse_forest(&[0x80, 0x00], 0).unwrap();
+        let rows = tag_layout_strings(&forest[0]);
+        assert!(rows[1].contains("│ 1 0 "));
+        assert!(rows[3].contains("context-specific"));
+        assert!(rows[3].contains("primitive"));
+        assert!(rows[3].contains(" 0 "));
+    }
+
+    #[test]
+    fn tag_layout_long_form() {
+        // [APPLICATION 1000] primitive: 0x5F 0x87 0x68.
+        let forest = parse_forest(&[0x5F, 0x87, 0x68, 0x00], 0).unwrap();
+        let rows = tag_layout_strings(&forest[0]);
+        assert!(rows[1].contains("│ 1 1 1 1 1 "));
+        assert!(rows[3].contains("31 = long form"));
+        assert!(rows[5].contains("octet 2:  1 0000111"));
+        assert!(rows[5].contains("more octets follow"));
+        assert!(rows[6].contains("octet 3:  0 1101000"));
+        assert!(rows[6].contains("last octet"));
+        assert_eq!(rows[7], "tag number = 1000");
+    }
 }
