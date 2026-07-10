@@ -452,6 +452,66 @@ pub fn encode_forest(nodes: &[Node]) -> Vec<u8> {
 // Shared value decoding helpers (used by the dump formatter and the TUI).
 // ---------------------------------------------------------------------------
 
+/// Minimal two's-complement big-endian encoding of an integer (the
+/// inverse of `decode_integer`).
+pub fn encode_integer(v: i128) -> Vec<u8> {
+    let bytes = v.to_be_bytes();
+    let mut i = 0;
+    while i < bytes.len() - 1 {
+        let redundant = (bytes[i] == 0x00 && bytes[i + 1] & 0x80 == 0)
+            || (bytes[i] == 0xFF && bytes[i + 1] & 0x80 != 0);
+        if !redundant {
+            break;
+        }
+        i += 1;
+    }
+    bytes[i..].to_vec()
+}
+
+/// Encode an OBJECT IDENTIFIER given in dot notation ("1.2.840.113549").
+pub fn encode_oid(dotted: &str) -> Result<Vec<u8>, String> {
+    let arcs: Vec<u64> = dotted
+        .split('.')
+        .map(|a| a.trim().parse::<u64>().map_err(|_| format!("invalid arc '{}'", a)))
+        .collect::<Result<_, _>>()?;
+    if arcs.len() < 2 {
+        return Err("an OID needs at least two arcs".to_string());
+    }
+    if arcs[0] > 2 {
+        return Err("the first arc must be 0, 1 or 2".to_string());
+    }
+    if arcs[0] < 2 && arcs[1] >= 40 {
+        return Err("the second arc must be < 40 when the first is 0 or 1".to_string());
+    }
+    let first = arcs[0]
+        .checked_mul(40)
+        .and_then(|v| v.checked_add(arcs[1]))
+        .ok_or("arc value too large")?;
+    let mut out = Vec::new();
+    push_base128(&mut out, first);
+    for &arc in &arcs[2..] {
+        push_base128(&mut out, arc);
+    }
+    Ok(out)
+}
+
+fn push_base128(out: &mut Vec<u8>, v: u64) {
+    let mut groups = Vec::new();
+    let mut v = v;
+    loop {
+        groups.push((v & 0x7F) as u8);
+        v >>= 7;
+        if v == 0 {
+            break;
+        }
+    }
+    groups.reverse();
+    let last = groups.len() - 1;
+    for (i, g) in groups.iter().enumerate() {
+        out.push(if i == last { *g } else { g | 0x80 });
+    }
+}
+
 /// Two's-complement big-endian integer, if it fits in i128.
 pub fn decode_integer(bytes: &[u8]) -> Option<i128> {
     if bytes.is_empty() || bytes.len() > 16 {
@@ -670,6 +730,33 @@ mod tests {
         assert_eq!(decode_integer(&[0xFF]), Some(-1));
         assert_eq!(decode_integer(&[0x00, 0xFF]), Some(255));
         assert_eq!(decode_integer(&[0x01, 0x00, 0x01]), Some(65537));
+    }
+
+    #[test]
+    fn integer_encoding() {
+        for v in [0i128, 1, -1, 127, 128, -128, -129, 255, 65537, -65537] {
+            let enc = encode_integer(v);
+            assert_eq!(decode_integer(&enc), Some(v), "value {}", v);
+        }
+        assert_eq!(encode_integer(0), [0x00]);
+        assert_eq!(encode_integer(255), [0x00, 0xFF]);
+        assert_eq!(encode_integer(-128), [0x80]);
+    }
+
+    #[test]
+    fn oid_encoding() {
+        assert_eq!(encode_oid("2.5.4.3").unwrap(), [0x55, 0x04, 0x03]);
+        assert_eq!(
+            encode_oid("1.2.840.113549").unwrap(),
+            [0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D]
+        );
+        // Round-trip through the decoder.
+        let enc = encode_oid("2.999.1").unwrap();
+        assert_eq!(oid_arcs(&enc), Some(vec![2, 999, 1]));
+        assert!(encode_oid("1").is_err());
+        assert!(encode_oid("3.1").is_err());
+        assert!(encode_oid("1.40").is_err());
+        assert!(encode_oid("1.2.x").is_err());
     }
 
     #[test]

@@ -18,7 +18,10 @@
 use std::io;
 use std::time::Duration;
 
-use ratatui::crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind};
+use ratatui::crossterm::event::{
+    self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind,
+};
+use ratatui::crossterm::execute;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
@@ -26,7 +29,8 @@ use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph};
 use ratatui::{DefaultTerminal, Frame};
 
 use crate::app::{
-    App, EditKind, Mode, PickerTarget, EDIT_BYTES_PER_LINE, EDIT_DIGITS_PER_LINE, PICKER_CLASSES,
+    App, DateTimeEditor, EditKind, EditState, Editor, HexEditor, Mode, PickerTarget, TextEditor,
+    TextFormat, DATE_FIELDS, EDIT_BYTES_PER_LINE, EDIT_DIGITS_PER_LINE, EDIT_MENU, PICKER_CLASSES,
     PICKER_UNIVERSAL,
 };
 use crate::ber::{
@@ -39,7 +43,10 @@ const CONTENT_HEX_LIMIT: usize = 4096;
 
 pub fn run(mut app: App) -> io::Result<()> {
     let mut terminal = ratatui::init();
+    // Bracketed paste lets clipboard content reach the value editors.
+    let _ = execute!(std::io::stdout(), EnableBracketedPaste);
     let result = event_loop(&mut terminal, &mut app);
+    let _ = execute!(std::io::stdout(), DisableBracketedPaste);
     ratatui::restore();
     result
 }
@@ -50,13 +57,23 @@ fn event_loop(terminal: &mut DefaultTerminal, app: &mut App) -> io::Result<()> {
         if !event::poll(Duration::from_millis(250))? {
             continue;
         }
-        let Event::Key(key) = event::read()? else { continue };
+        let key = match event::read()? {
+            Event::Key(key) => key,
+            Event::Paste(text) => {
+                if let Mode::Edit(ref mut edit) = app.mode {
+                    edit.editor.paste(&text);
+                }
+                continue;
+            }
+            _ => continue,
+        };
         if key.kind != KeyEventKind::Press {
             continue;
         }
         match app.mode {
             Mode::Edit(_) => handle_edit_key(app, key),
             Mode::TypePicker(_) => handle_picker_key(app, key),
+            Mode::EditMenu(_) => handle_menu_key(app, key),
             Mode::Browse => {
                 if handle_browse_key(app, key) {
                     return Ok(());
@@ -92,7 +109,7 @@ fn handle_browse_key(app: &mut App, key: KeyEvent) -> bool {
         KeyCode::Right | KeyCode::Char('l') => app.expand_or_child(),
         KeyCode::Enter | KeyCode::Char(' ') => app.toggle_expand(),
         KeyCode::Char('e') => app.start_edit(),
-        KeyCode::Char('E') => app.start_retag(),
+        KeyCode::Char('E') => app.open_edit_menu(),
         KeyCode::Char('i') => app.start_insert(false),
         KeyCode::Char('I') => app.start_insert(true),
         KeyCode::Char('d') => app.delete_selected(),
@@ -120,6 +137,22 @@ fn handle_picker_key(app: &mut App, key: KeyEvent) {
     }
 }
 
+fn handle_menu_key(app: &mut App, key: KeyEvent) {
+    match key.code {
+        KeyCode::Esc => app.cancel_menu(),
+        KeyCode::Enter => app.menu_confirm(),
+        KeyCode::Up | KeyCode::Char('k') => app.menu_move(-1),
+        KeyCode::Down | KeyCode::Char('j') => app.menu_move(1),
+        KeyCode::Char(c @ '1'..='5') => {
+            if let Mode::EditMenu(ref mut m) = app.mode {
+                m.selected = (c as usize) - ('1' as usize);
+            }
+            app.menu_confirm();
+        }
+        _ => {}
+    }
+}
+
 fn handle_edit_key(app: &mut App, key: KeyEvent) {
     match key.code {
         KeyCode::Esc => {
@@ -134,27 +167,15 @@ fn handle_edit_key(app: &mut App, key: KeyEvent) {
     }
     let Mode::Edit(ref mut edit) = app.mode else { return };
     match key.code {
-        KeyCode::Char(c) if c.is_ascii_hexdigit() => {
-            edit.digits.insert(edit.cursor, c.to_ascii_uppercase());
-            edit.cursor += 1;
-        }
-        KeyCode::Backspace => {
-            if edit.cursor > 0 {
-                edit.cursor -= 1;
-                edit.digits.remove(edit.cursor);
-            }
-        }
-        KeyCode::Delete => {
-            if edit.cursor < edit.digits.len() {
-                edit.digits.remove(edit.cursor);
-            }
-        }
-        KeyCode::Left => edit.cursor = edit.cursor.saturating_sub(1),
-        KeyCode::Right => edit.cursor = (edit.cursor + 1).min(edit.digits.len()),
-        KeyCode::Up => edit.cursor = edit.cursor.saturating_sub(EDIT_DIGITS_PER_LINE),
-        KeyCode::Down => edit.cursor = (edit.cursor + EDIT_DIGITS_PER_LINE).min(edit.digits.len()),
-        KeyCode::Home => edit.cursor = 0,
-        KeyCode::End => edit.cursor = edit.digits.len(),
+        KeyCode::Char(c) => edit.editor.insert_char(c),
+        KeyCode::Backspace => edit.editor.backspace(),
+        KeyCode::Delete => edit.editor.delete(),
+        KeyCode::Left | KeyCode::BackTab => edit.editor.move_horizontal(-1),
+        KeyCode::Right | KeyCode::Tab => edit.editor.move_horizontal(1),
+        KeyCode::Up => edit.editor.move_vertical(-1),
+        KeyCode::Down => edit.editor.move_vertical(1),
+        KeyCode::Home => edit.editor.home(),
+        KeyCode::End => edit.editor.end(),
         _ => {}
     }
 }
@@ -169,6 +190,9 @@ fn draw(frame: &mut Frame, app: &mut App) {
     draw_status(frame, app, status);
     if matches!(app.mode, Mode::TypePicker(_)) {
         draw_picker(frame, app, main);
+    }
+    if matches!(app.mode, Mode::EditMenu(_)) {
+        draw_edit_menu(frame, app, main);
     }
 }
 
@@ -481,73 +505,178 @@ fn draw_content_browse(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(para, area);
 }
 
-fn draw_content_edit(frame: &mut Frame, app: &mut App, area: Rect) {
-    let Mode::Edit(ref mut edit) = app.mode else { return };
-    let inner_height = area.height.saturating_sub(2) as usize; // borders
-    let text_rows = inner_height.saturating_sub(2); // header + hint line
-
-    let cursor_row = edit.cursor / EDIT_DIGITS_PER_LINE;
-    if cursor_row < edit.scroll {
-        edit.scroll = cursor_row;
-    } else if text_rows > 0 && cursor_row >= edit.scroll + text_rows {
-        edit.scroll = cursor_row + 1 - text_rows;
+/// First line of every value editor: live feedback from `to_bytes()`.
+fn feedback_line(edit: &EditState) -> Line<'static> {
+    match edit.to_bytes() {
+        Ok(bytes) => Line::from(Span::styled(
+            format!("→ {} byte{}", bytes.len(), if bytes.len() == 1 { "" } else { "s" }),
+            Style::new().fg(Color::Green),
+        )),
+        Err(e) => Line::from(Span::styled(format!("✗ {}", e), Style::new().fg(Color::Red))),
     }
+}
 
-    let byte_count = edit.digits.len() / 2;
-    let odd = edit.digits.len() % 2 != 0;
-    let mut lines: Vec<Line> = Vec::new();
-    lines.push(Line::from(vec![
-        Span::styled(
-            format!("{} byte{}", byte_count, if byte_count == 1 { "" } else { "s" }),
-            if odd { Style::new().fg(Color::Red) } else { Style::new().fg(Color::Green) },
-        ),
-        Span::styled(
-            if odd { " + 1 dangling digit" } else { "" },
-            Style::new().fg(Color::Red),
-        ),
-    ]));
-
-    let total_rows = edit.digits.len() / EDIT_DIGITS_PER_LINE + 1;
-    for row in edit.scroll..total_rows.min(edit.scroll + text_rows.max(1)) {
-        let start = row * EDIT_DIGITS_PER_LINE;
-        let end = (start + EDIT_DIGITS_PER_LINE).min(edit.digits.len());
-        let mut spans: Vec<Span> = vec![Span::styled(
-            format!("{:08X}  ", row * EDIT_BYTES_PER_LINE),
-            Style::new().dim(),
-        )];
-        for i in start..=end {
-            if i < end {
-                let style = if i == edit.cursor {
-                    Style::new().add_modifier(Modifier::REVERSED)
-                } else {
-                    Style::new()
-                };
-                spans.push(Span::styled(edit.digits[i].to_string(), style));
-                if i % 2 == 1 && i + 1 < end {
-                    spans.push(Span::raw(" "));
-                }
-            } else if i == edit.cursor && i == edit.digits.len() {
-                // Cursor sitting after the last digit.
-                spans.push(Span::styled(" ", Style::new().add_modifier(Modifier::REVERSED)));
-            }
-        }
-        lines.push(Line::from(spans));
-    }
-
-    let (title, hint) = match edit.kind {
-        EditKind::Content => (
-            " EDIT — content octets (hex) ".to_string(),
-            "[Enter] apply   [Esc] cancel   [←→↑↓] move   type hex digits to insert",
-        ),
-        EditKind::Insert { class, tag, constructed, .. } => (
+fn editor_title_hint(edit: &EditState) -> (String, &'static str) {
+    if let EditKind::Insert { class, tag, constructed, .. } = edit.kind {
+        return (
             format!(
                 " INSERT — value for new {} (hex{}) ",
                 ber::type_name_of(class, tag),
                 if constructed { ", must be valid TLVs, may stay empty" } else { ", may stay empty" },
             ),
             "[Enter] insert   [Esc] cancel   length octets are computed automatically",
+        );
+    }
+    match edit.editor {
+        Editor::Hex(_) => (
+            " EDIT — content octets (hex) ".to_string(),
+            "[Enter] apply   [Esc] cancel   [←→↑↓] move   type hex digits to insert",
         ),
-    };
+        Editor::Text(ref t) => match t.format {
+            TextFormat::Base64 => (
+                " EDIT — content octets (base64) ".to_string(),
+                "[Enter] apply   [Esc] cancel   standard base64, whitespace ignored",
+            ),
+            TextFormat::Raw => (
+                " EDIT — raw value (characters → bytes) ".to_string(),
+                "[Enter] apply   [Esc] cancel   typed/pasted characters become UTF-8 bytes",
+            ),
+            TextFormat::Integer => (
+                " EDIT — INTEGER value (decimal) ".to_string(),
+                "[Enter] apply   [Esc] cancel   decimal integer, '-' allowed",
+            ),
+            TextFormat::Real => (
+                " EDIT — REAL value (decimal) ".to_string(),
+                "[Enter] apply   [Esc] cancel   e.g. 3.14, -2.5E3, inf, -inf",
+            ),
+            TextFormat::Oid => (
+                " EDIT — OBJECT IDENTIFIER (dot notation) ".to_string(),
+                "[Enter] apply   [Esc] cancel   e.g. 1.2.840.113549",
+            ),
+            TextFormat::Boolean => (
+                " EDIT — BOOLEAN value ".to_string(),
+                "[Enter] apply   [Esc] cancel   TRUE or FALSE (also 1 / 0)",
+            ),
+            TextFormat::Text(_) => (
+                " EDIT — text value ".to_string(),
+                "[Enter] apply   [Esc] cancel   text is encoded per the string type",
+            ),
+        },
+        Editor::DateTime(_) => (
+            " EDIT — date / time ".to_string(),
+            "[←→/Tab] field   [↑↓] adjust   digits type   [Enter] apply   [Esc] cancel",
+        ),
+    }
+}
+
+fn hex_editor_lines(h: &mut HexEditor, text_rows: usize) -> Vec<Line<'static>> {
+    let cursor_row = h.cursor / EDIT_DIGITS_PER_LINE;
+    if cursor_row < h.scroll {
+        h.scroll = cursor_row;
+    } else if text_rows > 0 && cursor_row >= h.scroll + text_rows {
+        h.scroll = cursor_row + 1 - text_rows;
+    }
+    let mut lines = Vec::new();
+    let total_rows = h.digits.len() / EDIT_DIGITS_PER_LINE + 1;
+    for row in h.scroll..total_rows.min(h.scroll + text_rows.max(1)) {
+        let start = row * EDIT_DIGITS_PER_LINE;
+        let end = (start + EDIT_DIGITS_PER_LINE).min(h.digits.len());
+        let mut spans: Vec<Span> = vec![Span::styled(
+            format!("{:08X}  ", row * EDIT_BYTES_PER_LINE),
+            Style::new().dim(),
+        )];
+        for i in start..=end {
+            if i < end {
+                let style = if i == h.cursor {
+                    Style::new().add_modifier(Modifier::REVERSED)
+                } else {
+                    Style::new()
+                };
+                spans.push(Span::styled(h.digits[i].to_string(), style));
+                if i % 2 == 1 && i + 1 < end {
+                    spans.push(Span::raw(" "));
+                }
+            } else if i == h.cursor && i == h.digits.len() {
+                // Cursor sitting after the last digit.
+                spans.push(Span::styled(" ", Style::new().add_modifier(Modifier::REVERSED)));
+            }
+        }
+        lines.push(Line::from(spans));
+    }
+    lines
+}
+
+fn text_editor_lines(t: &TextEditor, width: usize) -> Vec<Line<'static>> {
+    let width = width.max(1);
+    let mut lines = Vec::new();
+    let mut spans: Vec<Span> = Vec::new();
+    let mut col = 0;
+    for (i, &c) in t.buf.iter().enumerate() {
+        let display = if c == '\n' { '␤' } else if c.is_control() { '·' } else { c };
+        let style = if i == t.cursor {
+            Style::new().add_modifier(Modifier::REVERSED)
+        } else {
+            Style::new()
+        };
+        spans.push(Span::styled(display.to_string(), style));
+        col += 1;
+        if col >= width || c == '\n' {
+            lines.push(Line::from(std::mem::take(&mut spans)));
+            col = 0;
+        }
+    }
+    if t.cursor == t.buf.len() {
+        spans.push(Span::styled(" ", Style::new().add_modifier(Modifier::REVERSED)));
+    }
+    lines.push(Line::from(spans));
+    lines
+}
+
+fn datetime_editor_lines(d: &DateTimeEditor) -> Vec<Line<'static>> {
+    let mut date_spans: Vec<Span> = Vec::new();
+    let mut time_spans: Vec<Span> = Vec::new();
+    for (i, label) in DATE_FIELDS.iter().enumerate() {
+        let target = if i < 3 { &mut date_spans } else { &mut time_spans };
+        target.push(Span::styled(format!("{:<7}", label), Style::new().dim()));
+        let style = if i == d.active {
+            Style::new().add_modifier(Modifier::REVERSED).bold()
+        } else {
+            Style::new().bold()
+        };
+        let width = if i == 0 { 4 } else { 2 };
+        target.push(Span::styled(format!("[{:>w$}]", d.fields[i], w = width), style));
+        target.push(Span::raw("   "));
+    }
+    vec![
+        Line::default(),
+        Line::from(date_spans),
+        Line::default(),
+        Line::from(time_spans),
+        Line::default(),
+        Line::from(Span::styled(
+            if d.generalized {
+                "GeneralizedTime — encoded as YYYYMMDDHHMMSSZ"
+            } else {
+                "UTCTime — encoded as YYMMDDHHMMSSZ (years 1950..2049)"
+            },
+            Style::new().dim(),
+        )),
+    ]
+}
+
+fn draw_content_edit(frame: &mut Frame, app: &mut App, area: Rect) {
+    let Mode::Edit(ref mut edit) = app.mode else { return };
+    let inner_height = area.height.saturating_sub(2) as usize; // borders
+    let inner_width = area.width.saturating_sub(2) as usize;
+    let text_rows = inner_height.saturating_sub(2); // feedback + hint line
+
+    let (title, hint) = editor_title_hint(edit);
+    let mut lines: Vec<Line> = vec![feedback_line(edit)];
+    match edit.editor {
+        Editor::Hex(ref mut h) => lines.extend(hex_editor_lines(h, text_rows)),
+        Editor::Text(ref t) => lines.extend(text_editor_lines(t, inner_width)),
+        Editor::DateTime(ref d) => lines.extend(datetime_editor_lines(d)),
+    }
     lines.push(Line::from(Span::styled(hint, Style::new().dim())));
 
     let para = Paragraph::new(lines).block(
@@ -559,13 +688,51 @@ fn draw_content_edit(frame: &mut Frame, app: &mut App, area: Rect) {
     frame.render_widget(para, area);
 }
 
+/// Centered popup listing the edit modes ('E').
+fn draw_edit_menu(frame: &mut Frame, app: &App, area: Rect) {
+    let Mode::EditMenu(ref m) = app.mode else { return };
+    let width = 66.min(area.width);
+    let height = (EDIT_MENU.len() as u16 + 3).min(area.height);
+    let popup = Rect {
+        x: area.x + (area.width.saturating_sub(width)) / 2,
+        y: area.y + (area.height.saturating_sub(height)) / 2,
+        width,
+        height,
+    };
+    frame.render_widget(Clear, popup);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::new().fg(Color::Yellow))
+        .title(" EDIT — choose editing mode ");
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+    let mut lines: Vec<Line> = Vec::new();
+    for (i, (name, desc)) in EDIT_MENU.iter().enumerate() {
+        let style = if i == m.selected {
+            Style::new().add_modifier(Modifier::REVERSED).bold()
+        } else {
+            Style::new().bold()
+        };
+        lines.push(Line::from(vec![
+            Span::styled(format!(" {} {:<14}", i + 1, name), style),
+            Span::styled(format!(" {}", desc), Style::new().dim()),
+        ]));
+    }
+    lines.push(Line::from(Span::styled(
+        " ↑↓/1-5 select   ⏎ choose   Esc cancel",
+        Style::new().dim(),
+    )));
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
 fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
     let dirty = if app.dirty { " [modified]" } else { "" };
     let hints = match app.mode {
         Mode::Browse => {
-            "q quit  ↑↓ move  ←→ fold  ⏎ toggle  e edit  E type  i/I insert  d delete  J/K reorder  s save  [ ] scroll"
+            "q quit  ↑↓ move  ←→ fold  ⏎ toggle  e hex-edit  E edit-menu  i/I insert  d delete  J/K reorder  s save  [ ] scroll"
         }
         Mode::TypePicker(_) => "←→ column  ↑↓ select  0-9 tag number  ⏎ continue  Esc cancel",
+        Mode::EditMenu(_) => "↑↓ or 1-5 select  ⏎ choose  Esc cancel",
         Mode::Edit(_) => "Enter apply  Esc cancel",
     };
     let line = Line::from(vec![

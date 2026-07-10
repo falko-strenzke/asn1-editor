@@ -162,7 +162,34 @@ impl PickerState {
 
 pub struct EditState {
     pub kind: EditKind,
-    /// Hex digits typed so far (no spaces, upper/lower as typed).
+    pub editor: Editor,
+}
+
+impl EditState {
+    /// Hex-grid editor over `content` (the classic 'e' edit).
+    pub fn hex(kind: EditKind, content: &[u8]) -> Self {
+        EditState { kind, editor: Editor::hex(content) }
+    }
+
+    /// Convert the editor buffer to content octets; Err carries the
+    /// message for the status bar.
+    pub fn to_bytes(&self) -> Result<Vec<u8>, String> {
+        self.editor.to_bytes()
+    }
+}
+
+/// The value editors reachable from the edit menu.
+pub enum Editor {
+    /// Hex grid (16 bytes per line).
+    Hex(HexEditor),
+    /// Single text buffer whose interpretation depends on `format`.
+    Text(TextEditor),
+    /// Date/time form with one field per token.
+    DateTime(DateTimeEditor),
+}
+
+pub struct HexEditor {
+    /// Hex digits typed so far (no spaces).
     pub digits: Vec<char>,
     /// Cursor position in `digits` (0..=len).
     pub cursor: usize,
@@ -170,10 +197,372 @@ pub struct EditState {
     pub scroll: usize,
 }
 
+/// Byte encoding of a text value, derived from the string type's tag.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum StrEncoding {
+    Utf8,
+    /// BMPString (UCS-2 big-endian).
+    Utf16Be,
+    /// UniversalString (UCS-4 big-endian).
+    Utf32Be,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TextFormat {
+    /// Standard base64; whitespace is ignored.
+    Base64,
+    /// Characters are taken literally as bytes (UTF-8), e.g. for pasting.
+    Raw,
+    /// Decimal integer, optionally negative.
+    Integer,
+    /// Decimal real; encoded as ISO 6093 NR3, "inf"/"-inf" supported.
+    Real,
+    /// OBJECT IDENTIFIER in dot notation.
+    Oid,
+    /// TRUE / FALSE (also 1 / 0).
+    Boolean,
+    /// Free text, encoded per the string type.
+    Text(StrEncoding),
+}
+
+pub struct TextEditor {
+    pub format: TextFormat,
+    pub buf: Vec<char>,
+    pub cursor: usize,
+}
+
+pub const DATE_FIELDS: [&str; 6] = ["Year", "Month", "Day", "Hour", "Minute", "Second"];
+
+pub struct DateTimeEditor {
+    /// Digit strings for year, month, day, hour, minute, second.
+    pub fields: [String; 6],
+    pub active: usize,
+    pub generalized: bool,
+}
+
+impl Editor {
+    pub fn hex(content: &[u8]) -> Self {
+        let digits = ber::hex_pairs(content)
+            .chars()
+            .filter(|c| !c.is_whitespace())
+            .collect();
+        Editor::Hex(HexEditor { digits, cursor: 0, scroll: 0 })
+    }
+
+    pub fn text(format: TextFormat, initial: String) -> Self {
+        let buf: Vec<char> = initial.chars().collect();
+        let cursor = buf.len();
+        Editor::Text(TextEditor { format, buf, cursor })
+    }
+
+    /// Printable character typed by the user.
+    pub fn insert_char(&mut self, c: char) {
+        match self {
+            Editor::Hex(h) => {
+                if c.is_ascii_hexdigit() {
+                    h.digits.insert(h.cursor, c.to_ascii_uppercase());
+                    h.cursor += 1;
+                }
+            }
+            Editor::Text(t) => {
+                if !c.is_control() {
+                    t.buf.insert(t.cursor, c);
+                    t.cursor += 1;
+                }
+            }
+            Editor::DateTime(d) => {
+                if c.is_ascii_digit() {
+                    let max = if d.active == 0 { 4 } else { 2 };
+                    if d.fields[d.active].len() < max {
+                        d.fields[d.active].push(c);
+                    }
+                }
+            }
+        }
+    }
+
+    pub fn backspace(&mut self) {
+        match self {
+            Editor::Hex(h) => {
+                if h.cursor > 0 {
+                    h.cursor -= 1;
+                    h.digits.remove(h.cursor);
+                }
+            }
+            Editor::Text(t) => {
+                if t.cursor > 0 {
+                    t.cursor -= 1;
+                    t.buf.remove(t.cursor);
+                }
+            }
+            Editor::DateTime(d) => {
+                d.fields[d.active].pop();
+            }
+        }
+    }
+
+    pub fn delete(&mut self) {
+        match self {
+            Editor::Hex(h) => {
+                if h.cursor < h.digits.len() {
+                    h.digits.remove(h.cursor);
+                }
+            }
+            Editor::Text(t) => {
+                if t.cursor < t.buf.len() {
+                    t.buf.remove(t.cursor);
+                }
+            }
+            Editor::DateTime(d) => d.fields[d.active].clear(),
+        }
+    }
+
+    /// Left/right: cursor movement, or the active date/time field.
+    pub fn move_horizontal(&mut self, delta: isize) {
+        match self {
+            Editor::Hex(h) => {
+                h.cursor = (h.cursor as isize + delta).clamp(0, h.digits.len() as isize) as usize;
+            }
+            Editor::Text(t) => {
+                t.cursor = (t.cursor as isize + delta).clamp(0, t.buf.len() as isize) as usize;
+            }
+            Editor::DateTime(d) => {
+                d.active = (d.active as isize + delta).rem_euclid(6) as usize;
+            }
+        }
+    }
+
+    /// Up/down: hex row, or numeric adjust of the active date/time field.
+    pub fn move_vertical(&mut self, delta: isize) {
+        match self {
+            Editor::Hex(h) => {
+                let step = delta * EDIT_DIGITS_PER_LINE as isize;
+                h.cursor = (h.cursor as isize + step).clamp(0, h.digits.len() as isize) as usize;
+            }
+            Editor::Text(_) => {}
+            Editor::DateTime(d) => {
+                let v = d.fields[d.active].parse::<i64>().unwrap_or(0) - delta as i64;
+                d.fields[d.active] = v.max(0).to_string();
+            }
+        }
+    }
+
+    pub fn home(&mut self) {
+        match self {
+            Editor::Hex(h) => h.cursor = 0,
+            Editor::Text(t) => t.cursor = 0,
+            Editor::DateTime(d) => d.active = 0,
+        }
+    }
+
+    pub fn end(&mut self) {
+        match self {
+            Editor::Hex(h) => h.cursor = h.digits.len(),
+            Editor::Text(t) => t.cursor = t.buf.len(),
+            Editor::DateTime(d) => d.active = 5,
+        }
+    }
+
+    /// Bracketed-paste input.
+    pub fn paste(&mut self, s: &str) {
+        for c in s.chars() {
+            match self {
+                // The raw editor keeps line breaks (they are data).
+                Editor::Text(t)
+                    if t.format == TextFormat::Raw && (c == '\n' || c == '\r') =>
+                {
+                    t.buf.insert(t.cursor, '\n');
+                    t.cursor += 1;
+                }
+                _ => self.insert_char(c),
+            }
+        }
+    }
+
+    pub fn to_bytes(&self) -> Result<Vec<u8>, String> {
+        match self {
+            Editor::Hex(h) => {
+                if !h.digits.len().is_multiple_of(2) {
+                    return Err("odd number of hex digits — add or remove one".to_string());
+                }
+                let hex: String = h.digits.iter().collect();
+                input::hex_decode(&hex).map_err(|e| format!("invalid hex: {}", e))
+            }
+            Editor::Text(t) => text_to_bytes(t),
+            Editor::DateTime(d) => datetime_to_bytes(d),
+        }
+    }
+}
+
+fn text_to_bytes(t: &TextEditor) -> Result<Vec<u8>, String> {
+    let s: String = t.buf.iter().collect();
+    match t.format {
+        TextFormat::Base64 => {
+            let stripped: String = s.chars().filter(|c| !c.is_whitespace()).collect();
+            input::b64_decode(&stripped).map_err(|e| format!("invalid base64: {}", e))
+        }
+        TextFormat::Raw => Ok(s.into_bytes()),
+        TextFormat::Integer => {
+            let v: i128 = s
+                .trim()
+                .parse()
+                .map_err(|_| "not a valid decimal integer".to_string())?;
+            Ok(ber::encode_integer(v))
+        }
+        TextFormat::Real => {
+            let trimmed = s.trim();
+            match trimmed.to_ascii_lowercase().as_str() {
+                "inf" | "+inf" => return Ok(vec![0x40]),
+                "-inf" => return Ok(vec![0x41]),
+                _ => {}
+            }
+            let v: f64 = trimmed
+                .parse()
+                .map_err(|_| "not a valid decimal number (or inf / -inf)".to_string())?;
+            if v == 0.0 {
+                Ok(Vec::new()) // REAL zero has empty content
+            } else {
+                // ISO 6093 NR3 decimal encoding.
+                let mut out = vec![0x03];
+                out.extend_from_slice(format!("{:E}", v).as_bytes());
+                Ok(out)
+            }
+        }
+        TextFormat::Oid => ber::encode_oid(s.trim()),
+        TextFormat::Boolean => match s.trim().to_ascii_uppercase().as_str() {
+            "TRUE" | "T" | "1" | "YES" => Ok(vec![0xFF]),
+            "FALSE" | "F" | "0" | "NO" => Ok(vec![0x00]),
+            _ => Err("enter TRUE or FALSE".to_string()),
+        },
+        TextFormat::Text(enc) => Ok(match enc {
+            StrEncoding::Utf8 => s.into_bytes(),
+            StrEncoding::Utf16Be => s
+                .encode_utf16()
+                .flat_map(|u| u.to_be_bytes())
+                .collect(),
+            StrEncoding::Utf32Be => s
+                .chars()
+                .flat_map(|c| (c as u32).to_be_bytes())
+                .collect(),
+        }),
+    }
+}
+
+fn datetime_to_bytes(d: &DateTimeEditor) -> Result<Vec<u8>, String> {
+    let mut nums = [0u32; 6];
+    for (i, field) in d.fields.iter().enumerate() {
+        nums[i] = field
+            .parse()
+            .map_err(|_| format!("{} is not filled in", DATE_FIELDS[i]))?;
+    }
+    let [year, month, day, hour, minute, second] = nums;
+    let range_err = |what: &str, lo: u32, hi: u32| format!("{} must be {}..{}", what, lo, hi);
+    if d.generalized {
+        if year > 9999 {
+            return Err(range_err("Year", 0, 9999));
+        }
+    } else if !(1950..=2049).contains(&year) {
+        return Err("UTCTime years span 1950..2049 (two digits)".to_string());
+    }
+    if !(1..=12).contains(&month) {
+        return Err(range_err("Month", 1, 12));
+    }
+    if !(1..=31).contains(&day) {
+        return Err(range_err("Day", 1, 31));
+    }
+    if hour > 23 {
+        return Err(range_err("Hour", 0, 23));
+    }
+    if minute > 59 {
+        return Err(range_err("Minute", 0, 59));
+    }
+    if second > 59 {
+        return Err(range_err("Second", 0, 59));
+    }
+    let s = if d.generalized {
+        format!("{:04}{:02}{:02}{:02}{:02}{:02}Z", year, month, day, hour, minute, second)
+    } else {
+        format!("{:02}{:02}{:02}{:02}{:02}{:02}Z", year % 100, month, day, hour, minute, second)
+    };
+    Ok(s.into_bytes())
+}
+
+/// Pre-populate the date/time form from an existing UTCTime /
+/// GeneralizedTime value; falls back to a neutral default.
+fn datetime_from_value(value: &[u8], generalized: bool) -> DateTimeEditor {
+    let default = DateTimeEditor {
+        fields: [
+            "2000".to_string(),
+            "01".to_string(),
+            "01".to_string(),
+            "00".to_string(),
+            "00".to_string(),
+            "00".to_string(),
+        ],
+        active: 0,
+        generalized,
+    };
+    let Ok(s) = std::str::from_utf8(value) else { return default };
+    let Some(digits) = s.strip_suffix('Z') else { return default };
+    let need = if generalized { 14 } else { 12 };
+    if digits.len() != need || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return default;
+    }
+    let (year, rest) = if generalized {
+        (digits[0..4].to_string(), &digits[4..])
+    } else {
+        let yy: u32 = digits[0..2].parse().unwrap();
+        let year = if yy < 50 { 2000 + yy } else { 1900 + yy };
+        (year.to_string(), &digits[2..])
+    };
+    DateTimeEditor {
+        fields: [
+            year,
+            rest[0..2].to_string(),
+            rest[2..4].to_string(),
+            rest[4..6].to_string(),
+            rest[6..8].to_string(),
+            rest[8..10].to_string(),
+        ],
+        active: 0,
+        generalized,
+    }
+}
+
+fn decode_utf16be(v: &[u8]) -> String {
+    let units: Vec<u16> = v.chunks(2).map(|c| u16::from_be_bytes([c[0], *c.get(1).unwrap_or(&0)])).collect();
+    String::from_utf16_lossy(&units)
+}
+
+fn decode_utf32be(v: &[u8]) -> String {
+    v.chunks(4)
+        .map(|c| {
+            let mut b = [0u8; 4];
+            b[..c.len()].copy_from_slice(c);
+            char::from_u32(u32::from_be_bytes(b)).unwrap_or('\u{FFFD}')
+        })
+        .collect()
+}
+
+/// Entries of the edit-mode menu opened with 'E'.
+pub const EDIT_MENU: [(&str, &str); 5] = [
+    ("Tag type", "change class / form / tag number of the element"),
+    ("Hex", "edit the content octets as hex digits"),
+    ("Base64", "edit the content octets as base64 text"),
+    ("Raw binary", "characters become bytes verbatim (paste-friendly)"),
+    ("Type specific", "number, OID, text, TRUE/FALSE, date/time fields …"),
+];
+
+pub struct MenuState {
+    pub selected: usize,
+}
+
 pub enum Mode {
     Browse,
-    /// Type-picker popup of the insert actions.
+    /// Type-picker popup of the insert and retag actions.
     TypePicker(PickerState),
+    /// Edit-mode chooser popup ('E').
+    EditMenu(MenuState),
     Edit(EditState),
 }
 
@@ -316,13 +705,143 @@ impl App {
 
     pub fn start_edit(&mut self) {
         let Some(node) = self.selected_node() else { return };
-        let digits: Vec<char> = ber::hex_pairs(&node.content_octets())
-            .chars()
-            .filter(|c| !c.is_whitespace())
-            .collect();
-        self.mode = Mode::Edit(EditState { kind: EditKind::Content, digits, cursor: 0, scroll: 0 });
+        self.mode = Mode::Edit(EditState::hex(EditKind::Content, &node.content_octets()));
         self.status =
             "editing content octets — type hex digits, Enter applies, Esc cancels".to_string();
+    }
+
+    /// 'E' opens the edit-mode menu for the selected element.
+    pub fn open_edit_menu(&mut self) {
+        if self.selected_node().is_none() {
+            return;
+        }
+        self.mode = Mode::EditMenu(MenuState { selected: 0 });
+        self.status = "choose how to edit the selected element".to_string();
+    }
+
+    pub fn cancel_menu(&mut self) {
+        self.mode = Mode::Browse;
+        self.status = "cancelled".to_string();
+    }
+
+    pub fn menu_move(&mut self, delta: isize) {
+        if let Mode::EditMenu(ref mut m) = self.mode {
+            m.selected = (m.selected as isize + delta)
+                .rem_euclid(EDIT_MENU.len() as isize) as usize;
+        }
+    }
+
+    pub fn menu_confirm(&mut self) {
+        let Mode::EditMenu(ref m) = self.mode else { return };
+        match m.selected {
+            0 => self.start_retag(),
+            1 => self.start_edit(),
+            2 => self.start_edit_base64(),
+            3 => self.start_edit_raw(),
+            _ => self.start_edit_type_specific(),
+        }
+    }
+
+    fn start_edit_base64(&mut self) {
+        let Some(node) = self.selected_node() else { return };
+        let initial = input::b64_encode(&node.content_octets());
+        self.mode = Mode::Edit(EditState {
+            kind: EditKind::Content,
+            editor: Editor::text(TextFormat::Base64, initial),
+        });
+        self.status = "editing content octets as base64 — Enter applies".to_string();
+    }
+
+    fn start_edit_raw(&mut self) {
+        let Some(node) = self.selected_node() else { return };
+        let content = node.content_octets();
+        let (initial, note) = match String::from_utf8(content) {
+            Ok(s) => (s, ""),
+            Err(_) => (
+                String::new(),
+                " (current value is not text, so the editor starts empty)",
+            ),
+        };
+        self.mode = Mode::Edit(EditState {
+            kind: EditKind::Content,
+            editor: Editor::text(TextFormat::Raw, initial),
+        });
+        self.status = format!(
+            "raw edit: typed/pasted characters become the value bytes{}",
+            note
+        );
+    }
+
+    /// The "type specific" menu entry: pick the most natural editor for
+    /// the selected element's universal type.
+    fn start_edit_type_specific(&mut self) {
+        let Some(node) = self.selected_node() else { return };
+        if node.constructed {
+            self.status =
+                "constructed elements have no single value — use hex/base64 or edit the children"
+                    .to_string();
+            return; // stay in the menu
+        }
+        let v = &node.value;
+        let (editor, hint) = if node.class != Class::Universal {
+            (Editor::hex(v), "no type information for this tag — editing as hex")
+        } else {
+            match node.tag {
+                ber::TAG_NULL => {
+                    self.status = "NULL has an empty value — nothing to edit".to_string();
+                    return; // stay in the menu
+                }
+                ber::TAG_INTEGER | ber::TAG_ENUMERATED => {
+                    let initial = ber::decode_integer(v).map(|i| i.to_string()).unwrap_or_default();
+                    (Editor::text(TextFormat::Integer, initial), "enter a decimal integer")
+                }
+                9 => (
+                    Editor::text(TextFormat::Real, String::new()),
+                    "enter a decimal number (e.g. 3.14, -2.5E3, inf)",
+                ),
+                ber::TAG_OID => {
+                    let initial = ber::oid_arcs(v)
+                        .map(|arcs| {
+                            arcs.iter().map(|a| a.to_string()).collect::<Vec<_>>().join(".")
+                        })
+                        .unwrap_or_default();
+                    (Editor::text(TextFormat::Oid, initial), "enter the OID in dot notation")
+                }
+                ber::TAG_BOOLEAN => {
+                    let initial =
+                        if v.first().copied().unwrap_or(0) == 0 { "FALSE" } else { "TRUE" };
+                    (
+                        Editor::text(TextFormat::Boolean, initial.to_string()),
+                        "enter TRUE or FALSE",
+                    )
+                }
+                ber::TAG_UTC_TIME | ber::TAG_GENERALIZED_TIME => {
+                    let generalized = node.tag == ber::TAG_GENERALIZED_TIME;
+                    (
+                        Editor::DateTime(datetime_from_value(v, generalized)),
+                        "fill in the date/time fields",
+                    )
+                }
+                28 => (
+                    Editor::text(TextFormat::Text(StrEncoding::Utf32Be), decode_utf32be(v)),
+                    "enter text (stored as UCS-4)",
+                ),
+                30 => (
+                    Editor::text(TextFormat::Text(StrEncoding::Utf16Be), decode_utf16be(v)),
+                    "enter text (stored as UCS-2)",
+                ),
+                7 | ber::TAG_UTF8_STRING | 18..=22 | 25..=27 => (
+                    Editor::text(
+                        TextFormat::Text(StrEncoding::Utf8),
+                        String::from_utf8_lossy(v).into_owned(),
+                    ),
+                    "enter text",
+                ),
+                _ => (Editor::hex(v), "no natural form for this type — editing as hex"),
+            }
+        };
+        self.mode = Mode::Edit(EditState { kind: EditKind::Content, editor });
+        self.status = format!("{} — Enter applies, Esc cancels", hint);
     }
 
     /// 'i' inserts after the selected element; 'I' (`as_child`) inserts as
@@ -434,8 +953,7 @@ impl App {
         match p.target.clone() {
             PickerTarget::Insert { parent, index } => {
                 let kind = EditKind::Insert { parent, index, class, constructed, tag };
-                self.mode =
-                    Mode::Edit(EditState { kind, digits: Vec::new(), cursor: 0, scroll: 0 });
+                self.mode = Mode::Edit(EditState::hex(kind, &[]));
                 self.status = format!(
                     "value for new {} — hex content octets (may stay empty), Enter inserts",
                     ber::type_name_of(class, tag),
@@ -554,15 +1072,10 @@ impl App {
 
     pub fn commit_edit(&mut self) {
         let Mode::Edit(ref edit) = self.mode else { return };
-        if edit.digits.len() % 2 != 0 {
-            self.status = "odd number of hex digits — add or remove one".to_string();
-            return;
-        }
-        let hex: String = edit.digits.iter().collect();
-        let bytes = match input::hex_decode(&hex) {
+        let bytes = match edit.to_bytes() {
             Ok(b) => b,
             Err(e) => {
-                self.status = format!("invalid hex: {}", e);
+                self.status = e;
                 return;
             }
         };
@@ -774,12 +1287,7 @@ mod tests {
         let data = [0x30, 0x04, 0x04, 0x02, 0xAA, 0xBB];
         let mut app = test_app(&data);
         app.select(1);
-        app.mode = Mode::Edit(EditState {
-            kind: EditKind::Content,
-            digits: "010203".chars().collect(),
-            cursor: 0,
-            scroll: 0,
-        });
+        app.mode = Mode::Edit(EditState::hex(EditKind::Content, &input::hex_decode("010203").unwrap()));
         app.commit_edit();
         assert!(app.dirty);
         assert_eq!(
@@ -796,12 +1304,7 @@ mod tests {
         let data = [0x30, 0x02, 0x05, 0x00];
         let mut app = test_app(&data);
         app.select(0);
-        app.mode = Mode::Edit(EditState {
-            kind: EditKind::Content,
-            digits: "05".chars().collect(), // truncated TLV
-            cursor: 0,
-            scroll: 0,
-        });
+        app.mode = Mode::Edit(EditState::hex(EditKind::Content, &input::hex_decode("05").unwrap()));
         app.commit_edit();
         assert!(!app.dirty);
         assert!(matches!(app.mode, Mode::Edit(_)));
@@ -860,7 +1363,7 @@ mod tests {
 
     fn type_value(app: &mut App, hex: &str) {
         let Mode::Edit(ref mut edit) = app.mode else { panic!("not in edit mode") };
-        edit.digits = hex.chars().collect();
+        edit.editor = Editor::hex(&input::hex_decode(hex).unwrap());
         app.commit_edit();
     }
 
@@ -973,6 +1476,200 @@ mod tests {
         assert_eq!(app.rows.len(), 1);
     }
 
+    /// Open the edit menu and confirm the given entry.
+    fn choose_edit_mode(app: &mut App, entry: usize) {
+        app.open_edit_menu();
+        let Mode::EditMenu(ref mut m) = app.mode else { panic!("menu not open") };
+        m.selected = entry;
+        app.menu_confirm();
+    }
+
+    fn set_text(app: &mut App, text: &str) {
+        let Mode::Edit(EditState { editor: Editor::Text(ref mut t), .. }) = app.mode else {
+            panic!("no text editor open")
+        };
+        t.buf = text.chars().collect();
+        t.cursor = t.buf.len();
+        app.commit_edit();
+    }
+
+    #[test]
+    fn edit_menu_routes_to_retag_and_hex() {
+        let data = [0x02, 0x01, 0x2A];
+        let mut app = test_app(&data);
+        choose_edit_mode(&mut app, 0);
+        assert!(matches!(app.mode, Mode::TypePicker(_)));
+        app.cancel_picker();
+        choose_edit_mode(&mut app, 1);
+        assert!(matches!(
+            app.mode,
+            Mode::Edit(EditState { editor: Editor::Hex(_), .. })
+        ));
+    }
+
+    #[test]
+    fn base64_edit_prefills_and_applies() {
+        let data = [0x04, 0x02, 0xAA, 0xBB];
+        let mut app = test_app(&data);
+        choose_edit_mode(&mut app, 2);
+        {
+            let Mode::Edit(EditState { editor: Editor::Text(ref t), .. }) = app.mode else {
+                panic!()
+            };
+            assert_eq!(t.format, TextFormat::Base64);
+            assert_eq!(t.buf.iter().collect::<String>(), input::b64_encode(&[0xAA, 0xBB]));
+        }
+        set_text(&mut app, &input::b64_encode(&[1, 2, 3]));
+        assert_eq!(ber::encode_forest(&app.roots), [0x04, 0x03, 0x01, 0x02, 0x03]);
+    }
+
+    #[test]
+    fn base64_edit_rejects_invalid_input() {
+        let data = [0x04, 0x01, 0xAA];
+        let mut app = test_app(&data);
+        choose_edit_mode(&mut app, 2);
+        set_text(&mut app, "not base64!!");
+        assert!(matches!(app.mode, Mode::Edit(_)), "invalid base64 must not commit");
+        assert_eq!(ber::encode_forest(&app.roots), data);
+    }
+
+    #[test]
+    fn raw_edit_takes_characters_as_bytes() {
+        let data = [0x0C, 0x02, 0x48, 0x69]; // UTF8String "Hi"
+        let mut app = test_app(&data);
+        choose_edit_mode(&mut app, 3);
+        {
+            let Mode::Edit(EditState { editor: Editor::Text(ref t), .. }) = app.mode else {
+                panic!()
+            };
+            assert_eq!(t.format, TextFormat::Raw);
+            assert_eq!(t.buf.iter().collect::<String>(), "Hi");
+        }
+        set_text(&mut app, "ABC");
+        assert_eq!(ber::encode_forest(&app.roots), [0x0C, 0x03, 0x41, 0x42, 0x43]);
+    }
+
+    #[test]
+    fn type_specific_integer_prefills_decimal() {
+        let data = [0x02, 0x01, 0x2A]; // INTEGER 42
+        let mut app = test_app(&data);
+        choose_edit_mode(&mut app, 4);
+        {
+            let Mode::Edit(EditState { editor: Editor::Text(ref t), .. }) = app.mode else {
+                panic!()
+            };
+            assert_eq!(t.format, TextFormat::Integer);
+            assert_eq!(t.buf.iter().collect::<String>(), "42");
+        }
+        set_text(&mut app, "-1");
+        assert_eq!(ber::encode_forest(&app.roots), [0x02, 0x01, 0xFF]);
+    }
+
+    #[test]
+    fn type_specific_oid_dot_notation() {
+        let data = [0x06, 0x03, 0x55, 0x04, 0x03]; // 2.5.4.3
+        let mut app = test_app(&data);
+        choose_edit_mode(&mut app, 4);
+        {
+            let Mode::Edit(EditState { editor: Editor::Text(ref t), .. }) = app.mode else {
+                panic!()
+            };
+            assert_eq!(t.buf.iter().collect::<String>(), "2.5.4.3");
+        }
+        set_text(&mut app, "1.2.840.113549");
+        assert_eq!(
+            ber::encode_forest(&app.roots),
+            [0x06, 0x06, 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D]
+        );
+    }
+
+    #[test]
+    fn type_specific_boolean() {
+        let data = [0x01, 0x01, 0xFF];
+        let mut app = test_app(&data);
+        choose_edit_mode(&mut app, 4);
+        set_text(&mut app, "false");
+        assert_eq!(ber::encode_forest(&app.roots), [0x01, 0x01, 0x00]);
+    }
+
+    #[test]
+    fn type_specific_utf8_text() {
+        let data = [0x0C, 0x02, 0x48, 0x69]; // UTF8String "Hi"
+        let mut app = test_app(&data);
+        choose_edit_mode(&mut app, 4);
+        set_text(&mut app, "Grüße");
+        assert_eq!(
+            ber::encode_forest(&app.roots)[2..],
+            *"Grüße".as_bytes()
+        );
+    }
+
+    #[test]
+    fn type_specific_bmpstring_is_ucs2() {
+        let data = [0x1E, 0x02, 0x00, 0x41]; // BMPString "A"
+        let mut app = test_app(&data);
+        choose_edit_mode(&mut app, 4);
+        set_text(&mut app, "AB");
+        assert_eq!(ber::encode_forest(&app.roots), [0x1E, 0x04, 0x00, 0x41, 0x00, 0x42]);
+    }
+
+    #[test]
+    fn type_specific_datetime_prefills_fields() {
+        let data = *b"\x17\x0d260709115028Z"; // UTCTime
+        let mut app = test_app(&data);
+        choose_edit_mode(&mut app, 4);
+        let Mode::Edit(EditState { editor: Editor::DateTime(ref mut d), .. }) = app.mode else {
+            panic!("no date editor")
+        };
+        assert!(!d.generalized);
+        assert_eq!(d.fields, ["2026", "07", "09", "11", "50", "28"].map(String::from));
+        d.fields[1] = "12".to_string(); // month
+        app.commit_edit();
+        assert_eq!(&ber::encode_forest(&app.roots)[2..], b"261209115028Z");
+    }
+
+    #[test]
+    fn type_specific_datetime_validates_ranges() {
+        let data = *b"\x17\x0d260709115028Z";
+        let mut app = test_app(&data);
+        choose_edit_mode(&mut app, 4);
+        {
+            let Mode::Edit(EditState { editor: Editor::DateTime(ref mut d), .. }) = app.mode
+            else {
+                panic!()
+            };
+            d.fields[2] = "32".to_string(); // day out of range
+        }
+        app.commit_edit();
+        assert!(matches!(app.mode, Mode::Edit(_)), "invalid date must not commit");
+        assert_eq!(ber::encode_forest(&app.roots), data);
+    }
+
+    #[test]
+    fn type_specific_refused_for_constructed_and_null() {
+        let data = [0x30, 0x02, 0x05, 0x00];
+        let mut app = test_app(&data);
+        app.select(0); // SEQUENCE
+        choose_edit_mode(&mut app, 4);
+        assert!(matches!(app.mode, Mode::EditMenu(_)), "constructed: stay in menu");
+        app.cancel_menu();
+        app.select(1); // NULL
+        choose_edit_mode(&mut app, 4);
+        assert!(matches!(app.mode, Mode::EditMenu(_)), "NULL: stay in menu");
+    }
+
+    #[test]
+    fn editor_paste_filters_hex() {
+        let data = [0x04, 0x01, 0xAA];
+        let mut app = test_app(&data);
+        app.start_edit();
+        let Mode::Edit(ref mut edit) = app.mode else { panic!() };
+        edit.editor = Editor::hex(&[]);
+        edit.editor.paste("01 02:0a\n");
+        app.commit_edit();
+        assert_eq!(ber::encode_forest(&app.roots), [0x04, 0x03, 0x01, 0x02, 0x0A]);
+    }
+
     #[test]
     fn retag_prepopulates_picker_with_current_type() {
         // SEQUENCE { INTEGER 1 }
@@ -1069,12 +1766,7 @@ mod tests {
         let mut app = test_app(&data);
         app.select(0);
         // New content is a complete nested INTEGER.
-        app.mode = Mode::Edit(EditState {
-            kind: EditKind::Content,
-            digits: "02021234".chars().collect(),
-            cursor: 0,
-            scroll: 0,
-        });
+        app.mode = Mode::Edit(EditState::hex(EditKind::Content, &input::hex_decode("02021234").unwrap()));
         app.commit_edit();
         let node = app.node_at(&[0]).unwrap();
         assert!(node.encapsulates);

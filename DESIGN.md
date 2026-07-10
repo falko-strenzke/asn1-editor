@@ -161,9 +161,8 @@ Consequences, verified by tests:
 
 ## 7. Editing model
 
-Editing is deliberately low-level and format-agnostic: the user edits the
-**content octets** of the selected element as hex. What that means per node
-kind:
+All value edits ultimately replace the **content octets** of the selected
+element. What that means per node kind:
 
 | Node kind        | Edit buffer contains                | On apply |
 |------------------|-------------------------------------|----------|
@@ -173,7 +172,10 @@ kind:
 
 Apply pipeline (`App::commit_edit` → `App::rebuild`):
 
-1. Hex digits are validated on input; an odd digit count blocks apply.
+1. The editor buffer is converted to bytes (`Editor::to_bytes`); a
+   validation error (odd hex digit count, bad base64, malformed number/OID,
+   out-of-range date field, …) blocks apply and is shown in the status bar
+   as well as live in the editor pane.
 2. The new bytes are placed into the node (children re-parsed for
    constructed nodes).
 3. The **whole forest is re-encoded and re-parsed.** This single mechanism
@@ -185,6 +187,41 @@ Apply pipeline (`App::commit_edit` → `App::rebuild`):
 The re-parse in step 3 cannot fail for tree shapes produced in step 2 (our
 own encoder output is always parseable); if it ever did, the previous tree
 is kept and an internal error is shown.
+
+### The edit menu and value editors
+
+`e` opens the hex editor directly; `E` opens a popup menu
+(`Mode::EditMenu`) with five editing modes, also selectable with `1`-`5`:
+
+1. **Tag type** — the type-picker dialog with a `Retag` target (below).
+2. **Hex** — `Editor::Hex`, a 16-bytes-per-line hex grid.
+3. **Base64** — `Editor::Text` with `TextFormat::Base64`; pre-filled with
+   the current value, whitespace ignored on apply.
+4. **Raw binary** — `TextFormat::Raw`: typed or pasted characters become
+   the value bytes verbatim (UTF-8). Bracketed paste is enabled, so
+   clipboard content arrives as a single paste event in every editor (the
+   hex editor filters it to hex digits). Pre-filled only when the current
+   value is valid UTF-8. A terminal cannot transport arbitrary byte values
+   as key input, hence "raw" means "the UTF-8 bytes of the characters".
+5. **Type specific** — the most natural editor for the element's universal
+   type:
+
+   | Type | Editor |
+   |------|--------|
+   | INTEGER, ENUMERATED | decimal integer (pre-filled) |
+   | REAL | decimal number, `inf`/`-inf`; encoded as ISO 6093 NR3 (decimal), zero as empty content |
+   | OBJECT IDENTIFIER | dot notation (pre-filled) |
+   | BOOLEAN | TRUE / FALSE (also 1 / 0) |
+   | UTF8String and other ASCII/UTF-8 string types | plain text |
+   | BMPString / UniversalString | plain text, encoded UCS-2 / UCS-4 big-endian |
+   | UTCTime / GeneralizedTime | a form with **separate fields for year, month, day, hour, minute, second** (`Editor::DateTime`), pre-filled from the current value; `←→`/Tab switch fields, `↑↓` adjust, ranges validated on apply |
+   | OCTET STRING, BIT STRING, everything else | hex grid |
+
+   NULL and constructed elements have no single natural value; the menu
+   says so and stays open.
+
+Every editor shows a live feedback line: the byte count the buffer would
+encode to, or the validation error, recomputed each frame.
 
 ### The type-picker dialog
 
@@ -223,7 +260,7 @@ are recomputed by the one existing mechanism:
   empty document (or an empty constructed element) is supported; a
   collapsed parent is auto-expanded so the insertion is visible, and the
   selection lands on the inserted element.
-* **Retag** (`E`): opens the type-picker with a `Retag` target,
+* **Retag** (`E` → "Tag type"): opens the type-picker with a `Retag` target,
   pre-populated with the selected element's current class, form and tag.
   Confirming a different type rewrites the identifier octets **in place
   while keeping the content octets**; the length is unchanged unless the
@@ -279,10 +316,12 @@ Built with ratatui 0.29 (bundled crossterm backend, `ratatui::init()` /
 * **Right pane — content.** Type/class/tag, offset, header and content
   length, decoded value (integers, OIDs dotted, strings, times, unused
   bits) and a `hexdump -C`-style dump of the content octets.
-* **Edit mode** (`e`): the right pane becomes a hex editor over the content
-  octets — 16 bytes per line, insert-at-cursor semantics, live byte count,
-  red indicator while the digit count is odd. `Enter` applies (§7),
-  `Esc` cancels. The pane border turns yellow as a mode cue.
+* **Edit mode** (`e` for hex directly, `E` for the edit menu): the right
+  pane becomes one of the value editors of §7 — hex grid, text line
+  (base64 / raw / number / OID / boolean / text) or the date/time form —
+  with insert-at-cursor semantics and a live feedback line (resulting byte
+  count, or the validation error in red). `Enter` applies (§7), `Esc`
+  cancels. The pane border turns yellow as a mode cue.
 * **Status bar**: `[modified]` flag, last action / error message, key help.
 
 ### Key bindings
@@ -296,7 +335,7 @@ Built with ratatui 0.29 (bundled crossterm backend, `ratatui::init()` /
 | `→`/`l` | expand node, or enter first child |
 | `Enter`/`Space` | toggle fold |
 | `e` | edit selected element's content octets (hex) |
-| `E` | change the selected element's type (type-picker dialog, keeps the value) |
+| `E` | edit menu: tag type / hex / base64 / raw binary / type specific |
 | `i` | insert new element after the selection (type-picker dialog, then value) |
 | `I` | insert new element as first child of a constructed element |
 | `←→`/`Tab`, `↑↓`, `0-9`, `Enter`, `Esc` | (type picker) column / selection / tag number / confirm / cancel |

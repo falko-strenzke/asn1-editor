@@ -38,7 +38,7 @@ the edited data in the same outer format.
 | `↑`/`k`, `↓`/`j`, `PgUp`/`PgDn`, `g`, `G` | navigate the tree |
 | `←`/`h`, `→`/`l`, `Enter`/`Space` | collapse / expand / toggle |
 | `e` | edit the selected element's content octets as hex |
-| `E` | change the selected element's type (opens the type-picker, keeps the value) |
+| `E` | open the edit menu: tag type / hex / base64 / raw binary / type specific |
 | `i` | insert a new element after the selected one (type-picker dialog, then value) |
 | `I` | insert a new element as first child of the selected constructed element |
 | `d` `d` | delete the selected element (press twice to confirm) |
@@ -65,11 +65,24 @@ default); identifier and length octets are generated, and the lengths of
 all enclosing elements are recomputed automatically — as for every other
 edit operation.
 
-`E` opens the same dialog for the **selected element**, pre-populated with
-its current class, form and tag. Confirming a different type re-tags the
-element in place while keeping its content octets (switching to a
-constructed form requires the content to be valid ASN.1); the value itself
-is edited separately with `e`.
+`E` opens an **edit menu** for the selected element with five modes:
+
+1. **Tag type** — the type-picker dialog pre-populated with the element's
+   current class/form/tag; confirming re-tags the element in place while
+   keeping its content octets.
+2. **Hex** — the same hex editor as `e`.
+3. **Base64** — the value as base64 text (pre-filled, whitespace ignored).
+4. **Raw binary** — typed or pasted characters become the value bytes
+   verbatim (UTF-8); useful for pasting data from the clipboard.
+5. **Type specific** — the value in its most natural form: decimal entry
+   for INTEGER/ENUMERATED/REAL, dot notation for OBJECT IDENTIFIER,
+   TRUE/FALSE for BOOLEAN, plain text for the string types (encoded as
+   UCS-2/UCS-4 for BMPString/UniversalString), hex for OCTET/BIT STRING,
+   and for UTCTime/GeneralizedTime a form with separate year, month, day,
+   hour, minute and second fields — no date-format guessing needed.
+
+Every editor shows live feedback (resulting byte count or the validation
+error) and applies with `Enter`; lengths are recomputed automatically.
 
 ## License
 
