@@ -447,6 +447,41 @@ fn draw_picker(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(Paragraph::new(preview), preview_area);
 }
 
+/// Render a bit-field box: one entry per column, each column holding
+/// [bit positions (embedded in the top border), bit values, field label,
+/// decoded meaning]. Returns 5 rows of box-drawing text.
+fn bitfield_box(cols: &[[String; 4]]) -> Vec<String> {
+    let widths: Vec<usize> =
+        cols.iter().map(|c| c.iter().map(|s| s.chars().count()).max().unwrap()).collect();
+    let last = cols.len() - 1;
+    let border = |left: char, mid: char, right: char, with_positions: bool| {
+        let mut out = String::from(left);
+        for (i, w) in widths.iter().enumerate() {
+            let content = if with_positions { cols[i][0].as_str() } else { "" };
+            out.push_str(content);
+            out.extend(std::iter::repeat_n('─', w - content.chars().count()));
+            out.push(if i < last { mid } else { right });
+        }
+        out
+    };
+    let row = |idx: usize| {
+        let mut out = String::from("│");
+        for (i, col) in cols.iter().enumerate() {
+            out.push_str(&col[idx]);
+            out.extend(std::iter::repeat_n(' ', widths[i] - col[idx].chars().count()));
+            out.push('│');
+        }
+        out
+    };
+    vec![
+        border('┌', '┬', '┐', true),
+        row(1),
+        row(2),
+        row(3),
+        border('└', '┴', '┘', false),
+    ]
+}
+
 /// Text rows of the tag bit-field diagram: which bits of the identifier
 /// octet(s) hold which field, how wide each field is, and what it decodes
 /// to. Row order: top border, bit values, field labels, decoded meaning,
@@ -472,7 +507,7 @@ pub fn tag_layout_strings(node: &Node) -> Vec<String> {
     };
 
     // One entry per column: [bit positions, bit values, label, decoded].
-    let cols: [[String; 4]; 3] = [
+    let cols: Vec<[String; 4]> = vec![
         [
             " 8 7 ".into(),
             format!(" {} {} ", bit(7), bit(6)),
@@ -492,38 +527,7 @@ pub fn tag_layout_strings(node: &Node) -> Vec<String> {
             format!(" {} ", tag_decoded),
         ],
     ];
-    let widths: Vec<usize> =
-        cols.iter().map(|c| c.iter().map(|s| s.chars().count()).max().unwrap()).collect();
-
-    let border = |left: char, mid: char, right: char, cells: Option<&[String; 3]>| {
-        let mut out = String::from(left);
-        for (i, w) in widths.iter().enumerate() {
-            let content = cells.map(|c| c[i].as_str()).unwrap_or("");
-            out.push_str(content);
-            out.extend(std::iter::repeat_n('─', w - content.chars().count()));
-            out.push(if i < 2 { mid } else { right });
-        }
-        out
-    };
-    let row = |get: fn(&[String; 4]) -> &String| {
-        let mut out = String::from("│");
-        for (i, col) in cols.iter().enumerate() {
-            let cell = get(col);
-            out.push_str(cell);
-            out.extend(std::iter::repeat_n(' ', widths[i] - cell.chars().count()));
-            out.push('│');
-        }
-        out
-    };
-
-    let tops: [String; 3] = [cols[0][0].clone(), cols[1][0].clone(), cols[2][0].clone()];
-    let mut lines = vec![
-        border('┌', '┬', '┐', Some(&tops)),
-        row(|c| &c[1]),
-        row(|c| &c[2]),
-        row(|c| &c[3]),
-        border('└', '┴', '┘', None),
-    ];
+    let mut lines = bitfield_box(&cols);
     if long_form {
         for (i, &b) in ids[1..].iter().enumerate() {
             lines.push(format!(
@@ -535,6 +539,68 @@ pub fn tag_layout_strings(node: &Node) -> Vec<String> {
             ));
         }
         lines.push(format!("tag number = {}", node.tag));
+    }
+    lines
+}
+
+/// Length octets of a node as they appear in its (canonical) encoding.
+pub fn node_length_octets(node: &Node) -> Vec<u8> {
+    if node.indefinite {
+        vec![0x80]
+    } else {
+        ber::length_octets(node.content_len)
+    }
+}
+
+/// Text rows of the length bit-field diagram, in the same style as
+/// `tag_layout_strings`: first length octet as a box (form bit + 7-bit
+/// field), then one row per value octet in the long form.
+pub fn length_layout_strings(node: &Node) -> Vec<String> {
+    let octets = node_length_octets(node);
+    let b0 = octets[0];
+    let bit = |i: u8| (b0 >> i) & 1;
+    let long_form = b0 & 0x80 != 0;
+    let bits7: String = (0..7).rev().map(|i| format!("{} ", bit(i))).collect();
+
+    let (label, decoded) = if !long_form {
+        (
+            " content length (7 bits) ".to_string(),
+            format!(" {} = content length ", node.content_len),
+        )
+    } else if node.indefinite {
+        (
+            " # of length octets (7 bits) ".to_string(),
+            " 0 = indefinite length ".to_string(),
+        )
+    } else {
+        (
+            " # of length octets (7 bits) ".to_string(),
+            format!(" {} octets follow ↓ ", octets.len() - 1),
+        )
+    };
+    let cols: Vec<[String; 4]> = vec![
+        [
+            " 8 ".into(),
+            format!(" {} ", bit(7)),
+            " form (1 bit) ".into(),
+            format!(" {} form ", if long_form { "long" } else { "short" }),
+        ],
+        [" 7 6 5 4 3 2 1 ".into(), format!(" {}", bits7), label, decoded],
+    ];
+    let mut lines = bitfield_box(&cols);
+    if long_form && !node.indefinite {
+        for (i, &b) in octets[1..].iter().enumerate() {
+            lines.push(format!(
+                "octet {}:  {:08b}   (= 0x{:02X}, big-endian value byte)",
+                i + 2,
+                b,
+                b,
+            ));
+        }
+        lines.push(format!("content length = {}", node.content_len));
+    }
+    if node.indefinite {
+        lines.push("content ends with end-of-contents octets (00 00)".to_string());
     }
     lines
 }
@@ -555,17 +621,29 @@ fn draw_content_browse(frame: &mut Frame, app: &App, area: Rect) {
                 ber::hex_pairs(&ids)
             )),
         ]));
+        // Bit values (row 1) and decoded meaning (row 3) stand out;
+        // borders and labels stay dim.
+        let diagram_style = |i: usize| match i {
+            1 => Style::new().bold(),
+            0 | 2 | 4 => Style::new().dim(),
+            _ => Style::new(), // decoded row and extra octet rows
+        };
         for (i, text) in tag_layout_strings(node).into_iter().enumerate() {
-            // Bit values (row 1) and decoded meaning (row 3) stand out;
-            // borders and labels stay dim.
-            let style = match i {
-                1 => Style::new().bold(),
-                0 | 2 | 4 => Style::new().dim(),
-                _ => Style::new(), // decoded row and long-form octet rows
-            };
-            lines.push(Line::from(Span::styled(text, style)));
+            lines.push(Line::from(Span::styled(text, diagram_style(i))));
         }
         let plural = |n: usize| if n == 1 { "" } else { "s" };
+        let len_octets = node_length_octets(node);
+        lines.push(Line::from(vec![
+            Span::styled("Length  ", Style::new().dim()),
+            Span::raw(format!(
+                "length octet{}: {}",
+                plural(len_octets.len()),
+                ber::hex_pairs(&len_octets)
+            )),
+        ]));
+        for (i, text) in length_layout_strings(node).into_iter().enumerate() {
+            lines.push(Line::from(Span::styled(text, diagram_style(i))));
+        }
         lines.push(Line::from(vec![
             Span::styled("Offset  ", Style::new().dim()),
             Span::raw(format!(
@@ -884,6 +962,48 @@ mod tests {
         assert!(rows[3].contains("context-specific"));
         assert!(rows[3].contains("primitive"));
         assert!(rows[3].contains(" 0 "));
+    }
+
+    #[test]
+    fn length_layout_short_form() {
+        // OCTET STRING with 5 content bytes: length octet 0x05.
+        let forest = parse_forest(&[0x04, 0x05, 1, 2, 3, 4, 5], 0).unwrap();
+        let rows = length_layout_strings(&forest[0]);
+        assert_eq!(rows.len(), 5);
+        assert!(rows[0].contains(" 8 ") && rows[0].contains(" 7 6 5 4 3 2 1 "));
+        // 0x05 = 0 0000101.
+        assert!(rows[1].contains("│ 0 ") && rows[1].contains("│ 0 0 0 0 1 0 1"));
+        assert!(rows[2].contains("form (1 bit)"));
+        assert!(rows[2].contains("content length (7 bits)"));
+        assert!(rows[3].contains("short form"));
+        assert!(rows[3].contains("5 = content length"));
+    }
+
+    #[test]
+    fn length_layout_long_form() {
+        // OCTET STRING with 200 content bytes: length octets 0x81 0xC8.
+        let mut data = vec![0x04, 0x81, 0xC8];
+        data.extend(std::iter::repeat_n(0u8, 200));
+        let forest = parse_forest(&data, 0).unwrap();
+        let rows = length_layout_strings(&forest[0]);
+        // 0x81 = 1 0000001.
+        assert!(rows[1].contains("│ 1 ") && rows[1].contains("│ 0 0 0 0 0 0 1"));
+        assert!(rows[2].contains("# of length octets (7 bits)"));
+        assert!(rows[3].contains("long form"));
+        assert!(rows[3].contains("1 octets follow"));
+        assert!(rows[5].contains("octet 2:  11001000") && rows[5].contains("0xC8"));
+        assert_eq!(rows[6], "content length = 200");
+    }
+
+    #[test]
+    fn length_layout_indefinite() {
+        let forest = parse_forest(&[0x30, 0x80, 0x05, 0x00, 0x00, 0x00], 0).unwrap();
+        assert_eq!(node_length_octets(&forest[0]), [0x80]);
+        let rows = length_layout_strings(&forest[0]);
+        assert!(rows[1].contains("│ 1 ") && rows[1].contains("│ 0 0 0 0 0 0 0"));
+        assert!(rows[3].contains("long form"));
+        assert!(rows[3].contains("0 = indefinite length"));
+        assert!(rows[5].contains("end-of-contents"));
     }
 
     #[test]

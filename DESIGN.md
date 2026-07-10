@@ -314,8 +314,8 @@ Built with ratatui 0.29 (bundled crossterm backend, `ratatui::init()` /
 * **Left pane — tree.** One row per visible node: fold marker (`▸`/`▾`),
   indentation by depth, type name (colored by tag class; bold when
   constructed/encapsulating) and a short decoded value preview.
-* **Right pane — content.** At the top, the build-up of the tag is shown
-  graphically: a bit-field diagram of the identifier octet with the bit
+* **Right pane — content.** At the top, the build-up of the tag and the
+  length octets is shown graphically: bit-field diagrams with the bit
   positions (8..1), the actual bit values, each field's width in bits and
   its decoded meaning —
 
@@ -327,13 +327,28 @@ Built with ratatui 0.29 (bundled crossterm backend, `ratatui::init()` /
   │ class (2 bits) │ P/C (1 bit) │ tag number (5 bits) │
   │ universal      │ constructed │ 16 = SEQUENCE       │
   └────────────────┴─────────────┴─────────────────────┘
+  Length  length octets: 82 01 C3
+  ┌ 8 ───────────┬ 7 6 5 4 3 2 1 ──────────────┐
+  │ 1            │ 0 0 0 0 0 1 0               │
+  │ form (1 bit) │ # of length octets (7 bits) │
+  │ long form    │ 2 octets follow ↓           │
+  └──────────────┴─────────────────────────────┘
+  octet 2:  00000001   (= 0x01, big-endian value byte)
+  octet 3:  11000011   (= 0xC3, big-endian value byte)
+  content length = 451
   ```
 
-  For high tag numbers (long form, tag ≥ 31) the continuation octets are
-  broken down as well (bit 8 = more-octets flag, bits 7-1 = tag bits),
-  followed by the resulting tag number. Below the diagram: offset, header
-  and content length, decoded value (integers, OIDs dotted, strings,
-  times, unused bits) and a `hexdump -C`-style dump of the content octets.
+  For high tag numbers (long form, tag ≥ 31) the identifier continuation
+  octets are broken down the same way (bit 8 = more-octets flag, bits 7-1
+  = tag bits), followed by the resulting tag number. Short-form lengths
+  show bit 8 = 0 and the 7-bit content length directly; indefinite
+  lengths (BER) show `0x80` with a note that the content ends with
+  end-of-contents octets. The length diagram shows the canonical
+  (minimal) encoding of the current content length — identical to the
+  file bytes for DER input, normalized for BER inputs with redundant
+  length octets. Below the diagrams: offset, header and content length,
+  decoded value (integers, OIDs dotted, strings, times, unused bits) and
+  a `hexdump -C`-style dump of the content octets.
 * **Edit mode** (`e` for the type-specific editor, `E` for the edit
   menu): the right pane becomes one of the value editors of §7 — hex grid,
   text line

@@ -94,6 +94,13 @@ pub fn identifier_octets(class: Class, tag: u32, constructed: bool) -> Vec<u8> {
     out
 }
 
+/// Encode just the (definite, minimal) length octets for a content length.
+pub fn length_octets(len: usize) -> Vec<u8> {
+    let mut out = Vec::new();
+    write_length(len, &mut out);
+    out
+}
+
 impl Node {
     /// Type label using dumpasn1's naming.
     pub fn type_name(&self) -> String {
