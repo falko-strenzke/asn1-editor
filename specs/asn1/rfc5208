@@ -1,0 +1,69 @@
+-- ASN.1 module extracted from RFC 5208 (May 2008),
+-- "Public-Key Cryptography Standards (PKCS) #8: Private-Key Information
+--  Syntax Specification Version 1.2", Appendix A.
+-- Source: https://www.rfc-editor.org/rfc/rfc5208.txt
+--
+-- Adapted for this tool's ASN.1 subset parser, which (like the bundled
+-- RFC 5280 modules) does not implement information object classes:
+--   * the "{{PrivateKeyAlgorithms}}" / "{{KeyEncryptionAlgorithms}}"
+--     information-object-set parameters on AlgorithmIdentifier are
+--     dropped, and
+--   * the two "... ALGORITHM-IDENTIFIER ::= { ... }" object-set value
+--     assignments are omitted.
+-- Neither affects the DER structure being matched: AlgorithmIdentifier is
+-- still SEQUENCE { algorithm OBJECT IDENTIFIER, parameters ANY OPTIONAL }.
+-- AlgorithmIdentifier and Attribute are imported by the original module;
+-- AlgorithmIdentifier resolves against the RFC 5280 module bundled
+-- alongside this file (cross-module reference resolution), and the
+-- unresolved Attribute matches like ANY (it only appears in the OPTIONAL
+-- "attributes" field, absent from typical keys).
+
+PKCS-8 { iso(1) member-body(2) us(840) rsadsi(113549)
+  pkcs(1) pkcs-8(8) modules(1) pkcs-8(1) }
+
+DEFINITIONS IMPLICIT TAGS ::=
+
+BEGIN
+
+-- EXPORTS ALL
+
+-- All types and values defined in this module are exported for use in
+-- other ASN.1 modules.
+
+IMPORTS
+
+informationFramework, authenticationFramework
+    FROM UsefulDefinitions { joint-iso-itu-t(2) ds(5) module(1)
+        usefulDefinitions(0) 3 }
+
+Attribute
+    FROM InformationFramework informationFramework
+
+AlgorithmIdentifier
+    FROM AuthenticationFramework authenticationFramework ;
+
+-- Private-key information syntax
+
+PrivateKeyInfo ::= SEQUENCE {
+    version                   Version,
+    privateKeyAlgorithm       PrivateKeyAlgorithmIdentifier,
+    privateKey                PrivateKey,
+    attributes           [0]  IMPLICIT Attributes OPTIONAL }
+
+Version ::= INTEGER {v1(0)} (v1,...)
+
+PrivateKeyAlgorithmIdentifier ::= AlgorithmIdentifier
+
+PrivateKey ::= OCTET STRING
+
+Attributes ::= SET OF Attribute
+
+-- Encrypted private-key information syntax
+
+EncryptedPrivateKeyInfo ::= SEQUENCE {
+    encryptionAlgorithm       AlgorithmIdentifier,
+    encryptedData             EncryptedData }
+
+EncryptedData ::= OCTET STRING
+
+END

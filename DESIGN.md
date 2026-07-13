@@ -29,7 +29,8 @@ Goals:
 
 * Identify well-known structures by matching against ASN.1 specification
   modules in `specs/asn1/` (bundled: RFC 5280 → X.509 certificates and
-  CRLs) and annotate the tree with the spec's field and type names (§8).
+  CRLs, RFC 5208 → PKCS#8 private keys) and annotate the tree with the
+  spec's field and type names (§8).
 
 Non-goals (see §14):
 
@@ -78,8 +79,10 @@ tests/
   dumpasn1_compat.rs  structural comparison against the dumpasn1 binary,
                       plus a parse→encode round-trip test over testdata/
   spec_rfc5280.rs     spec parsing + identification of the DER test files
-specs/asn1/  ASN.1 specification modules (rfc5280: certificates + CRLs)
-testdata/  DER samples (EC cert, RSA cert, EC key, PKCS#7, CRL)
+specs/asn1/  ASN.1 specification modules (rfc5280: certificates + CRLs;
+             rfc5208: PKCS#8 private keys)
+testdata/  DER samples (EC cert, RSA cert, SEC1 EC key, PKCS#8 key,
+           PKCS#7, CRL)
   chain/   a 3-level ECDSA P-256 hierarchy (root CA -> intermediate CA ->
            TLS server leaf) plus CRLs from the root and intermediate, for
            exercising signature verification (§9) end to end; also
@@ -316,10 +319,22 @@ the names from their ASN.1 definition.
 `specs/asn1/` holds ASN.1 modules in 1988 syntax. `specs/asn1/rfc5280`
 contains the two modules of RFC 5280 Appendix A (PKIX1Explicit88 and
 PKIX1Implicit88), extracted verbatim from the RFC text (de-paginated,
-otherwise unmodified). Additional files dropped into the directory are
-parsed automatically; parse failures are reported as warnings and the
-file is skipped. The directory is located via `$ASN1_EDITOR_SPECS`, then
-`./specs/asn1`, then `specs/asn1` next to an ancestor of the executable.
+otherwise unmodified). `specs/asn1/rfc5208` contains the PKCS#8 module
+(RFC 5208 Appendix A → `PrivateKeyInfo`), with one documented adaptation:
+the `{{…}}` information-object-set parameters on `AlgorithmIdentifier` are
+dropped, since this subset parser does not implement information object
+classes and they do not affect the DER structure being matched. Its
+`AlgorithmIdentifier` is left as an (import) reference, resolved across
+modules against the RFC 5280 definition loaded from the same directory —
+exercising the cross-module reference resolution described below.
+
+Additional files dropped into the directory are parsed automatically;
+parse failures are reported as warnings and the file is skipped. Files are
+loaded in sorted filename order and the *first* definition of a type name
+wins (so `rfc5208`, which sorts before `rfc5280`, must not redefine any
+shared type — it doesn't; it only references `AlgorithmIdentifier`). The
+directory is located via `$ASN1_EDITOR_SPECS`, then `./specs/asn1`, then
+`specs/asn1` next to an ancestor of the executable.
 
 ### The specification parser
 
@@ -368,8 +383,9 @@ Every successful (sub-)match records a label `(field name, type name)`
 for the node's path; choices append the alternative name (e.g.
 `Time.utcTime`). The candidate whose match labels the **most nodes**
 wins; matches labeling fewer than two nodes (e.g. a bare `ANY`) are
-discarded as noise. With the RFC 5280 modules loaded, X.509 certificates
-identify as `Certificate` and CRLs as `CertificateList`.
+discarded as noise. With the bundled modules loaded, X.509 certificates
+identify as `Certificate`, CRLs as `CertificateList`, and PKCS#8 keys as
+`PrivateKeyInfo`.
 
 The identification is recomputed after every edit, so a document can gain
 or lose its labels as edits make it conform or not conform to a spec.

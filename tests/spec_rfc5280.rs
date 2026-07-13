@@ -13,7 +13,8 @@
 // limitations under the License.
 
 //! End-to-end tests of the ASN.1 specification support against the real
-//! RFC 5280 modules in `specs/asn1/rfc5280` and the DER test files.
+//! bundled modules in `specs/asn1` (RFC 5280 certificates/CRLs, RFC 5208
+//! PKCS#8 private keys) and the DER test files.
 
 use std::path::Path;
 
@@ -23,6 +24,9 @@ fn manifest(rel: &str) -> std::path::PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join(rel)
 }
 
+/// The database of every bundled spec module (RFC 5280 + RFC 5208 + any
+/// others dropped into `specs/asn1`). Named for RFC 5280 for historical
+/// reasons; it is the whole directory.
 fn rfc5280_db() -> spec::SpecDb {
     let (db, errors) = spec::load_dir(&manifest("specs/asn1"));
     assert!(errors.is_empty(), "spec parse errors: {:?}", errors);
@@ -97,6 +101,38 @@ fn crl_is_identified_as_certificate_list() {
     assert_eq!(label(&[0, 0]).field.as_deref(), Some("tbsCertList"));
     assert_eq!(label(&[0, 0, 2]).field.as_deref(), Some("issuer"));
     assert_eq!(label(&[0, 0, 3]).field.as_deref(), Some("thisUpdate"));
+}
+
+#[test]
+fn pkcs8_private_key_is_identified() {
+    let db = rfc5280_db();
+    // The RFC 5208 module must have been parsed alongside RFC 5280.
+    assert!(db.resolve("PrivateKeyInfo").is_some());
+
+    let data = std::fs::read(manifest("testdata/private_key_pkcs8.der")).unwrap();
+    let roots = ber::parse_forest(&data, 0).unwrap();
+    let ident = spec::identify(&db, &roots).expect("PKCS#8 key identified");
+
+    assert_eq!(ident.type_name, "PrivateKeyInfo");
+    assert_eq!(ident.source, "rfc5208");
+
+    let label = |path: &[usize]| ident.labels.get(path).unwrap();
+    // PrivateKeyInfo ::= SEQUENCE { version, privateKeyAlgorithm,
+    //                               privateKey, [0] attributes OPTIONAL }
+    assert_eq!(label(&[0]).type_name, "PrivateKeyInfo");
+    assert_eq!(label(&[0, 0]).field.as_deref(), Some("version"));
+    assert_eq!(label(&[0, 0]).type_name, "Version");
+    assert_eq!(label(&[0, 1]).field.as_deref(), Some("privateKeyAlgorithm"));
+    // privateKeyAlgorithm resolves through PrivateKeyAlgorithmIdentifier
+    // to the AlgorithmIdentifier imported from the RFC 5280 module (proving
+    // cross-module reference resolution): its inner OID is labeled.
+    assert!(label(&[0, 1]).type_name.contains("AlgorithmIdentifier"));
+    assert_eq!(label(&[0, 1, 0]).field.as_deref(), Some("algorithm"));
+    assert_eq!(label(&[0, 1, 0]).type_name, "OBJECT IDENTIFIER");
+    // privateKey is an OCTET STRING (even though the BER encapsulation
+    // heuristic parses its contents, the node's universal tag is still 4).
+    assert_eq!(label(&[0, 2]).field.as_deref(), Some("privateKey"));
+    assert_eq!(label(&[0, 2]).type_name, "PrivateKey");
 }
 
 #[test]
