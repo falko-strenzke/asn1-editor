@@ -415,6 +415,21 @@ identify as `Certificate`, CRLs as `CertificateList`, PKCS#8 /
 asymmetric-key private keys as `OneAsymmetricKey`, and SEC1 EC private
 keys as `ECPrivateKey`.
 
+After the top-level match, ASN.1 nested inside **encapsulating** OCTET /
+BIT STRING values (§5) is labeled too. The top-level match treats such a
+value as an opaque primitive (`PrivateKey ::= OCTET STRING`,
+`subjectPublicKey BIT STRING`, …) and never descends into it, so a
+separate post-pass (`label_encapsulated`) walks the tree and, for each
+encapsulating node, independently `identify`s its single nested item and
+merges the resulting labels under that node's path. This is what names the
+fields of the RFC 5915 `ECPrivateKey` carried inside a PKCS#8
+`OneAsymmetricKey`'s `privateKey` OCTET STRING. Only extra per-node labels
+are added — the document's overall type stays that of the top-level match
+— and the same `score ≥ 2` noise filter applies, so content that matches
+no bundled type (e.g. an RSA `SEQUENCE { INTEGER, INTEGER }` public key,
+with no PKCS#1 module loaded) is left unlabeled rather than
+mis-identified.
+
 The identification is recomputed after every edit, so a document can gain
 or lose its labels as edits make it conform or not conform to a spec.
 
@@ -426,9 +441,13 @@ or lose its labels as edits make it conform or not conform to a spec.
 * Content pane: a `Spec` line with the selected element's field and type
   name plus the overall document type and source file.
 
-Not yet done (future work): resolving `ANY DEFINED BY` and OCTET STRING
-extension bodies via OID tables (e.g. labeling the contents of X.509
-extensions), and value-level checks (constraints are ignored).
+Not yet done (future work): OID-table-driven resolution of `ANY DEFINED
+BY` and OCTET STRING bodies whose type is selected by a sibling OID (e.g.
+labeling an X.509 extension's `extnValue` according to its `extnID`, or an
+RSA private key by its algorithm OID) — the encapsulation post-pass above
+labels nested content only when it structurally matches a bundled type on
+its own, not when the type must be looked up from an OID; and value-level
+checks (constraints are ignored).
 
 ## 9. Signature verification (`src/x509.rs`, `src/verify.rs`)
 

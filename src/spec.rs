@@ -600,6 +600,14 @@ struct Ctx {
 /// the RFC 5958 `OneAsymmetricKey` that replaces it match the same v1 key
 /// identically, and `rfc5958` (> `rfc5208`) is preferred. Within one
 /// source, ties keep the first-defined type (stable file order).
+///
+/// After the top-level match, ASN.1 nested inside encapsulating OCTET /
+/// BIT STRING values (which the top match treats as opaque and never
+/// descends into) is labeled too, by independently identifying each
+/// encapsulated sub-structure — e.g. the RFC 5915 `ECPrivateKey` carried
+/// in a PKCS#8 `privateKey` OCTET STRING gets its fields named. The
+/// document's overall `type_name`/`source` still come from the top match;
+/// only extra per-node labels are added.
 pub fn identify(db: &SpecDb, roots: &[Node]) -> Option<Identification> {
     if roots.len() != 1 {
         return None;
@@ -631,7 +639,41 @@ pub fn identify(db: &SpecDb, roots: &[Node]) -> Option<Identification> {
             }
         }
     }
-    best.map(|(_, ident)| ident)
+    let mut ident = best.map(|(_, ident)| ident)?;
+    label_encapsulated(db, roots, &[], &mut ident.labels);
+    Some(ident)
+}
+
+/// Recursively label the ASN.1 content nested inside encapsulating OCTET /
+/// BIT STRING nodes. Each encapsulating node holds exactly one nested
+/// item (the dumpasn1 heuristic, §5); it is identified independently and
+/// its labels are re-keyed under the node's own path. The top-level match
+/// never labels inside an encapsulation (OCTET/BIT STRING match as opaque
+/// primitives), so there is nothing to overwrite; `or_insert` guards
+/// against overlap regardless.
+fn label_encapsulated(
+    db: &SpecDb,
+    nodes: &[Node],
+    prefix: &[usize],
+    labels: &mut HashMap<Vec<usize>, Label>,
+) {
+    for (i, node) in nodes.iter().enumerate() {
+        let mut path = prefix.to_vec();
+        path.push(i);
+        if node.encapsulates {
+            // `identify` recurses into deeper encapsulation itself, so we
+            // don't re-descend into this node's children here.
+            if let Some(sub) = identify(db, &node.children) {
+                for (sub_path, label) in sub.labels {
+                    let mut full = path.clone();
+                    full.extend(sub_path);
+                    labels.entry(full).or_insert(label);
+                }
+            }
+        } else {
+            label_encapsulated(db, &node.children, &path, labels);
+        }
+    }
 }
 
 fn kind_name(ty: &Type) -> String {

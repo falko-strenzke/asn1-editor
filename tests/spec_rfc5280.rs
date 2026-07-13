@@ -149,6 +149,15 @@ fn pkcs8_private_key_is_identified() {
     // heuristic parses its contents, the node's universal tag is still 4).
     assert_eq!(label(&[0, 2]).field.as_deref(), Some("privateKey"));
     assert_eq!(label(&[0, 2]).type_name, "PrivateKey");
+
+    // The EC key components *inside* the privateKey OCTET STRING (an
+    // encapsulated RFC 5915 ECPrivateKey) are labeled too, so the UI names
+    // them rather than showing bare SEQUENCE/INTEGER/... nodes.
+    assert_eq!(label(&[0, 2, 0]).type_name, "ECPrivateKey");
+    assert_eq!(label(&[0, 2, 0, 0]).field.as_deref(), Some("version"));
+    assert_eq!(label(&[0, 2, 0, 1]).field.as_deref(), Some("privateKey"));
+    assert_eq!(label(&[0, 2, 0, 1]).type_name, "OCTET STRING");
+    assert_eq!(label(&[0, 2, 0, 2]).field.as_deref(), Some("publicKey"));
 }
 
 #[test]
