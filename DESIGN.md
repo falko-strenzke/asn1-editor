@@ -80,6 +80,11 @@ tests/
   spec_rfc5280.rs     spec parsing + identification of the DER test files
 specs/asn1/  ASN.1 specification modules (rfc5280: certificates + CRLs)
 testdata/  DER samples (EC cert, RSA cert, EC key, PKCS#7, CRL)
+  chain/   a 3-level ECDSA P-256 hierarchy (root CA -> intermediate CA ->
+           TLS server leaf) plus CRLs from the root and intermediate, for
+           exercising signature verification (§9) end to end; also
+           server_bad_signature.der, a structurally valid leaf cert with
+           one signature byte flipped, for the "does NOT verify" path
 ```
 
 Dependency rule: `ber.rs` depends on nothing; `dump.rs`/`input.rs`/
