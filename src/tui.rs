@@ -30,10 +30,9 @@ use ratatui::{DefaultTerminal, Frame};
 
 use crate::app::{
     App, DateTimeEditor, EditKind, EditState, Editor, Focus, HexEditor, Mode, PickerTarget,
-    TextEditor, TextFormat, DATE_FIELDS, EDIT_BYTES_PER_LINE, EDIT_DIGITS_PER_LINE, EDIT_MENU,
-    PICKER_CLASSES, PICKER_UNIVERSAL,
+    RowSource, TextEditor, TextFormat, DATE_FIELDS, EDIT_BYTES_PER_LINE, EDIT_DIGITS_PER_LINE,
+    EDIT_MENU, PICKER_CLASSES, PICKER_UNIVERSAL,
 };
-use crate::dump;
 use crate::ber::{
     self, Class, Node, TAG_BIT_STRING, TAG_BOOLEAN, TAG_GENERALIZED_TIME, TAG_INTEGER, TAG_NULL,
     TAG_OID, TAG_UTC_TIME,
@@ -657,7 +656,16 @@ fn draw_tree(frame: &mut Frame, app: &mut App, area: Rect) {
         .rows
         .iter()
         .map(|row| {
-            let node = app.node_at(&row.path).expect("row paths are valid");
+            if row.source == RowSource::DecryptedPlaceholder {
+                return ListItem::new(Line::from(vec![
+                    Span::raw("  ".repeat(row.depth + 1)),
+                    Span::styled(
+                        "decrypted content not available",
+                        Style::new().fg(Color::Yellow).italic(),
+                    ),
+                ]));
+            }
+            let node = app.node_for_row(row).expect("row paths are valid");
             let marker = if node.has_children() {
                 if node.expanded { "▾ " } else { "▸ " }
             } else {
@@ -665,7 +673,10 @@ fn draw_tree(frame: &mut Frame, app: &mut App, area: Rect) {
             };
             let mut spans =
                 vec![Span::raw(format!("{}{}", "  ".repeat(row.depth), marker))];
-            let label = app.label_at(&row.path);
+            if row.source == RowSource::Decrypted && row.path.len() == 1 {
+                spans.push(Span::styled("decrypted: ", Style::new().fg(Color::Green).bold()));
+            }
+            let label = app.label_for_row(row);
             if let Some(field) = label.and_then(|l| l.field.as_deref()) {
                 spans.push(Span::styled(
                     format!("{}: ", field),
@@ -739,18 +750,6 @@ fn hex_dump_lines(bytes: &[u8]) -> Vec<Line<'static>> {
         )));
     }
     lines
-}
-
-/// Render decrypted plaintext as a dumpasn1-style tree (it is a
-/// `PrivateKeyInfo`); fall back to a hex dump if it somehow doesn't parse.
-fn decrypted_lines(plaintext: &[u8]) -> Vec<Line<'static>> {
-    match ber::parse_forest(plaintext, 0) {
-        Ok(roots) => dump::dump(&roots, plaintext.len())
-            .lines()
-            .map(|l| Line::from(Span::styled(l.to_string(), Style::new().fg(Color::LightGreen))))
-            .collect(),
-        Err(_) => hex_dump_lines(plaintext),
-    }
 }
 
 fn draw_content(frame: &mut Frame, app: &mut App, area: Rect) {
@@ -1065,14 +1064,27 @@ fn signature_status_line(status: &SignatureStatus) -> Line<'static> {
 
 fn draw_content_browse(frame: &mut Frame, app: &App, area: Rect) {
     let mut lines: Vec<Line> = Vec::new();
-    if let Some(node) = app.selected_node() {
+    let selected_row = app.rows.get(app.selected);
+    if selected_row.map(|r| r.source) == Some(RowSource::DecryptedPlaceholder) {
+        lines.push(Line::from(Span::styled(
+            "Decrypted content not available",
+            Style::new().fg(Color::Yellow).bold(),
+        )));
+        lines.push(Line::default());
+        lines.push(Line::from("Press 'z' and enter the PKCS#8 password to decrypt it."));
+    } else if let Some(node) = app.selected_node() {
         lines.push(Line::from(vec![
             Span::styled("Type    ", Style::new().dim()),
             Span::styled(node.type_name(), class_style(node)),
         ]));
-        if let Some(row) = app.rows.get(app.selected) {
-            if let Some(label) = app.label_at(&row.path) {
-                let ident = app.ident.as_ref().expect("label implies identification");
+        if let Some(row) = selected_row {
+            if let Some(label) = app.label_for_row(row) {
+                let ident = match row.source {
+                    RowSource::Document => app.ident.as_ref(),
+                    RowSource::Decrypted => app.decrypted.as_ref().and_then(|d| d.ident.as_ref()),
+                    RowSource::DecryptedPlaceholder => None,
+                }
+                .expect("label implies identification");
                 let field = label.field.as_deref().unwrap_or("-");
                 lines.push(Line::from(vec![
                     Span::styled("Spec    ", Style::new().dim()),
@@ -1145,18 +1157,6 @@ fn draw_content_browse(frame: &mut Frame, app: &App, area: Rect) {
                 Span::styled("Decoded ", Style::new().dim()),
                 Span::raw(decoded.trim().to_string()),
             ]));
-        }
-        // Decrypted private key, shown for the encryptedData node once a
-        // password has been supplied — between the header and the raw hex.
-        if let Some(dec) = &app.decrypted {
-            if app.rows.get(app.selected).map(|r| r.path.as_slice()) == Some(dec.encrypted_path.as_slice()) {
-                lines.push(Line::default());
-                lines.push(Line::from(Span::styled(
-                    format!("Decrypted content ({} bytes):", dec.plaintext.len()),
-                    Style::new().fg(Color::Green).underlined(),
-                )));
-                lines.extend(decrypted_lines(&dec.plaintext));
-            }
         }
         lines.push(Line::default());
         let content = node.content_octets();

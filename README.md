@@ -68,6 +68,7 @@ current directory, or via `$ASN1_EDITOR_SPECS`).
 | `J` / `K` | move the selected element down / up among its siblings |
 | `Enter` / `Esc` | apply / cancel the edit |
 | `s` | save |
+| `z` | decrypt a supported encrypted PKCS#8 key and show its virtual plaintext tree |
 | `[` / `]` | scroll the content pane |
 | `q` | quit (`q q` discards unsaved changes) |
 
@@ -77,6 +78,13 @@ editor. All value editors work on the element's *content octets* (for
 BIT STRING including the leading unused-bits octet). Lengths of all
 enclosing elements are recomputed automatically. Content of constructed
 elements must remain valid ASN.1, otherwise the edit is rejected.
+
+For a supported PBES2-encrypted PKCS#8 key, the encrypted-data node has a
+`decrypted content not available` child until `z` is used to enter the
+password. Successful decryption replaces that placeholder with a foldable,
+editable virtual ASN.1 tree. Editing the virtual tree re-encrypts it with a
+fresh IV; editing the encrypted data refreshes the virtual tree while the
+decryption remains valid.
 
 Inserting (`i`/`I`) first opens a popup dialog to choose the ASN.1 type,
 with one column per bit field of the identifier octet: **class**

@@ -24,7 +24,10 @@
 
 use std::num::NonZeroU32;
 
-use aws_lc_rs::cipher::{DecryptingKey, DecryptionContext, UnboundCipherKey, AES_128, AES_256};
+use aws_lc_rs::cipher::{
+    DecryptingKey, DecryptionContext, EncryptionContext, PaddedBlockEncryptingKey,
+    UnboundCipherKey, AES_128, AES_256,
+};
 use aws_lc_rs::iv::{FixedLength, IV_LEN_128_BIT};
 use aws_lc_rs::pbkdf2;
 
@@ -66,6 +69,8 @@ pub struct EncryptedPrivateKey {
     /// Tree path of the `encryptedData` OCTET STRING node (always `[0, 1]`):
     /// the node whose decrypted content the UI reveals.
     pub encrypted_path: Vec<usize>,
+    /// Tree path of the AES-CBC IV OCTET STRING.
+    pub iv_path: Vec<usize>,
     salt: Vec<u8>,
     iterations: u32,
     prf: Prf,
@@ -115,6 +120,7 @@ pub fn parse(roots: &[Node]) -> Result<Option<EncryptedPrivateKey>, String> {
 
     Ok(Some(EncryptedPrivateKey {
         encrypted_path: vec![0, 1],
+        iv_path: vec![0, 0, 1, 1, 1],
         salt,
         iterations,
         prf,
@@ -206,6 +212,14 @@ fn parse_scheme(scheme: &Node) -> Result<(usize, Vec<u8>), String> {
 }
 
 impl EncryptedPrivateKey {
+    fn derived_key(&self, password: &[u8]) -> Result<Vec<u8>, String> {
+        let iterations = NonZeroU32::new(self.iterations)
+            .ok_or("PBKDF2 iteration count must be positive")?;
+        let mut key = vec![0u8; self.key_len];
+        pbkdf2::derive(self.prf.algorithm(), iterations, &self.salt, password, &mut key);
+        Ok(key)
+    }
+
     /// Derive the key with PBKDF2, AES-CBC decrypt, strip PKCS#7 padding,
     /// and confirm the result is a single ASN.1 SEQUENCE (a
     /// `PrivateKeyInfo`). A wrong password almost always shows up as bad
@@ -215,10 +229,7 @@ impl EncryptedPrivateKey {
         if self.ciphertext.is_empty() || !self.ciphertext.len().is_multiple_of(AES_BLOCK) {
             return Err("ciphertext length is not a whole number of AES blocks".to_string());
         }
-        let iterations = NonZeroU32::new(self.iterations)
-            .ok_or("PBKDF2 iteration count must be positive")?;
-        let mut key = vec![0u8; self.key_len];
-        pbkdf2::derive(self.prf.algorithm(), iterations, &self.salt, password, &mut key);
+        let key = self.derived_key(password)?;
 
         let cipher_alg = if self.key_len == 16 { &AES_128 } else { &AES_256 };
         let unbound = UnboundCipherKey::new(cipher_alg, &key)
@@ -241,6 +252,67 @@ impl EncryptedPrivateKey {
             }
             _ => Err("decryption failed (wrong password?)".to_string()),
         }
+    }
+
+    /// Encrypt a modified `PrivateKeyInfo` with the original PBKDF2
+    /// parameters and a fresh AES-CBC IV. The caller stores both returned
+    /// values in the outer `EncryptedPrivateKeyInfo` tree.
+    pub fn encrypt(&self, password: &[u8], plaintext: &[u8]) -> Result<(Vec<u8>, Vec<u8>), String> {
+        self.encrypt_with_context(password, plaintext, None)
+    }
+
+    /// Encrypt using the IV already stored in the container. This primarily
+    /// supports synchronized editing/tests where only `encryptedData` is
+    /// replaced and the PBES2 parameters remain unchanged.
+    pub fn encrypt_with_current_iv(
+        &self,
+        password: &[u8],
+        plaintext: &[u8],
+    ) -> Result<Vec<u8>, String> {
+        self.encrypt_with_context(password, plaintext, Some(&self.iv))
+            .map(|(ciphertext, _)| ciphertext)
+    }
+
+    fn encrypt_with_context(
+        &self,
+        password: &[u8],
+        plaintext: &[u8],
+        iv: Option<&[u8]>,
+    ) -> Result<(Vec<u8>, Vec<u8>), String> {
+        // Refuse to turn arbitrary bytes into an object that claims to be a
+        // PKCS#8 private key. Tree edits normally guarantee this already;
+        // this also protects whole-content edits.
+        match ber::parse_forest(plaintext, 0) {
+            Ok(roots) if roots.len() == 1 && roots[0].is_universal(TAG_SEQUENCE) => {}
+            _ => return Err("decrypted content must be one ASN.1 SEQUENCE".to_string()),
+        }
+
+        let key = self.derived_key(password)?;
+        let cipher_alg = if self.key_len == 16 { &AES_128 } else { &AES_256 };
+        let unbound = UnboundCipherKey::new(cipher_alg, &key)
+            .map_err(|_| "invalid derived key".to_string())?;
+        let encrypting = PaddedBlockEncryptingKey::cbc_pkcs7(unbound)
+            .map_err(|_| "cipher init failed".to_string())?;
+        let mut ciphertext = plaintext.to_vec();
+        let context = if let Some(iv) = iv {
+            let iv: [u8; IV_LEN_128_BIT] = iv
+                .try_into()
+                .map_err(|_| "bad IV length".to_string())?;
+            encrypting
+                .less_safe_encrypt(
+                    &mut ciphertext,
+                    EncryptionContext::Iv128(FixedLength::from(iv)),
+                )
+                .map_err(|_| "encryption failed".to_string())?
+        } else {
+            encrypting
+                .encrypt(&mut ciphertext)
+                .map_err(|_| "encryption failed".to_string())?
+        };
+        let iv: &[u8] = (&context)
+            .try_into()
+            .map_err(|_| "cipher did not return an IV".to_string())?;
+        Ok((ciphertext, iv.to_vec()))
     }
 }
 
@@ -306,6 +378,47 @@ mod tests {
         // version INTEGER, privateKeyAlgorithm SEQUENCE, privateKey OCTET STRING
         assert!(inner[0].children.len() >= 3);
         assert!(inner[0].children[0].is_universal(TAG_INTEGER));
+    }
+
+    #[test]
+    fn reencrypts_modified_plaintext_with_fresh_and_existing_ivs() {
+        let roots = parse_file("testdata/enc_pkcs8.der");
+        let enc = parse(&roots).unwrap().unwrap();
+        let mut plain = enc.decrypt(b"asn1editor").unwrap();
+        // Keep a valid PrivateKeyInfo while making its encoding observably
+        // different for the round trips below.
+        let mut inner = ber::parse_forest(&plain, 0).unwrap();
+        inner[0].children[0].value = vec![1];
+        plain = ber::encode_forest(&inner);
+
+        let same_iv_ciphertext = enc
+            .encrypt_with_current_iv(b"asn1editor", &plain)
+            .unwrap();
+        let mut same_iv_roots = roots.clone();
+        node_at_mut_for_test(&mut same_iv_roots, &enc.encrypted_path).value = same_iv_ciphertext;
+        assert_eq!(
+            parse(&same_iv_roots).unwrap().unwrap().decrypt(b"asn1editor").unwrap(),
+            plain
+        );
+
+        let (ciphertext, iv) = enc.encrypt(b"asn1editor", &plain).unwrap();
+        assert_ne!(iv, enc.iv, "normal re-encryption must generate a fresh IV");
+        let mut fresh_iv_roots = roots;
+        node_at_mut_for_test(&mut fresh_iv_roots, &enc.encrypted_path).value = ciphertext;
+        node_at_mut_for_test(&mut fresh_iv_roots, &enc.iv_path).value = iv;
+        assert_eq!(
+            parse(&fresh_iv_roots).unwrap().unwrap().decrypt(b"asn1editor").unwrap(),
+            plain
+        );
+    }
+
+    fn node_at_mut_for_test<'a>(roots: &'a mut [Node], path: &[usize]) -> &'a mut Node {
+        let (&first, rest) = path.split_first().unwrap();
+        let mut node = &mut roots[first];
+        for &index in rest {
+            node = &mut node.children[index];
+        }
+        node
     }
 
     #[test]

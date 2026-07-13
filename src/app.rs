@@ -32,11 +32,21 @@ pub const EDIT_BYTES_PER_LINE: usize = 16;
 pub const EDIT_DIGITS_PER_LINE: usize = EDIT_BYTES_PER_LINE * 2;
 
 /// One visible line of the tree pane: the path of child indices from the
-/// root forest down to the node.
+/// corresponding real or virtual root forest down to the node.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Row {
     pub path: Vec<usize>,
     pub depth: usize,
+    pub source: RowSource,
+}
+
+/// A tree row either addresses the serialized document, the virtual
+/// decrypted forest, or the placeholder shown before a password is entered.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RowSource {
+    Document,
+    Decrypted,
+    DecryptedPlaceholder,
 }
 
 /// What the hex editor is operating on.
@@ -48,7 +58,14 @@ pub enum EditKind {
     /// position `index` of `parent`'s children (`parent` empty = top
     /// level). Only the value (content octets) is typed; identifier and
     /// length octets are generated.
-    Insert { parent: Vec<usize>, index: usize, class: Class, constructed: bool, tag: u32 },
+    Insert {
+        parent: Vec<usize>,
+        index: usize,
+        class: Class,
+        constructed: bool,
+        tag: u32,
+        source: RowSource,
+    },
 }
 
 /// Choices of the type-picker dialog, one entry per class-bits value.
@@ -94,10 +111,10 @@ pub const PICKER_UNIVERSAL: [(u32, &str); 26] = [
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum PickerTarget {
     /// Insert a new element at `index` of `parent`'s children.
-    Insert { parent: Vec<usize>, index: usize },
+    Insert { parent: Vec<usize>, index: usize, source: RowSource },
     /// Change the type of the existing element at `path`, keeping its
     /// content octets.
-    Retag { path: Vec<usize> },
+    Retag { path: Vec<usize>, source: RowSource },
 }
 
 /// State of the "choose ASN.1 type" popup shown by the insert actions.
@@ -612,14 +629,26 @@ impl PasswordState {
     }
 }
 
-/// A successful decryption of the currently open `EncryptedPrivateKeyInfo`,
-/// kept so the content pane can reveal it when the encrypted node is
-/// selected.
+/// A successful decryption of the currently open `EncryptedPrivateKeyInfo`.
+/// Its parsed roots are displayed as virtual rows below `encrypted_path` and
+/// are never included directly in the outer document encoding.
 pub struct Decrypted {
     /// Path of the `encryptedData` node whose plaintext this is.
     pub encrypted_path: Vec<usize>,
     /// The decrypted plaintext DER (a `PrivateKeyInfo`).
     pub plaintext: Vec<u8>,
+    /// Parsed, editable representation of `plaintext`.
+    pub roots: Vec<Node>,
+    /// Password retained for synchronizing edits in either representation.
+    password: Vec<u8>,
+    /// Specification match for the virtual plaintext tree.
+    pub ident: Option<Identification>,
+}
+
+impl Drop for Decrypted {
+    fn drop(&mut self) {
+        self.password.fill(0);
+    }
 }
 
 /// Which pane receives navigation keys while in `Mode::Browse`.
@@ -681,8 +710,8 @@ pub struct App {
     /// browser selection changes; empty when a directory or nothing is
     /// selected.
     pub browser_relations: FileRelations,
-    /// Plaintext of the open document's `encryptedData`, once the user has
-    /// decrypted it with 'z'. Cleared on load and on any edit.
+    /// Editable virtual plaintext of the open document's `encryptedData`,
+    /// once the user has decrypted it with 'z'.
     pub decrypted: Option<Decrypted>,
 }
 
@@ -841,16 +870,24 @@ impl App {
         self.status = "decryption cancelled".to_string();
     }
 
-    /// Apply the typed password: decrypt and, on success, remember the
-    /// plaintext so the content pane can reveal it. Returns to browse mode
-    /// either way.
+    /// Apply the typed password and expose the parsed plaintext as a virtual
+    /// subtree below the encrypted-data node. Returns to browse mode either
+    /// way.
     pub fn submit_password(&mut self) {
         let Mode::Password(ref state) = self.mode else { return };
         let password = state.buf.clone();
         let result = match pkcs8::parse(&self.roots) {
-            Ok(Some(enc)) => enc.decrypt(password.as_bytes()).map(|plaintext| Decrypted {
-                encrypted_path: enc.encrypted_path,
-                plaintext,
+            Ok(Some(enc)) => enc.decrypt(password.as_bytes()).and_then(|plaintext| {
+                let roots = ber::parse_forest(&plaintext, 0)
+                    .map_err(|e| format!("decrypted ASN.1 could not be parsed: {}", e))?;
+                let ident = spec::identify(&self.spec_db, &roots);
+                Ok(Decrypted {
+                    encrypted_path: enc.encrypted_path,
+                    plaintext,
+                    roots,
+                    password: password.into_bytes(),
+                    ident,
+                })
             }),
             Ok(None) => Err("not an encrypted private key".to_string()),
             Err(msg) => Err(msg),
@@ -859,8 +896,8 @@ impl App {
         match result {
             Ok(decrypted) => {
                 self.decrypted = Some(decrypted);
-                self.status =
-                    "decrypted — select the encrypted data node to view the private key".to_string();
+                self.rebuild_rows();
+                self.status = "decrypted content is available in the ASN.1 tree".to_string();
             }
             Err(msg) => {
                 self.decrypted = None;
@@ -970,6 +1007,9 @@ impl App {
 
     fn identify(&mut self) {
         self.ident = spec::identify(&self.spec_db, &self.roots);
+        if let Some(ref mut decrypted) = self.decrypted {
+            decrypted.ident = spec::identify(&self.spec_db, &decrypted.roots);
+        }
     }
 
     /// Spec label of the node at `path`, if the document was identified.
@@ -977,24 +1017,82 @@ impl App {
         self.ident.as_ref().and_then(|i| i.labels.get(path))
     }
 
+    pub fn label_for_row(&self, row: &Row) -> Option<&Label> {
+        match row.source {
+            RowSource::Document => self.label_at(&row.path),
+            RowSource::Decrypted => self
+                .decrypted
+                .as_ref()
+                .and_then(|d| d.ident.as_ref())
+                .and_then(|i| i.labels.get(&row.path)),
+            RowSource::DecryptedPlaceholder => None,
+        }
+    }
+
     pub fn node_at(&self, path: &[usize]) -> Option<&Node> {
         node_at(&self.roots, path)
     }
 
+    pub fn node_for_row(&self, row: &Row) -> Option<&Node> {
+        match row.source {
+            RowSource::Document => node_at(&self.roots, &row.path),
+            RowSource::Decrypted => {
+                node_at(&self.decrypted.as_ref()?.roots, &row.path)
+            }
+            RowSource::DecryptedPlaceholder => None,
+        }
+    }
+
     pub fn selected_node(&self) -> Option<&Node> {
         let row = self.rows.get(self.selected)?;
-        node_at(&self.roots, &row.path)
+        self.node_for_row(row)
     }
 
     pub fn selected_node_mut(&mut self) -> Option<&mut Node> {
-        let path = self.rows.get(self.selected)?.path.clone();
-        node_at_mut(&mut self.roots, &path)
+        let row = self.rows.get(self.selected)?.clone();
+        match row.source {
+            RowSource::Document => node_at_mut(&mut self.roots, &row.path),
+            RowSource::Decrypted => {
+                node_at_mut(&mut self.decrypted.as_mut()?.roots, &row.path)
+            }
+            RowSource::DecryptedPlaceholder => None,
+        }
     }
 
     pub fn rebuild_rows(&mut self) {
         let mut rows = Vec::new();
+        let encrypted_path = pkcs8::parse(&self.roots)
+            .ok()
+            .flatten()
+            .map(|enc| enc.encrypted_path);
         for (i, node) in self.roots.iter().enumerate() {
-            collect_rows(node, vec![i], &mut rows);
+            collect_rows(node, vec![i], 0, RowSource::Document, &mut rows);
+        }
+        if let Some(encrypted_path) = encrypted_path {
+            if let Some(encrypted_row) = rows.iter().position(|r| {
+                r.source == RowSource::Document && r.path == encrypted_path
+            }) {
+                let depth = rows[encrypted_row].depth + 1;
+                let mut virtual_rows = Vec::new();
+                if let Some(decrypted) = &self.decrypted {
+                    for (i, node) in decrypted.roots.iter().enumerate() {
+                        collect_rows(
+                            node,
+                            vec![i],
+                            depth,
+                            RowSource::Decrypted,
+                            &mut virtual_rows,
+                        );
+                    }
+                } else {
+                    virtual_rows.push(Row {
+                        path: encrypted_path,
+                        depth,
+                        source: RowSource::DecryptedPlaceholder,
+                    });
+                }
+                rows.splice(encrypted_row + 1..encrypted_row + 1, virtual_rows);
+            }
         }
         self.rows = rows;
         if self.selected >= self.rows.len() {
@@ -1036,10 +1134,26 @@ impl App {
                 node.expanded = false;
             }
             self.rebuild_rows();
+        } else if row.source == RowSource::DecryptedPlaceholder {
+            if let Some(i) = self.rows.iter().position(|r| {
+                r.source == RowSource::Document && r.path == row.path
+            }) {
+                self.select(i);
+            }
         } else if row.path.len() > 1 {
             let parent = &row.path[..row.path.len() - 1];
-            if let Some(i) = self.rows.iter().position(|r| r.path == parent) {
+            if let Some(i) = self.rows.iter().position(|r| {
+                r.source == row.source && r.path == parent
+            }) {
                 self.select(i);
+            }
+        } else if row.source == RowSource::Decrypted {
+            if let Some(encrypted_path) = self.decrypted.as_ref().map(|d| &d.encrypted_path) {
+                if let Some(i) = self.rows.iter().position(|r| {
+                    r.source == RowSource::Document && &r.path == encrypted_path
+                }) {
+                    self.select(i);
+                }
             }
         }
     }
@@ -1217,10 +1331,15 @@ impl App {
             self.status = "no file open — select one in the browser first".to_string();
             return;
         }
-        let (parent, index) = if self.rows.is_empty() {
-            (Vec::new(), 0) // empty document: insert the first top-level element
+        let (parent, index, source) = if self.rows.is_empty() {
+            (Vec::new(), 0, RowSource::Document) // empty document: insert the first top-level element
         } else {
-            let path = self.rows[self.selected].path.clone();
+            let row = self.rows[self.selected].clone();
+            if row.source == RowSource::DecryptedPlaceholder {
+                self.status = "decrypt the content before editing it".to_string();
+                return;
+            }
+            let path = row.path;
             if as_child {
                 let Some(node) = self.selected_node() else { return };
                 if !node.constructed && !node.encapsulates {
@@ -1229,13 +1348,19 @@ impl App {
                             .to_string();
                     return;
                 }
-                (path, 0)
+                (path, 0, row.source)
             } else {
                 let (last, parent) = path.split_last().expect("row paths are non-empty");
-                (parent.to_vec(), last + 1)
+                if row.source == RowSource::Decrypted && parent.is_empty() {
+                    self.status =
+                        "a decrypted PKCS#8 value must remain one top-level SEQUENCE".to_string();
+                    return;
+                }
+                (parent.to_vec(), last + 1, row.source)
             }
         };
-        self.mode = Mode::TypePicker(PickerState::new(PickerTarget::Insert { parent, index }));
+        self.mode =
+            Mode::TypePicker(PickerState::new(PickerTarget::Insert { parent, index, source }));
         self.status = "choose the type of the new element".to_string();
     }
 
@@ -1244,9 +1369,14 @@ impl App {
     /// identifier octets while keeping the content octets.
     pub fn start_retag(&mut self) {
         let Some(row) = self.rows.get(self.selected) else { return };
+        if row.source == RowSource::DecryptedPlaceholder {
+            self.status = "decrypt the content before editing it".to_string();
+            return;
+        }
         let path = row.path.clone();
+        let source = row.source;
         let Some(node) = self.selected_node() else { return };
-        let mut p = PickerState::new(PickerTarget::Retag { path });
+        let mut p = PickerState::new(PickerTarget::Retag { path, source });
         p.class_idx = PICKER_CLASSES
             .iter()
             .position(|(_, c)| *c == node.class)
@@ -1320,23 +1450,47 @@ impl App {
         let Mode::TypePicker(ref p) = self.mode else { return };
         let (class, constructed, tag) = (p.class(), p.constructed(), p.tag());
         match p.target.clone() {
-            PickerTarget::Insert { parent, index } => {
-                let kind = EditKind::Insert { parent, index, class, constructed, tag };
+            PickerTarget::Insert { parent, index, source } => {
+                let kind = EditKind::Insert { parent, index, class, constructed, tag, source };
                 self.mode = Mode::Edit(EditState::hex(kind, &[]));
                 self.status = format!(
                     "value for new {} — hex content octets (may stay empty), Enter inserts",
                     ber::type_name_of(class, tag),
                 );
             }
-            PickerTarget::Retag { path } => self.apply_retag(&path, class, constructed, tag),
+            PickerTarget::Retag { path, source } => {
+                self.apply_retag(&path, source, class, constructed, tag)
+            }
         }
     }
 
     /// Give the element at `path` a new identifier (class/form/tag). The
     /// content octets are preserved; when switching to constructed form
     /// they must parse as a TLV series.
-    fn apply_retag(&mut self, path: &[usize], class: Class, constructed: bool, tag: u32) {
-        let Some(node) = node_at_mut(&mut self.roots, path) else { return };
+    fn apply_retag(
+        &mut self,
+        path: &[usize],
+        source: RowSource,
+        class: Class,
+        constructed: bool,
+        tag: u32,
+    ) {
+        if source == RowSource::Decrypted
+            && path.len() == 1
+            && (class != Class::Universal || tag != ber::TAG_SEQUENCE || !constructed)
+        {
+            self.status = "the decrypted PKCS#8 root must remain a SEQUENCE".to_string();
+            return;
+        }
+        let roots = match source {
+            RowSource::Document => &mut self.roots,
+            RowSource::Decrypted => {
+                let Some(decrypted) = self.decrypted.as_mut() else { return };
+                &mut decrypted.roots
+            }
+            RowSource::DecryptedPlaceholder => return,
+        };
+        let Some(node) = node_at_mut(roots, path) else { return };
         if node.class == class && node.constructed == constructed && node.tag == tag {
             self.mode = Mode::Browse;
             self.status = "type unchanged".to_string();
@@ -1378,11 +1532,23 @@ impl App {
     /// Move the selected element up (-1) or down (+1) among its siblings.
     pub fn move_selected(&mut self, delta: isize) {
         let Some(row) = self.rows.get(self.selected).cloned() else { return };
+        if row.source == RowSource::DecryptedPlaceholder {
+            self.status = "decrypt the content before editing it".to_string();
+            return;
+        }
         let (&last, parent) = row.path.split_last().expect("row paths are non-empty");
+        let roots = match row.source {
+            RowSource::Document => &mut self.roots,
+            RowSource::Decrypted => {
+                let Some(decrypted) = self.decrypted.as_mut() else { return };
+                &mut decrypted.roots
+            }
+            RowSource::DecryptedPlaceholder => unreachable!(),
+        };
         let sibling_count = if parent.is_empty() {
-            self.roots.len()
+            roots.len()
         } else {
-            node_at(&self.roots, parent).map(|p| p.children.len()).unwrap_or(0)
+            node_at(roots, parent).map(|p| p.children.len()).unwrap_or(0)
         };
         let target = last as isize + delta;
         if target < 0 || target >= sibling_count as isize {
@@ -1391,15 +1557,19 @@ impl App {
         }
         let target = target as usize;
         if parent.is_empty() {
-            self.roots.swap(last, target);
-        } else if let Some(p) = node_at_mut(&mut self.roots, parent) {
+            roots.swap(last, target);
+        } else if let Some(p) = node_at_mut(roots, parent) {
             p.children.swap(last, target);
         }
         self.dirty = true;
         self.rebuild();
         let mut new_path = parent.to_vec();
         new_path.push(target);
-        if let Some(i) = self.rows.iter().position(|r| r.path == new_path) {
+        if let Some(i) = self
+            .rows
+            .iter()
+            .position(|r| r.source == row.source && r.path == new_path)
+        {
             self.select(i);
         }
         self.status = "element moved — 's' writes the file".to_string();
@@ -1409,6 +1579,14 @@ impl App {
     /// confirmation, the second call within the same selection deletes).
     pub fn delete_selected(&mut self) {
         let Some(row) = self.rows.get(self.selected).cloned() else { return };
+        if row.source == RowSource::DecryptedPlaceholder {
+            self.status = "decrypt the content before editing it".to_string();
+            return;
+        }
+        if row.source == RowSource::Decrypted && row.path.len() == 1 {
+            self.status = "the decrypted PKCS#8 root cannot be deleted".to_string();
+            return;
+        }
         if !self.delete_confirm {
             self.delete_confirm = true;
             self.status = format!(
@@ -1420,9 +1598,17 @@ impl App {
         }
         self.delete_confirm = false;
         let (&last, parent) = row.path.split_last().expect("row paths are non-empty");
+        let roots = match row.source {
+            RowSource::Document => &mut self.roots,
+            RowSource::Decrypted => {
+                let Some(decrypted) = self.decrypted.as_mut() else { return };
+                &mut decrypted.roots
+            }
+            RowSource::DecryptedPlaceholder => unreachable!(),
+        };
         if parent.is_empty() {
-            self.roots.remove(last);
-        } else if let Some(p) = node_at_mut(&mut self.roots, parent) {
+            roots.remove(last);
+        } else if let Some(p) = node_at_mut(roots, parent) {
             p.children.remove(last);
         }
         self.dirty = true;
@@ -1449,8 +1635,8 @@ impl App {
             }
         };
 
-        if let EditKind::Insert { parent, index, class, constructed, tag } = edit.kind.clone() {
-            self.commit_insert(&bytes, parent, index, class, constructed, tag);
+        if matches!(&edit.kind, EditKind::Insert { .. }) {
+            self.commit_insert(&bytes, edit.kind.clone());
             return;
         }
 
@@ -1490,12 +1676,11 @@ impl App {
     fn commit_insert(
         &mut self,
         bytes: &[u8],
-        parent: Vec<usize>,
-        index: usize,
-        class: Class,
-        constructed: bool,
-        tag: u32,
+        kind: EditKind,
     ) {
+        let EditKind::Insert { parent, index, class, constructed, tag, source } = kind else {
+            return;
+        };
         let mut node = Node {
             class,
             tag,
@@ -1523,10 +1708,18 @@ impl App {
         } else {
             node.value = bytes.to_vec();
         }
+        let roots = match source {
+            RowSource::Document => &mut self.roots,
+            RowSource::Decrypted => {
+                let Some(decrypted) = self.decrypted.as_mut() else { return };
+                &mut decrypted.roots
+            }
+            RowSource::DecryptedPlaceholder => return,
+        };
         if parent.is_empty() {
-            self.roots.insert(index, node);
+            roots.insert(index, node);
         } else {
-            let Some(p) = node_at_mut(&mut self.roots, &parent) else { return };
+            let Some(p) = node_at_mut(roots, &parent) else { return };
             p.children.insert(index, node);
             p.expanded = true; // make the insertion visible
         }
@@ -1535,7 +1728,11 @@ impl App {
         self.rebuild();
         let mut path = parent;
         path.push(index);
-        if let Some(i) = self.rows.iter().position(|r| r.path == path) {
+        if let Some(i) = self
+            .rows
+            .iter()
+            .position(|r| r.source == source && r.path == path)
+        {
             self.select(i);
         }
         self.status = format!(
@@ -1547,7 +1744,18 @@ impl App {
     /// Re-encode the whole tree and re-parse it so that every offset,
     /// length and encapsulation flag is consistent again after an edit.
     pub fn rebuild(&mut self) {
-        let sel_path = self.rows.get(self.selected).map(|r| r.path.clone());
+        let selection = self
+            .rows
+            .get(self.selected)
+            .map(|r| (r.source, r.path.clone()));
+
+        if selection.as_ref().map(|(source, _)| *source) == Some(RowSource::Decrypted) {
+            if let Err(e) = self.encrypt_decrypted_tree() {
+                self.status = format!("could not update encrypted content: {}", e);
+                return;
+            }
+        }
+
         let data = ber::encode_forest(&self.roots);
         self.total_len = data.len();
         match ber::parse_forest(&data, 0) {
@@ -1560,16 +1768,83 @@ impl App {
                 self.status = format!("internal error: re-parse failed ({})", e);
             }
         }
+        if selection.as_ref().map(|(source, _)| *source) == Some(RowSource::Document) {
+            self.refresh_decrypted_tree();
+        }
+        self.identify();
         self.rebuild_rows();
         // Edits can make the document gain or lose conformance to a spec,
-        // or break/fix its signature; and they invalidate any decryption
-        // (offsets/content changed).
-        self.decrypted = None;
-        self.identify();
+        // or break/fix its signature.
         self.recompute_sig_status();
-        if let Some(path) = sel_path {
-            if let Some(i) = self.rows.iter().position(|r| r.path == path) {
+        if let Some((source, path)) = selection {
+            if let Some(i) = self
+                .rows
+                .iter()
+                .position(|r| r.source == source && r.path == path)
+            {
                 self.select(i);
+            }
+        }
+    }
+
+    /// Serialize the edited virtual tree and replace the outer ciphertext
+    /// and IV. The virtual nodes themselves remain outside `self.roots`.
+    fn encrypt_decrypted_tree(&mut self) -> Result<(), String> {
+        let (password, plaintext) = {
+            let decrypted = self.decrypted.as_ref().ok_or("decryption is not available")?;
+            (decrypted.password.clone(), ber::encode_forest(&decrypted.roots))
+        };
+        let encrypted = pkcs8::parse(&self.roots)?
+            .ok_or("document is no longer an EncryptedPrivateKeyInfo")?;
+        let (ciphertext, iv) = encrypted.encrypt(&password, &plaintext)?;
+
+        let data_node = node_at_mut(&mut self.roots, &encrypted.encrypted_path)
+            .ok_or("encryptedData node is missing")?;
+        data_node.value = ciphertext;
+        data_node.children.clear();
+        data_node.encapsulates = false;
+
+        let iv_node = node_at_mut(&mut self.roots, &encrypted.iv_path)
+            .ok_or("cipher IV node is missing")?;
+        iv_node.value = iv;
+        iv_node.children.clear();
+        iv_node.encapsulates = false;
+
+        if let Some(ref mut decrypted) = self.decrypted {
+            decrypted.plaintext = plaintext;
+        }
+        Ok(())
+    }
+
+    /// When the serialized representation is edited, decrypt it again with
+    /// the retained password so the virtual representation immediately
+    /// reflects the new ciphertext and/or PBES2 parameters.
+    fn refresh_decrypted_tree(&mut self) {
+        let Some(password) = self.decrypted.as_ref().map(|d| d.password.clone()) else {
+            return;
+        };
+        let old_roots = self.decrypted.as_ref().map(|d| d.roots.clone()).unwrap_or_default();
+        let refreshed = (|| {
+            let encrypted = pkcs8::parse(&self.roots)?
+                .ok_or("document is no longer an EncryptedPrivateKeyInfo".to_string())?;
+            let plaintext = encrypted.decrypt(&password)?;
+            let mut roots = ber::parse_forest(&plaintext, 0)
+                .map_err(|e| format!("decrypted ASN.1 could not be parsed: {}", e))?;
+            copy_expanded(&old_roots, &mut roots);
+            let ident = spec::identify(&self.spec_db, &roots);
+            Ok::<Decrypted, String>(Decrypted {
+                encrypted_path: encrypted.encrypted_path,
+                plaintext,
+                roots,
+                password,
+                ident,
+            })
+        })();
+        match refreshed {
+            Ok(decrypted) => self.decrypted = Some(decrypted),
+            Err(e) => {
+                self.decrypted = None;
+                self.status = format!("encrypted content changed; decryption is unavailable: {}", e);
             }
         }
     }
@@ -1595,13 +1870,19 @@ impl App {
     }
 }
 
-fn collect_rows(node: &Node, path: Vec<usize>, rows: &mut Vec<Row>) {
-    rows.push(Row { depth: path.len() - 1, path: path.clone() });
+fn collect_rows(
+    node: &Node,
+    path: Vec<usize>,
+    base_depth: usize,
+    source: RowSource,
+    rows: &mut Vec<Row>,
+) {
+    rows.push(Row { depth: base_depth + path.len() - 1, path: path.clone(), source });
     if node.expanded {
         for (i, child) in node.children.iter().enumerate() {
             let mut child_path = path.clone();
             child_path.push(i);
-            collect_rows(child, child_path, rows);
+            collect_rows(child, child_path, base_depth, source, rows);
         }
     }
 }
@@ -2109,7 +2390,10 @@ mod tests {
         assert_eq!(p.class(), Class::Universal);
         assert!(p.constructed());
         assert_eq!(p.tag(), ber::TAG_SEQUENCE);
-        assert_eq!(p.target, PickerTarget::Retag { path: vec![0] });
+        assert_eq!(
+            p.target,
+            PickerTarget::Retag { path: vec![0], source: RowSource::Document }
+        );
     }
 
     #[test]
@@ -2352,7 +2636,26 @@ mod tests {
     }
 
     fn row_of(app: &App, path: &[usize]) -> usize {
-        app.rows.iter().position(|r| r.path == path).expect("row exists")
+        app.rows
+            .iter()
+            .position(|r| r.source == RowSource::Document && r.path == path)
+            .expect("document row exists")
+    }
+
+    fn row_of_source(app: &App, source: RowSource, path: &[usize]) -> usize {
+        app.rows
+            .iter()
+            .position(|r| r.source == source && r.path == path)
+            .expect("row exists")
+    }
+
+    fn decrypt_test_key(app: &mut App) {
+        app.start_decrypt();
+        let Mode::Password(ref mut p) = app.mode else { panic!("password prompt not open") };
+        for c in "asn1editor".chars() {
+            p.insert_char(c);
+        }
+        app.submit_password();
     }
 
     #[test]
@@ -2430,17 +2733,10 @@ mod tests {
     #[test]
     fn decrypt_prompts_then_reveals_the_private_key() {
         let mut app = open_real_file(std::path::Path::new("testdata/enc_pkcs8.der"));
+        let placeholder = row_of_source(&app, RowSource::DecryptedPlaceholder, &[0, 1]);
+        assert_eq!(app.rows[placeholder].depth, app.rows[row_of(&app, &[0, 1])].depth + 1);
         // 'z' recognizes the encrypted key and opens the password prompt.
-        app.start_decrypt();
-        assert!(matches!(app.mode, Mode::Password(_)));
-
-        // Type the (fixed, committed) password and submit.
-        if let Mode::Password(ref mut p) = app.mode {
-            for c in "asn1editor".chars() {
-                p.insert_char(c);
-            }
-        }
-        app.submit_password();
+        decrypt_test_key(&mut app);
         assert!(matches!(app.mode, Mode::Browse));
         let dec = app.decrypted.as_ref().expect("decrypted");
         assert_eq!(dec.encrypted_path, [0, 1]);
@@ -2448,6 +2744,16 @@ mod tests {
         let inner = ber::parse_forest(&dec.plaintext, 0).unwrap();
         assert_eq!(inner.len(), 1);
         assert!(inner[0].is_universal(ber::TAG_SEQUENCE));
+        assert!(app
+            .rows
+            .iter()
+            .any(|r| r.source == RowSource::Decrypted && r.path == [0]));
+        assert!(!app.rows.iter().any(|r| r.source == RowSource::DecryptedPlaceholder));
+
+        let before = app.rows.len();
+        app.select(row_of_source(&app, RowSource::Decrypted, &[0]));
+        app.toggle_expand();
+        assert!(app.rows.len() < before, "the virtual root must be foldable");
     }
 
     #[test]
@@ -2474,20 +2780,43 @@ mod tests {
     }
 
     #[test]
-    fn editing_clears_a_prior_decryption() {
+    fn editing_decrypted_content_reencrypts_and_updates_the_outer_tree() {
         let mut app = open_real_file(std::path::Path::new("testdata/enc_pkcs8.der"));
-        app.start_decrypt();
-        if let Mode::Password(ref mut p) = app.mode {
-            for c in "asn1editor".chars() {
-                p.insert_char(c);
-            }
-        }
-        app.submit_password();
-        assert!(app.decrypted.is_some());
-        // Any edit runs rebuild(), which invalidates the decryption.
-        app.select(row_of(&app, &[0, 1])); // encryptedData OCTET STRING
-        app.mode = Mode::Edit(EditState::hex(EditKind::Content, &[0xAA, 0xBB]));
+        decrypt_test_key(&mut app);
+        let old_ciphertext = app.node_at(&[0, 1]).unwrap().value.clone();
+        let old_iv = app.node_at(&[0, 0, 1, 1, 1]).unwrap().value.clone();
+
+        app.select(row_of_source(&app, RowSource::Decrypted, &[0, 0]));
+        app.mode = Mode::Edit(EditState::hex(EditKind::Content, &[1]));
         app.commit_edit();
-        assert!(app.decrypted.is_none(), "an edit must clear the stale decryption");
+
+        let decrypted = app.decrypted.as_ref().expect("decryption remains available");
+        assert_eq!(node_at(&decrypted.roots, &[0, 0]).unwrap().value, [1]);
+        assert_ne!(app.node_at(&[0, 1]).unwrap().value, old_ciphertext);
+        assert_ne!(app.node_at(&[0, 0, 1, 1, 1]).unwrap().value, old_iv);
+        let encrypted = pkcs8::parse(&app.roots).unwrap().unwrap();
+        assert_eq!(encrypted.decrypt(b"asn1editor").unwrap(), decrypted.plaintext);
+    }
+
+    #[test]
+    fn editing_encrypted_content_refreshes_the_virtual_tree() {
+        let mut app = open_real_file(std::path::Path::new("testdata/enc_pkcs8.der"));
+        decrypt_test_key(&mut app);
+
+        let encrypted = pkcs8::parse(&app.roots).unwrap().unwrap();
+        let mut plaintext_roots = app.decrypted.as_ref().unwrap().roots.clone();
+        plaintext_roots[0].children[0].value = vec![1];
+        let plaintext = ber::encode_forest(&plaintext_roots);
+        let ciphertext = encrypted
+            .encrypt_with_current_iv(b"asn1editor", &plaintext)
+            .unwrap();
+
+        app.select(row_of(&app, &[0, 1]));
+        app.mode = Mode::Edit(EditState::hex(EditKind::Content, &ciphertext));
+        app.commit_edit();
+
+        let decrypted = app.decrypted.as_ref().expect("ciphertext is decrypted again");
+        assert_eq!(decrypted.plaintext, plaintext);
+        assert_eq!(node_at(&decrypted.roots, &[0, 0]).unwrap().value, [1]);
     }
 }
