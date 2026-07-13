@@ -480,10 +480,19 @@ the two kinds of edge touching `selected`:
 
 Each `RelationEdge` carries a `verified` flag: true when the signature
 cryptographically checks out, false when the issuance is only *claimed*
-(the issuer is present but its signature does not verify). Self-edges (a
-self-signed root pointing at itself) are omitted — there is no second file
-to draw an arrow to. The logic is pure and unit-tested against the bundled
-`testdata/chain/` hierarchy; rendering is separate and untested.
+(the issuer is present but its signature does not verify). Self-signed
+certificates — issuer equal to their own subject *and* the signature
+verifying under their own key — contribute no issuance edge at all: their
+"issuer" is themselves, so any arrow could only point at the file itself
+or at another *copy* of the same certificate (the same root stored as
+both `.der` and `.pem`, like `testdata/cert_ec.*`), which is issuance
+noise, not a relation. Note this only suppresses the self-signed
+certificate's own incoming edge; the objects it signed still point at it.
+The check is cryptographic rather than by file path or DN alone, so a
+key-rollover certificate (self-*issued*: same DN, but signed by the
+previous key) still shows its true issuance edge. The logic is pure and
+unit-tested against the bundled `testdata/chain/` hierarchy and the
+duplicated `cert_ec` pair; rendering is separate and untested.
 
 In the browser pane, the arrows are drawn as routed elbow connectors that
 really travel from source row to destination row — a horizontal stub out
@@ -547,16 +556,31 @@ Built with ratatui 0.29 (bundled crossterm backend, `ratatui::init()` /
 * **Far-left pane — file browser.** A folding directory tree (`src/browser.rs`)
   of the directory the current file lives in (or, if the program was
   started with a directory instead of a file, that directory, with the
-  other two panes starting empty). Fold marker (`▸`/`▾`) on directories,
-  their children read lazily on first expand; the file currently open (if
-  any) is marked with `•` even if the selection has moved elsewhere.
+  other two panes starting empty until the first navigation). Fold marker
+  (`▸`/`▾`) on directories, their children read lazily on first expand.
   `Tab` switches keyboard focus between this pane and the document panes;
-  the focused pane gets a highlighted border. On a file, `Enter`/`Space`
-  opens it into the tree/content panes (with an unsaved-changes
-  confirmation, same two-step pattern as delete); on a directory it
-  folds/unfolds. Started with a directory and no file picked yet, `save`
-  and insert are refused with a status message — there is nothing to
-  write to. Colored elbow arrows show the selected file's cryptographic
+  the focused pane gets a highlighted border.
+
+  Moving the browser selection with any navigation key (`↑↓`/`←→`/
+  `PgUp`/`PgDn`/`Home`/`End`) **live-previews the highlighted file** into
+  the tree/content panes (`App::preview_browser_selection`), without
+  moving focus away from the browser — so repeatedly pressing `↓` browses
+  through file contents the same way it browses file names. The file
+  currently loaded (whether by live preview or explicitly opened) is
+  marked with `•` even if the browser selection has since moved
+  elsewhere. Live preview is a no-op while highlighting a directory, the
+  already-loaded file, or — to avoid silently discarding work — while the
+  open document has unsaved changes; a failed preview (the highlighted
+  file isn't recognizable ASN.1) reports the error in the status bar but
+  leaves the previously previewed content on screen. On a file,
+  `Enter`/`Space` then just switches focus to the document panes (the
+  common case: the file is already loaded from live preview); it only
+  triggers a load itself — with the same two-step unsaved-changes
+  confirmation as `delete` — when live preview was skipped because of
+  unsaved changes. On a directory, `Enter`/`Space` folds/unfolds, as
+  before. Started with a directory and no file picked yet, `save` and
+  insert are refused with a status message — there is nothing to write
+  to. Colored elbow arrows show the selected file's cryptographic
   relations to the other visible files (§9), routed from source row to
   destination row: the signer's arrow enters the selection from the left
   (cyan), arrows to the objects the selection signed leave it to the right
@@ -614,19 +638,21 @@ Built with ratatui 0.29 (bundled crossterm backend, `ratatui::init()` /
 document (tree/content) panes, both in and out of a loaded document; `q`
 quits regardless of focus. The rest of the browse-mode bindings below
 apply to whichever pane is focused — arrow keys and fold navigation work
-the same way in both, but `Enter`/`Space` opens a file (or folds a
-directory) in the browser versus toggling fold in the tree, and the
-editing/save/insert/delete/reorder keys only apply to the document pane.
+the same way in both, but in the browser they also live-preview the
+highlighted file (see above), `Enter`/`Space` switches focus to an
+already-previewed file (or folds a directory) versus toggling fold in the
+tree, and the editing/save/insert/delete/reorder keys only apply to the
+document pane.
 
 | Key | Action |
 |-----|--------|
 | `Tab` | switch focus between the file browser and the document panes |
-| `↑`/`k`, `↓`/`j` | move selection |
-| `PgUp`/`PgDn` | move selection by 15 |
-| `g`/`Home`, `G`/`End` | first / last row |
-| `←`/`h` | collapse node/directory, or jump to parent |
-| `→`/`l` | expand node/directory, or enter first child |
-| `Enter`/`Space` | toggle fold (tree); open file / toggle fold (browser) |
+| `↑`/`k`, `↓`/`j` | move selection (browser: also live-previews the file) |
+| `PgUp`/`PgDn` | move selection by 15 (browser: also live-previews) |
+| `g`/`Home`, `G`/`End` | first / last row (browser: also live-previews) |
+| `←`/`h` | collapse node/directory, or jump to parent (browser: also live-previews) |
+| `→`/`l` | expand node/directory, or enter first child (browser: also live-previews) |
+| `Enter`/`Space` | toggle fold (tree); switch to the previewed file / toggle fold (browser) |
 | `e` | edit selected element's value (type-specific editor) |
 | `E` | edit menu: tag type / hex / base64 / raw binary / type specific |
 | `i` | insert new element after the selection (type-picker dialog, then value) |

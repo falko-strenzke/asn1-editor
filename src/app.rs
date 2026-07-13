@@ -710,7 +710,7 @@ impl App {
             selected: 0,
             tree_state: ListState::default(),
             mode: Mode::Browse,
-            status: "select a file in the browser and press Enter to open it".to_string(),
+            status: "↑↓ to preview a file — Enter switches to it".to_string(),
             dirty: false,
             quit_confirm: false,
             delete_confirm: false,
@@ -787,9 +787,33 @@ impl App {
             .map(|signable| verify::verify_against(&self.ca_index, &signable));
     }
 
-    /// Enter/Space on the selected browser row: fold a directory, or open a
-    /// file into the document panes (armed with an unsaved-changes
-    /// confirmation, mirroring `delete_selected`'s two-step pattern).
+    /// Live-preview the file currently highlighted in the browser into the
+    /// tree/content panes, without requiring Enter. Called after every
+    /// browser navigation key. A no-op for directories, for the file
+    /// that's already loaded, and — to avoid silently discarding work —
+    /// while the current document has unsaved changes (in which case
+    /// `activate_browser_entry`'s confirmation dance is still required).
+    pub fn preview_browser_selection(&mut self) {
+        let Some(entry) = self.browser.selected_entry() else { return };
+        if entry.is_dir {
+            return;
+        }
+        let path = entry.path.clone();
+        if self.file_open && (self.path == path || self.dirty) {
+            return;
+        }
+        if let Err(e) = self.open_file(path.clone()) {
+            self.status = format!("cannot preview {}: {}", path.display(), e);
+        }
+    }
+
+    /// Enter/Space on the selected browser row: fold a directory, or
+    /// switch focus to the document panes for a file. Since browser
+    /// navigation already live-previews files (`preview_browser_selection`),
+    /// the common case is just a focus switch; loading here only happens
+    /// when the previewed file was skipped because of unsaved changes, in
+    /// which case a first Enter arms a discard confirmation (mirroring
+    /// `delete_selected`'s two-step pattern) and a second one loads.
     pub fn activate_browser_entry(&mut self) {
         let Some(entry) = self.browser.selected_entry() else { return };
         if entry.is_dir {
@@ -797,6 +821,11 @@ impl App {
             return;
         }
         let path = entry.path.clone();
+        if self.file_open && self.path == path {
+            self.open_confirm = false;
+            self.focus = Focus::Document;
+            return;
+        }
         if self.file_open && self.dirty && !self.open_confirm {
             self.open_confirm = true;
             self.status = format!(
@@ -2118,5 +2147,83 @@ mod tests {
         assert!(app.path.ends_with("b.der"));
         assert!(!app.dirty);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn preview_loads_the_highlighted_file_without_changing_focus() {
+        let dir = tmp_dir("preview");
+        std::fs::write(dir.join("a.der"), [0x05, 0x00]).unwrap(); // NULL
+        std::fs::write(dir.join("b.der"), [0x02, 0x01, 0x07]).unwrap(); // INTEGER 7
+        let mut app = App::new_dir(dir.clone());
+        assert_eq!(app.focus, Focus::Browser);
+
+        app.browser.select(0); // "a.der"
+        app.preview_browser_selection();
+        assert!(app.file_open);
+        assert!(app.path.ends_with("a.der"));
+        assert!(app.selected_node().unwrap().is_universal(ber::TAG_NULL));
+        assert_eq!(app.focus, Focus::Browser, "preview must not steal focus");
+
+        app.browser.select(1); // "b.der"
+        app.preview_browser_selection();
+        assert!(app.path.ends_with("b.der"));
+        assert!(app.selected_node().unwrap().is_universal(ber::TAG_INTEGER));
+        assert_eq!(app.focus, Focus::Browser);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn preview_is_a_no_op_on_directories_and_on_the_already_loaded_file() {
+        let dir = tmp_dir("preview-noop");
+        std::fs::create_dir(dir.join("sub")).unwrap();
+        // SEQUENCE { INTEGER 1, INTEGER 2 } — two rows, so a non-zero
+        // document-pane selection is possible to check for a reset.
+        std::fs::write(dir.join("a.der"), [0x30, 0x06, 0x02, 0x01, 0x01, 0x02, 0x01, 0x02]).unwrap();
+        let mut app = App::new_dir(dir.clone());
+
+        app.browser.select(0); // "sub" (dirs sort first)
+        app.preview_browser_selection();
+        assert!(!app.file_open, "hovering a directory must not load anything");
+
+        app.browser.select(1); // "a.der"
+        app.preview_browser_selection();
+        assert!(app.file_open);
+        assert_eq!(app.rows.len(), 3); // SEQUENCE + 2 children
+        app.select(2); // move the document-pane selection off the default
+        app.preview_browser_selection(); // same file still highlighted: must be a true no-op
+        assert_eq!(app.selected, 2, "re-preview must not reset the document selection");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn preview_does_not_discard_unsaved_changes() {
+        let dir = tmp_dir("preview-dirty");
+        std::fs::write(dir.join("a.der"), [0x05, 0x00]).unwrap();
+        std::fs::write(dir.join("b.der"), [0x02, 0x01, 0x07]).unwrap();
+        let mut app = App::new_dir(dir.clone());
+        app.browser.select(0); // "a.der"
+        app.preview_browser_selection();
+        app.dirty = true; // simulate an unsaved edit
+
+        app.browser.select(1); // "b.der"
+        app.preview_browser_selection();
+        assert!(app.path.ends_with("a.der"), "must not discard unsaved edits just by moving the cursor");
+        assert!(app.dirty);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn enter_on_the_previewed_file_only_switches_focus() {
+        let dir = tmp_dir("enter-fastpath");
+        std::fs::write(dir.join("a.der"), [0x05, 0x00]).unwrap();
+        let mut app = App::new_dir(dir.clone());
+        app.browser.select(0);
+        app.preview_browser_selection(); // as tui.rs would do on ↑↓
+        assert_eq!(app.focus, Focus::Browser);
+
+        app.activate_browser_entry();
+        assert_eq!(app.focus, Focus::Document);
+        assert!(app.path.ends_with("a.der"));
     }
 }

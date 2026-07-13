@@ -135,16 +135,39 @@ pub struct FileRelations {
     pub signs: Vec<RelationEdge>,
 }
 
+/// Is this certificate cryptographically self-signed — issuer equal to its
+/// own subject and the signature verifying under its own public key? Such
+/// a certificate's issuance edge would only ever point at itself (or at
+/// another *copy* of the same certificate, e.g. the same root stored as
+/// both .der and .pem), so the relation graph draws nothing for it.
+fn is_self_signed(s: &Signable) -> bool {
+    let (Some(subject), Some(pubkey)) = (&s.subject, &s.pubkey) else {
+        return false; // CRLs and cert-less shapes cannot be self-signed
+    };
+    if *subject != s.issuer {
+        return false;
+    }
+    let Some(alg) = algorithm_for(&s.sig_alg) else { return false };
+    signature::UnparsedPublicKey::new(alg, pubkey)
+        .verify(&s.tbs, &s.signature)
+        .is_ok()
+}
+
 /// Compute the signer/signed relations of `selected` against every other
 /// signed object in `signables`. Pure logic (no rendering): for each
 /// scanned file it resolves the single issuer `verify_against` would pick,
-/// then reads off the edges touching `selected`. Self-edges (a self-signed
-/// root pointing at itself) are omitted. `signs` order follows scan order
-/// and is therefore not guaranteed stable — callers that care should sort.
+/// then reads off the edges touching `selected`. Self-signed certificates
+/// contribute no issuance edge at all — neither to themselves nor between
+/// duplicate copies of the same certificate in different files. `signs`
+/// order follows scan order and is therefore not guaranteed stable —
+/// callers that care should sort.
 pub fn relations_for(signables: &[SignableFile], selected: &Path) -> FileRelations {
     let candidates = x509::cert_candidates(signables);
     let mut relations = FileRelations::default();
     for file in signables {
+        if is_self_signed(&file.signable) {
+            continue; // no incoming/outgoing arrows for self-signed certs
+        }
         let (issuer_path, verified) = match verify_against(&candidates, &file.signable) {
             SignatureStatus::Verified { issuer_path, .. } => (issuer_path, true),
             SignatureStatus::Invalid { issuer_path, .. } => (issuer_path, false),
@@ -152,7 +175,10 @@ pub fn relations_for(signables: &[SignableFile], selected: &Path) -> FileRelatio
             SignatureStatus::IssuerNotFound | SignatureStatus::UnsupportedAlgorithm(_) => continue,
         };
         if issuer_path == file.path {
-            continue; // self-signed: no arrow from a file to itself
+            // Not cryptographically self-signed (or it would have been
+            // skipped above), but the resolver still landed on the file
+            // itself — never draw an arrow from a file to itself.
+            continue;
         }
         if file.path == selected {
             relations.signed_by = Some(RelationEdge { other: issuer_path.clone(), verified });
@@ -262,6 +288,20 @@ mod tests {
             ])
         );
         assert!(!signed.contains_key("root_ca.der"), "no self-edge");
+    }
+
+    #[test]
+    fn duplicated_self_signed_cert_gets_no_arrows() {
+        // testdata/ holds the same self-signed EC certificate twice, as
+        // cert_ec.der and cert_ec.pem. Neither copy may point at the
+        // other: self-signed certificates have no issuance arrows at all.
+        let dir = Path::new("testdata");
+        let signables = x509::scan_dir_signables(dir);
+        for file in ["cert_ec.der", "cert_ec.pem", "cert_rsa.der"] {
+            let rel = relations_for(&signables, &dir.join(file));
+            assert_eq!(rel.signed_by, None, "{} must have no incoming arrow", file);
+            assert!(rel.signs.is_empty(), "{} must have no outgoing arrows", file);
+        }
     }
 
     #[test]

@@ -119,7 +119,9 @@ fn handle_browser_key(app: &mut App, key: KeyEvent) {
         KeyCode::Enter | KeyCode::Char(' ') => app.activate_browser_entry(),
         _ => {}
     }
-    // Any of the above can move the browser selection; refresh the arrows.
+    // Any of the above can move the browser selection; live-preview the
+    // now-selected file and refresh the relation arrows.
+    app.preview_browser_selection();
     app.recompute_browser_relations();
 }
 
@@ -1027,7 +1029,9 @@ fn draw_content_browse(frame: &mut Frame, app: &App, area: Rect) {
         )));
         lines.extend(hex_dump_lines(&content));
     } else if !app.file_open {
-        lines.push(Line::from("no file open — pick one in the Files pane on the left (Enter)"));
+        lines.push(Line::from(
+            "no file open — move ↑↓ over a file in the Files pane on the left to preview it",
+        ));
     } else {
         lines.push(Line::from("no element selected"));
     }
@@ -1266,7 +1270,7 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
     let dirty = if app.dirty { " [modified]" } else { "" };
     let hints = match app.mode {
         Mode::Browse if app.focus == Focus::Browser => {
-            "q quit  Tab switch pane  ↑↓ move  ←→ fold  ⏎ open/fold"
+            "q quit  Tab switch pane  ↑↓ move+preview  ←→ fold  ⏎ switch to file/fold"
         }
         Mode::Browse => {
             "q quit  Tab switch pane  ↑↓ move  ←→ fold  ⏎ toggle  e edit  E edit-menu  i/I insert  d delete  J/K reorder  s save  [ ] scroll"
