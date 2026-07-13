@@ -62,4 +62,10 @@ PublicKey ::= BIT STRING
 
 Attributes ::= SET OF Attribute
 
+EncryptedPrivateKeyInfo ::= SEQUENCE {
+    encryptionAlgorithm       AlgorithmIdentifier,
+    encryptedData             EncryptedData }
+
+EncryptedData ::= OCTET STRING
+
 END

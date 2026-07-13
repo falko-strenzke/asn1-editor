@@ -161,6 +161,19 @@ fn pkcs8_private_key_is_identified() {
 }
 
 #[test]
+fn encrypted_pkcs8_key_is_identified() {
+    let db = rfc5280_db();
+    let data = std::fs::read(manifest("testdata/enc_pkcs8.der")).unwrap();
+    let roots = ber::parse_forest(&data, 0).unwrap();
+    let ident = spec::identify(&db, &roots).expect("encrypted key identified");
+    assert_eq!(ident.type_name, "EncryptedPrivateKeyInfo");
+    assert_eq!(ident.source, "rfc5958");
+    let label = |path: &[usize]| ident.labels.get(path).unwrap();
+    assert_eq!(label(&[0, 0]).field.as_deref(), Some("encryptionAlgorithm"));
+    assert_eq!(label(&[0, 1]).field.as_deref(), Some("encryptedData"));
+}
+
+#[test]
 fn rfc5958_is_preferred_over_rfc5208() {
     let data = std::fs::read(manifest("testdata/private_key_pkcs8.der")).unwrap();
     let roots = ber::parse_forest(&data, 0).unwrap();

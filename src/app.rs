@@ -22,6 +22,7 @@ use ratatui::widgets::ListState;
 use crate::ber::{self, Class, Node};
 use crate::browser::FileBrowser;
 use crate::input::{self, Container};
+use crate::pkcs8;
 use crate::spec::{self, Identification, Label, SpecDb};
 use crate::verify::{self, FileRelations, SignatureStatus};
 use crate::x509::{self, CaCandidate, SignableFile};
@@ -586,6 +587,39 @@ pub enum Mode {
     /// Edit-mode chooser popup ('E').
     EditMenu(MenuState),
     Edit(EditState),
+    /// Password prompt for decrypting an `EncryptedPrivateKeyInfo` ('z').
+    Password(PasswordState),
+}
+
+/// State of the decrypt-password prompt: the (masked) characters typed so far.
+pub struct PasswordState {
+    pub buf: String,
+}
+
+impl PasswordState {
+    pub fn insert_char(&mut self, c: char) {
+        if !c.is_control() {
+            self.buf.push(c);
+        }
+    }
+
+    pub fn backspace(&mut self) {
+        self.buf.pop();
+    }
+
+    pub fn paste(&mut self, s: &str) {
+        self.buf.extend(s.chars().filter(|c| !c.is_control()));
+    }
+}
+
+/// A successful decryption of the currently open `EncryptedPrivateKeyInfo`,
+/// kept so the content pane can reveal it when the encrypted node is
+/// selected.
+pub struct Decrypted {
+    /// Path of the `encryptedData` node whose plaintext this is.
+    pub encrypted_path: Vec<usize>,
+    /// The decrypted plaintext DER (a `PrivateKeyInfo`).
+    pub plaintext: Vec<u8>,
 }
 
 /// Which pane receives navigation keys while in `Mode::Browse`.
@@ -647,6 +681,9 @@ pub struct App {
     /// browser selection changes; empty when a directory or nothing is
     /// selected.
     pub browser_relations: FileRelations,
+    /// Plaintext of the open document's `encryptedData`, once the user has
+    /// decrypted it with 'z'. Cleared on load and on any edit.
+    pub decrypted: Option<Decrypted>,
 }
 
 impl App {
@@ -687,6 +724,7 @@ impl App {
             sig_status: None,
             signables,
             browser_relations: FileRelations::default(),
+            decrypted: None,
         };
         app.rebuild_rows();
         app.recompute_sig_status(); // also refreshes browser_relations
@@ -724,6 +762,7 @@ impl App {
             sig_status: None,
             signables,
             browser_relations: FileRelations::default(),
+            decrypted: None,
         };
         app.rebuild_rows();
         app.recompute_browser_relations();
@@ -769,11 +808,65 @@ impl App {
         self.delete_confirm = false;
         self.content_scroll = 0;
         self.file_open = true;
+        self.decrypted = None;
         self.rebuild_rows();
         self.identify();
         self.recompute_sig_status();
         self.status = format!("loaded {} bytes ({})", self.total_len, container.describe());
         Ok(())
+    }
+
+    /// 'z': prompt for a password to decrypt the open document, if it is a
+    /// supported `EncryptedPrivateKeyInfo`. Works from either pane (it acts
+    /// on the open document, which browser live-preview keeps current).
+    pub fn start_decrypt(&mut self) {
+        if !self.file_open {
+            self.status = "no file open — select an encrypted private key first".to_string();
+            return;
+        }
+        match pkcs8::parse(&self.roots) {
+            Ok(Some(_)) => {
+                self.mode = Mode::Password(PasswordState { buf: String::new() });
+                self.status = "enter the password to decrypt this private key".to_string();
+            }
+            Ok(None) => {
+                self.status = "not an encrypted private key (EncryptedPrivateKeyInfo)".to_string();
+            }
+            Err(msg) => self.status = format!("cannot decrypt: {}", msg),
+        }
+    }
+
+    pub fn cancel_password(&mut self) {
+        self.mode = Mode::Browse;
+        self.status = "decryption cancelled".to_string();
+    }
+
+    /// Apply the typed password: decrypt and, on success, remember the
+    /// plaintext so the content pane can reveal it. Returns to browse mode
+    /// either way.
+    pub fn submit_password(&mut self) {
+        let Mode::Password(ref state) = self.mode else { return };
+        let password = state.buf.clone();
+        let result = match pkcs8::parse(&self.roots) {
+            Ok(Some(enc)) => enc.decrypt(password.as_bytes()).map(|plaintext| Decrypted {
+                encrypted_path: enc.encrypted_path,
+                plaintext,
+            }),
+            Ok(None) => Err("not an encrypted private key".to_string()),
+            Err(msg) => Err(msg),
+        };
+        self.mode = Mode::Browse;
+        match result {
+            Ok(decrypted) => {
+                self.decrypted = Some(decrypted);
+                self.status =
+                    "decrypted — select the encrypted data node to view the private key".to_string();
+            }
+            Err(msg) => {
+                self.decrypted = None;
+                self.status = msg;
+            }
+        }
     }
 
     /// Re-derive `sig_status` for the current document against `ca_index`,
@@ -1469,7 +1562,9 @@ impl App {
         }
         self.rebuild_rows();
         // Edits can make the document gain or lose conformance to a spec,
-        // or break/fix its signature.
+        // or break/fix its signature; and they invalidate any decryption
+        // (offsets/content changed).
+        self.decrypted = None;
         self.identify();
         self.recompute_sig_status();
         if let Some(path) = sel_path {
@@ -2330,5 +2425,69 @@ mod tests {
             "the intermediate's outgoing arrow must go red without any navigation"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn decrypt_prompts_then_reveals_the_private_key() {
+        let mut app = open_real_file(std::path::Path::new("testdata/enc_pkcs8.der"));
+        // 'z' recognizes the encrypted key and opens the password prompt.
+        app.start_decrypt();
+        assert!(matches!(app.mode, Mode::Password(_)));
+
+        // Type the (fixed, committed) password and submit.
+        if let Mode::Password(ref mut p) = app.mode {
+            for c in "asn1editor".chars() {
+                p.insert_char(c);
+            }
+        }
+        app.submit_password();
+        assert!(matches!(app.mode, Mode::Browse));
+        let dec = app.decrypted.as_ref().expect("decrypted");
+        assert_eq!(dec.encrypted_path, [0, 1]);
+        // The plaintext is a real PrivateKeyInfo (single SEQUENCE).
+        let inner = ber::parse_forest(&dec.plaintext, 0).unwrap();
+        assert_eq!(inner.len(), 1);
+        assert!(inner[0].is_universal(ber::TAG_SEQUENCE));
+    }
+
+    #[test]
+    fn decrypt_with_wrong_password_reports_error() {
+        let mut app = open_real_file(std::path::Path::new("testdata/enc_pkcs8.der"));
+        app.start_decrypt();
+        if let Mode::Password(ref mut p) = app.mode {
+            p.insert_char('n');
+            p.insert_char('o');
+        }
+        app.submit_password();
+        assert!(matches!(app.mode, Mode::Browse));
+        assert!(app.decrypted.is_none());
+        assert!(app.status.contains("wrong password") || app.status.contains("failed"));
+    }
+
+    #[test]
+    fn decrypt_on_a_non_encrypted_file_is_a_no_op_with_message() {
+        let mut app = open_real_file(std::path::Path::new("testdata/private_key_pkcs8.der"));
+        app.start_decrypt();
+        assert!(matches!(app.mode, Mode::Browse), "no password prompt for a plaintext key");
+        assert!(app.decrypted.is_none());
+        assert!(app.status.contains("not an encrypted private key"));
+    }
+
+    #[test]
+    fn editing_clears_a_prior_decryption() {
+        let mut app = open_real_file(std::path::Path::new("testdata/enc_pkcs8.der"));
+        app.start_decrypt();
+        if let Mode::Password(ref mut p) = app.mode {
+            for c in "asn1editor".chars() {
+                p.insert_char(c);
+            }
+        }
+        app.submit_password();
+        assert!(app.decrypted.is_some());
+        // Any edit runs rebuild(), which invalidates the decryption.
+        app.select(row_of(&app, &[0, 1])); // encryptedData OCTET STRING
+        app.mode = Mode::Edit(EditState::hex(EditKind::Content, &[0xAA, 0xBB]));
+        app.commit_edit();
+        assert!(app.decrypted.is_none(), "an edit must clear the stale decryption");
     }
 }

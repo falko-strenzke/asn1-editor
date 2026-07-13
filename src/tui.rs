@@ -33,6 +33,7 @@ use crate::app::{
     TextEditor, TextFormat, DATE_FIELDS, EDIT_BYTES_PER_LINE, EDIT_DIGITS_PER_LINE, EDIT_MENU,
     PICKER_CLASSES, PICKER_UNIVERSAL,
 };
+use crate::dump;
 use crate::ber::{
     self, Class, Node, TAG_BIT_STRING, TAG_BOOLEAN, TAG_GENERALIZED_TIME, TAG_INTEGER, TAG_NULL,
     TAG_OID, TAG_UTC_TIME,
@@ -66,8 +67,10 @@ fn event_loop(terminal: &mut DefaultTerminal, app: &mut App) -> io::Result<()> {
         let key = match event::read()? {
             Event::Key(key) => key,
             Event::Paste(text) => {
-                if let Mode::Edit(ref mut edit) = app.mode {
-                    edit.editor.paste(&text);
+                match app.mode {
+                    Mode::Edit(ref mut edit) => edit.editor.paste(&text),
+                    Mode::Password(ref mut p) => p.paste(&text),
+                    _ => {}
                 }
                 continue;
             }
@@ -80,6 +83,7 @@ fn event_loop(terminal: &mut DefaultTerminal, app: &mut App) -> io::Result<()> {
             Mode::Edit(_) => handle_edit_key(app, key),
             Mode::TypePicker(_) => handle_picker_key(app, key),
             Mode::EditMenu(_) => handle_menu_key(app, key),
+            Mode::Password(_) => handle_password_key(app, key),
             Mode::Browse => {
                 if key.code != KeyCode::Char('q') {
                     app.quit_confirm = false;
@@ -117,6 +121,7 @@ fn handle_browser_key(app: &mut App, key: KeyEvent) {
         KeyCode::Left | KeyCode::Char('h') => app.browser.collapse_or_parent(),
         KeyCode::Right | KeyCode::Char('l') => app.browser.expand_or_child(),
         KeyCode::Enter | KeyCode::Char(' ') => app.activate_browser_entry(),
+        KeyCode::Char('z') => app.start_decrypt(),
         _ => {}
     }
     // Any of the above can move the browser selection; live-preview the
@@ -147,8 +152,27 @@ fn handle_document_key(app: &mut App, key: KeyEvent) {
         KeyCode::Char('K') => app.move_selected(-1),
         KeyCode::Char('J') => app.move_selected(1),
         KeyCode::Char('s') => app.save(),
+        KeyCode::Char('z') => app.start_decrypt(),
         KeyCode::Char('[') => app.content_scroll = app.content_scroll.saturating_sub(4),
         KeyCode::Char(']') => app.content_scroll = app.content_scroll.saturating_add(4),
+        _ => {}
+    }
+}
+
+fn handle_password_key(app: &mut App, key: KeyEvent) {
+    match key.code {
+        KeyCode::Esc => app.cancel_password(),
+        KeyCode::Enter => app.submit_password(),
+        KeyCode::Backspace => {
+            if let Mode::Password(ref mut p) = app.mode {
+                p.backspace();
+            }
+        }
+        KeyCode::Char(c) => {
+            if let Mode::Password(ref mut p) = app.mode {
+                p.insert_char(c);
+            }
+        }
         _ => {}
     }
 }
@@ -229,6 +253,40 @@ fn draw(frame: &mut Frame, app: &mut App) {
     if matches!(app.mode, Mode::EditMenu(_)) {
         draw_edit_menu(frame, app, main);
     }
+    if matches!(app.mode, Mode::Password(_)) {
+        draw_password(frame, app, main);
+    }
+}
+
+/// Centered popup prompting for the decrypt password (masked).
+fn draw_password(frame: &mut Frame, app: &App, area: Rect) {
+    let Mode::Password(ref p) = app.mode else { return };
+    let width = 54.min(area.width);
+    let height = 5.min(area.height);
+    let popup = Rect {
+        x: area.x + (area.width.saturating_sub(width)) / 2,
+        y: area.y + (area.height.saturating_sub(height)) / 2,
+        width,
+        height,
+    };
+    frame.render_widget(Clear, popup);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::new().fg(Color::Yellow))
+        .title(" DECRYPT — enter password ");
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+    let masked: String = "•".repeat(p.buf.chars().count());
+    let lines = vec![
+        Line::from(vec![
+            Span::styled("password: ", Style::new().dim()),
+            Span::styled(masked, Style::new().bold()),
+            Span::styled("▏", Style::new().fg(Color::Yellow)),
+        ]),
+        Line::default(),
+        Line::from(Span::styled("⏎ decrypt   Esc cancel", Style::new().dim())),
+    ];
+    frame.render_widget(Paragraph::new(lines), inner);
 }
 
 /// Border style cue for which pane currently has keyboard focus.
@@ -683,6 +741,18 @@ fn hex_dump_lines(bytes: &[u8]) -> Vec<Line<'static>> {
     lines
 }
 
+/// Render decrypted plaintext as a dumpasn1-style tree (it is a
+/// `PrivateKeyInfo`); fall back to a hex dump if it somehow doesn't parse.
+fn decrypted_lines(plaintext: &[u8]) -> Vec<Line<'static>> {
+    match ber::parse_forest(plaintext, 0) {
+        Ok(roots) => dump::dump(&roots, plaintext.len())
+            .lines()
+            .map(|l| Line::from(Span::styled(l.to_string(), Style::new().fg(Color::LightGreen))))
+            .collect(),
+        Err(_) => hex_dump_lines(plaintext),
+    }
+}
+
 fn draw_content(frame: &mut Frame, app: &mut App, area: Rect) {
     match &app.mode {
         Mode::Edit(_) => draw_content_edit(frame, app, area),
@@ -1076,6 +1146,18 @@ fn draw_content_browse(frame: &mut Frame, app: &App, area: Rect) {
                 Span::raw(decoded.trim().to_string()),
             ]));
         }
+        // Decrypted private key, shown for the encryptedData node once a
+        // password has been supplied — between the header and the raw hex.
+        if let Some(dec) = &app.decrypted {
+            if app.rows.get(app.selected).map(|r| r.path.as_slice()) == Some(dec.encrypted_path.as_slice()) {
+                lines.push(Line::default());
+                lines.push(Line::from(Span::styled(
+                    format!("Decrypted content ({} bytes):", dec.plaintext.len()),
+                    Style::new().fg(Color::Green).underlined(),
+                )));
+                lines.extend(decrypted_lines(&dec.plaintext));
+            }
+        }
         lines.push(Line::default());
         let content = node.content_octets();
         lines.push(Line::from(Span::styled(
@@ -1329,14 +1411,15 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
     let dirty = if app.dirty { " [modified]" } else { "" };
     let hints = match app.mode {
         Mode::Browse if app.focus == Focus::Browser => {
-            "q quit  Tab switch pane  ↑↓ move+preview  ←→ fold  ⏎ switch to file/fold"
+            "q quit  Tab switch pane  ↑↓ move+preview  ←→ fold  ⏎ switch to file/fold  z decrypt"
         }
         Mode::Browse => {
-            "q quit  Tab switch pane  ↑↓ move  ←→ fold  ⏎ toggle  e edit  E edit-menu  i/I insert  d delete  J/K reorder  s save  [ ] scroll"
+            "q quit  Tab switch pane  ↑↓ move  ←→ fold  ⏎ toggle  e edit  E edit-menu  i/I insert  d delete  J/K reorder  s save  z decrypt  [ ] scroll"
         }
         Mode::TypePicker(_) => "←→ column  ↑↓ select  0-9 tag number  ⏎ continue  Esc cancel",
         Mode::EditMenu(_) => "↑↓ or 1-5 select  ⏎ choose  Esc cancel",
         Mode::Edit(_) => "Enter apply  Esc cancel",
+        Mode::Password(_) => "type password  ⏎ decrypt  Esc cancel",
     };
     let line = Line::from(vec![
         Span::styled(dirty, Style::new().fg(Color::Red).bold()),

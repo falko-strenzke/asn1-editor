@@ -73,7 +73,9 @@ src/
              of whatever document (if any) is open
   x509.rs    structural decoding of Certificate/CertificateList + a
              recursive directory scan for candidate CA certs
-  verify.rs  signature verification (the only module using aws-lc-rs)
+  verify.rs  signature verification (uses aws-lc-rs)
+  pkcs8.rs   structural decoding + password decryption of
+             EncryptedPrivateKeyInfo (PBES2; uses aws-lc-rs)
   app.rs     application state: tree, flattened rows, selection, edit logic
   tui.rs     ratatui event loop and rendering (no business logic)
 tests/
@@ -84,7 +86,7 @@ specs/asn1/  ASN.1 specification modules (rfc5280: certificates + CRLs;
              rfc5208: PKCS#8 private keys; rfc5958: asymmetric key packages;
              rfc5915: SEC1 EC private keys)
 testdata/  DER samples (EC cert, RSA cert, SEC1 EC key, PKCS#8 key,
-           PKCS#7, CRL)
+           encrypted PKCS#8 key [password "asn1editor"], PKCS#7, CRL)
   chain/   a 3-level ECDSA P-256 hierarchy (root CA -> intermediate CA ->
            TLS server leaf) plus CRLs from the root and intermediate, for
            exercising signature verification (§9) end to end; also
@@ -96,8 +98,10 @@ Dependency rule: `ber.rs` depends on nothing; `dump.rs`/`input.rs`/
 `spec.rs` depend only on `ber.rs`; `browser.rs` depends only on the
 standard library (it knows nothing about ASN.1); `x509.rs` depends on
 `ber.rs` + `input.rs` (structural decoding only, no crypto); `verify.rs`
-depends on `x509.rs` + `aws-lc-rs`; `app.rs` depends on all of the above;
-`tui.rs` renders `app.rs`. External dependencies: `ratatui`, `aws-lc-rs`.
+depends on `x509.rs` + `aws-lc-rs`; `pkcs8.rs` depends on `ber.rs` +
+`aws-lc-rs` (the two crypto modules); `app.rs` depends on all of the
+above; `tui.rs` renders `app.rs`. External dependencies: `ratatui`,
+`aws-lc-rs`.
 
 ## 4. Data model
 
@@ -322,10 +326,11 @@ the names from their ASN.1 definition.
 contains the two modules of RFC 5280 Appendix A (PKIX1Explicit88 and
 PKIX1Implicit88), extracted verbatim from the RFC text (de-paginated,
 otherwise unmodified). `specs/asn1/rfc5208` contains the PKCS#8 module
-(RFC 5208 Appendix A → `PrivateKeyInfo`) and `specs/asn1/rfc5958` the
-asymmetric-key-package module that obsoletes it (RFC 5958 Appendix A →
-`OneAsymmetricKey`, which is `PrivateKeyInfo` plus an optional `[1]
-publicKey` field present in version v2). Both carry documented
+(RFC 5208 Appendix A → `PrivateKeyInfo` and `EncryptedPrivateKeyInfo`) and
+`specs/asn1/rfc5958` the asymmetric-key-package module that obsoletes it
+(RFC 5958 Appendix A → `OneAsymmetricKey`, which is `PrivateKeyInfo` plus
+an optional `[1] publicKey` field present in version v2, plus its own
+`EncryptedPrivateKeyInfo`). Both carry documented
 adaptations for this subset parser: the `{{…}}` / `{ … }` information-
 object-set parameters on `AlgorithmIdentifier` (and, for RFC 5958, the
 `[[2: … ]]` version-bracket around `publicKey`) are dropped — none affect
@@ -502,10 +507,11 @@ knowledge of its own:
   correct for DER input, but a real (if rare) risk of silently altering
   the exact bytes a signature is defined over.
 
-`src/verify.rs` is the only module that talks to the crypto library
+`src/verify.rs` is one of the two modules that talk to the crypto library
 (`aws-lc-rs`, chosen for its `ring`-compatible API and — unlike `ring` —
 active investment in post-quantum algorithms, positioning it best for
-adding ML-DSA/SLH-DSA verification later). It maps the signature
+adding ML-DSA/SLH-DSA verification later; `pkcs8.rs`, §9a, is the other).
+It maps the signature
 algorithm OID to an `aws-lc-rs` `VerificationAlgorithm` (RSA PKCS#1 v1.5
 with SHA-1/256/384/512, ECDSA P-256/P-384 with SHA-256/384, Ed25519 — RSA-
 PSS and post-quantum algorithms are not implemented), picks a candidate
@@ -610,6 +616,39 @@ are independent (live preview aside): a user can edit file A while the
 browser happens to be showing file B's relation to A, and B's arrow must
 still reflect the edit without any navigation happening in between.
 
+## 9a. Encrypted private-key decryption (`src/pkcs8.rs`)
+
+An `EncryptedPrivateKeyInfo` (RFC 5958 §3 / RFC 5208) wraps a private key
+in a password-based encryption; its `encryptedData` OCTET STRING is opaque
+in the tree. `pkcs8.rs` can decrypt it in place (read-only — the document
+is never modified) so the user can inspect the key.
+
+`pkcs8::parse` structurally decodes `EncryptedPrivateKeyInfo ::= SEQUENCE {
+encryptionAlgorithm AlgorithmIdentifier, encryptedData OCTET STRING }`
+(positional `ber::Node` walking, like `x509.rs`) and extracts the PBES2
+(`1.2.840.113549.1.5.13`) parameters: a **PBKDF2** key-derivation
+(`…1.5.12` — salt, iteration count, PRF HMAC-SHA1/256/384/512, optional
+key length) and an **AES-128/256-CBC** encryption scheme (IV). Its return
+type distinguishes the three cases the UI needs: `Ok(None)` (not an
+encrypted key), `Err(msg)` (an encrypted key but an unsupported scheme —
+PBES1, scrypt, AES-192 which `aws-lc-rs` doesn't expose, …), `Ok(Some)`
+(supported). `decrypt(password)` PBKDF2-derives the key (`aws-lc-rs`
+`pbkdf2::derive`), AES-CBC decrypts (`cipher::DecryptingKey::cbc`, raw, so
+PKCS#7 padding is stripped and validated manually), and confirms the
+plaintext is a single ASN.1 SEQUENCE — the wrong-password signal (bad
+padding, or the rare valid-padding-but-garbage case).
+
+Flow (state in `app.rs`, keys/rendering in `tui.rs`): pressing **`z`** in
+either pane (`start_decrypt`, acting on the open document — browser
+live-preview keeps it current) opens a `Mode::Password` masked-input
+popup; `submit_password` re-parses, decrypts, and on success stores
+`App::decrypted { encrypted_path, plaintext }` (cleared on load and on any
+edit, since `rebuild` invalidates offsets). The content pane, when the
+selected node is that `encrypted_path` (`[0,1]`), inserts a green
+"Decrypted content" section — the plaintext rendered with `dump::dump` —
+between the header lines and the raw hex dump. A wrong password leaves
+`decrypted` unset and shows the error in the status bar.
+
 ## 10. Input containers
 
 `input::load` detects, in order: PEM (`-----BEGIN <label>-----`, first
@@ -704,8 +743,11 @@ Built with ratatui 0.29 (bundled crossterm backend, `ratatui::init()` /
   (minimal) encoding of the current content length — identical to the
   file bytes for DER input, normalized for BER inputs with redundant
   length octets. Below the diagrams: offset, header and content length,
-  decoded value (integers, OIDs dotted, strings, times, unused bits) and
-  a `hexdump -C`-style dump of the content octets.
+  decoded value (integers, OIDs dotted, strings, times, unused bits),
+  then — for the `encryptedData` node of an `EncryptedPrivateKeyInfo`
+  once decrypted with `z` (§9a) — a green "Decrypted content" section
+  showing the plaintext key as a `dump::dump` tree, and finally a
+  `hexdump -C`-style dump of the (raw) content octets.
 * **Edit mode** (`e` for the type-specific editor, `E` for the edit
   menu): the right pane becomes one of the value editors of §7 — hex grid,
   text line
@@ -745,6 +787,7 @@ document pane.
 | `J` / `K` | move selected element down / up among its siblings |
 | `Enter` / `Esc` | (edit mode) apply / cancel |
 | `s` | save (re-encode + re-wrap container) |
+| `z` | decrypt an `EncryptedPrivateKeyInfo` (prompts for a password) |
 | `[` / `]` | scroll content pane |
 | `q` | quit (`q q` to discard unsaved changes) |
 
