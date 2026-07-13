@@ -426,13 +426,9 @@ fn text_to_bytes(t: &TextEditor) -> Result<Vec<u8>, String> {
             input::b64_decode(&stripped).map_err(|e| format!("invalid base64: {}", e))
         }
         TextFormat::Raw => Ok(s.into_bytes()),
-        TextFormat::Integer => {
-            let v: i128 = s
-                .trim()
-                .parse()
-                .map_err(|_| "not a valid decimal integer".to_string())?;
-            Ok(ber::encode_integer(v))
-        }
+        // Arbitrary precision, so a prefilled 20-octet serial number can be
+        // applied back unchanged.
+        TextFormat::Integer => ber::encode_integer_decimal(&s),
         TextFormat::Real => {
             let trimmed = s.trim();
             match trimmed.to_ascii_lowercase().as_str() {
@@ -1017,7 +1013,7 @@ impl App {
                     return; // stay in the menu
                 }
                 ber::TAG_INTEGER | ber::TAG_ENUMERATED => {
-                    let initial = ber::decode_integer(v).map(|i| i.to_string()).unwrap_or_default();
+                    let initial = ber::integer_decimal(v).unwrap_or_default();
                     (Editor::text(TextFormat::Integer, initial), "enter a decimal integer")
                 }
                 9 => (
@@ -1800,6 +1796,32 @@ mod tests {
         }
         set_text(&mut app, "-1");
         assert_eq!(ber::encode_forest(&app.roots), [0x02, 0x01, 0xFF]);
+    }
+
+    #[test]
+    fn type_specific_integer_handles_values_beyond_i128() {
+        // 17-byte INTEGER (2^128), e.g. a large certificate serial number.
+        let mut data = vec![0x02, 0x11, 0x01];
+        data.extend([0x00; 16]);
+        let mut app = test_app(&data);
+        choose_edit_mode(&mut app, 4);
+        let big = "340282366920938463463374607431768211456";
+        {
+            let Mode::Edit(EditState { editor: Editor::Text(ref t), .. }) = app.mode else {
+                panic!()
+            };
+            // The prefill must be the decimal value, not empty (or hex).
+            assert_eq!(t.buf.iter().collect::<String>(), big);
+        }
+        // Applying the prefilled value back is byte-identical...
+        set_text(&mut app, big);
+        assert_eq!(ber::encode_forest(&app.roots), data);
+        // ...and a huge new value encodes fine too.
+        choose_edit_mode(&mut app, 4);
+        set_text(&mut app, "-340282366920938463463374607431768211456");
+        let mut expect = vec![0x02, 0x11, 0xFF];
+        expect.extend([0x00; 16]);
+        assert_eq!(ber::encode_forest(&app.roots), expect);
     }
 
     #[test]

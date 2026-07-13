@@ -487,8 +487,9 @@ fn summary(node: &Node) -> String {
             TAG_BOOLEAN => {
                 if v.first().copied().unwrap_or(0) == 0 { "FALSE".into() } else { "TRUE".into() }
             }
-            TAG_INTEGER => ber::decode_integer(v)
-                .map(|i| i.to_string())
+            // Arbitrary precision: 20-octet serial numbers and the like
+            // must show in decimal too, exactly like freshly edited values.
+            TAG_INTEGER => ber::integer_decimal(v)
                 .unwrap_or_else(|| preview_text_or_hex(v)),
             TAG_NULL => String::new(),
             TAG_OID => ber::oid_arcs(v)
@@ -1358,6 +1359,15 @@ mod tests {
         let g = arrow_gutters(&rows, 0, &rel);
         assert!(g.left.iter().all(|c| c.is_none()));
         assert!(g.right.iter().all(|c| c.is_none()));
+    }
+
+    #[test]
+    fn tree_summary_shows_large_integers_in_decimal() {
+        // 17-byte INTEGER (2^128): beyond i128, previously fell back to hex.
+        let mut data = vec![0x02, 0x11, 0x01];
+        data.extend([0x00; 16]);
+        let forest = parse_forest(&data, 0).unwrap();
+        assert_eq!(summary(&forest[0]), " 340282366920938463463374607431768211456");
     }
 
     #[test]

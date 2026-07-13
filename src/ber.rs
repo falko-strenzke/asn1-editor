@@ -475,6 +475,60 @@ pub fn encode_integer(v: i128) -> Vec<u8> {
     bytes[i..].to_vec()
 }
 
+/// Minimal two's-complement encoding of a decimal string of any length
+/// (the inverse of `integer_decimal`). INTEGER values in certificates
+/// routinely exceed i128 (20-octet serial numbers), so the conversion
+/// works on digit/byte arrays instead of a machine integer.
+pub fn encode_integer_decimal(s: &str) -> Result<Vec<u8>, String> {
+    let t = s.trim();
+    let (negative, digits) = match t.strip_prefix('-') {
+        Some(rest) => (true, rest),
+        None => (false, t.strip_prefix('+').unwrap_or(t)),
+    };
+    if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) {
+        return Err("not a valid decimal integer".to_string());
+    }
+    // Base-10 digits -> big-endian base-256 magnitude (no leading zeros).
+    let mut mag: Vec<u8> = Vec::new();
+    for &d in digits.as_bytes() {
+        let mut carry = (d - b'0') as u32;
+        for b in mag.iter_mut().rev() {
+            let cur = *b as u32 * 10 + carry;
+            *b = (cur & 0xFF) as u8;
+            carry = cur >> 8;
+        }
+        while carry > 0 {
+            mag.insert(0, (carry & 0xFF) as u8);
+            carry >>= 8;
+        }
+    }
+    if mag.is_empty() {
+        return Ok(vec![0x00]); // zero (also "-0")
+    }
+    if !negative {
+        if mag[0] & 0x80 != 0 {
+            mag.insert(0, 0x00); // keep the sign bit clear
+        }
+        return Ok(mag);
+    }
+    // Negative: -m fits in n bytes iff m <= 2^(8n-1); grow by one byte if
+    // the magnitude exceeds that, then take the two's complement.
+    if mag[0] > 0x80 || (mag[0] == 0x80 && mag[1..].iter().any(|&b| b != 0)) {
+        mag.insert(0, 0x00);
+    }
+    for b in mag.iter_mut() {
+        *b = !*b;
+    }
+    for b in mag.iter_mut().rev() {
+        let (v, carry) = b.overflowing_add(1);
+        *b = v;
+        if !carry {
+            break;
+        }
+    }
+    Ok(mag)
+}
+
 /// Encode an OBJECT IDENTIFIER given in dot notation ("1.2.840.113549").
 pub fn encode_oid(dotted: &str) -> Result<Vec<u8>, String> {
     let arcs: Vec<u64> = dotted
@@ -529,6 +583,57 @@ pub fn decode_integer(bytes: &[u8]) -> Option<i128> {
         v = (v << 8) | b as i128;
     }
     Some(v)
+}
+
+/// Decimal string of an INTEGER's content octets, at any length
+/// (two's-complement big-endian, like `decode_integer` but without the
+/// i128 bound — 20-octet certificate serial numbers must display in
+/// decimal too). `None` only for empty content, which is not a valid
+/// INTEGER encoding.
+pub fn integer_decimal(bytes: &[u8]) -> Option<String> {
+    if bytes.is_empty() {
+        return None;
+    }
+    let negative = bytes[0] & 0x80 != 0;
+    let mut mag = bytes.to_vec();
+    if negative {
+        // Two's complement -> magnitude: invert all bytes, add one.
+        for b in mag.iter_mut() {
+            *b = !*b;
+        }
+        for b in mag.iter_mut().rev() {
+            let (v, carry) = b.overflowing_add(1);
+            *b = v;
+            if !carry {
+                break;
+            }
+        }
+    }
+    // Repeated division of the base-256 magnitude by 10; remainders are
+    // the decimal digits, least significant first.
+    let mut digits = Vec::new();
+    let mut start = 0;
+    while start < mag.len() {
+        let mut rem: u32 = 0;
+        for b in mag[start..].iter_mut() {
+            let cur = rem * 256 + *b as u32;
+            *b = (cur / 10) as u8;
+            rem = cur % 10;
+        }
+        digits.push(b'0' + rem as u8);
+        while start < mag.len() && mag[start] == 0 {
+            start += 1;
+        }
+    }
+    if digits.is_empty() {
+        digits.push(b'0');
+    }
+    let mut out = String::with_capacity(digits.len() + 1);
+    if negative {
+        out.push('-');
+    }
+    out.extend(digits.iter().rev().map(|&d| d as char));
+    Some(out)
 }
 
 /// Decode OBJECT IDENTIFIER content octets into arc values.
@@ -748,6 +853,64 @@ mod tests {
         assert_eq!(encode_integer(0), [0x00]);
         assert_eq!(encode_integer(255), [0x00, 0xFF]);
         assert_eq!(encode_integer(-128), [0x80]);
+    }
+
+    #[test]
+    fn integer_decimal_matches_decode_integer_in_i128_range() {
+        for v in [0i128, 1, -1, 127, 128, -128, -129, 255, 65537, -65537, i128::MAX, i128::MIN] {
+            let enc = encode_integer(v);
+            assert_eq!(integer_decimal(&enc).as_deref(), Some(v.to_string().as_str()), "value {}", v);
+        }
+        assert_eq!(integer_decimal(&[]), None);
+    }
+
+    #[test]
+    fn integer_decimal_handles_values_beyond_i128() {
+        // 17 bytes: too long for decode_integer, must still show decimal.
+        let mut bytes = vec![0x01];
+        bytes.extend([0x00; 16]);
+        assert!(decode_integer(&bytes).is_none());
+        // 2^128 = 340282366920938463463374607431768211456.
+        assert_eq!(
+            integer_decimal(&bytes).as_deref(),
+            Some("340282366920938463463374607431768211456")
+        );
+        // A typical 20-octet certificate serial number.
+        let serial: Vec<u8> = (1..=20).collect();
+        let dec = integer_decimal(&serial).unwrap();
+        assert!(dec.chars().all(|c| c.is_ascii_digit()));
+        // Round trip through the arbitrary-precision encoder.
+        assert_eq!(encode_integer_decimal(&dec).unwrap(), serial);
+    }
+
+    #[test]
+    fn encode_integer_decimal_is_minimal_twos_complement() {
+        assert_eq!(encode_integer_decimal("0").unwrap(), [0x00]);
+        assert_eq!(encode_integer_decimal("-0").unwrap(), [0x00]);
+        assert_eq!(encode_integer_decimal("127").unwrap(), [0x7F]);
+        assert_eq!(encode_integer_decimal("128").unwrap(), [0x00, 0x80]);
+        assert_eq!(encode_integer_decimal("255").unwrap(), [0x00, 0xFF]);
+        assert_eq!(encode_integer_decimal("-1").unwrap(), [0xFF]);
+        assert_eq!(encode_integer_decimal("-128").unwrap(), [0x80]);
+        assert_eq!(encode_integer_decimal("-129").unwrap(), [0xFF, 0x7F]);
+        assert_eq!(encode_integer_decimal("-32768").unwrap(), [0x80, 0x00]);
+        assert_eq!(encode_integer_decimal(" +65537 ").unwrap(), [0x01, 0x00, 0x01]);
+        assert!(encode_integer_decimal("").is_err());
+        assert!(encode_integer_decimal("12x").is_err());
+        assert!(encode_integer_decimal("--1").is_err());
+        // Agreement with the i128 encoder across its whole range edge.
+        for v in [-1i128, 0, 1, 255, -255, i128::MAX, i128::MIN] {
+            assert_eq!(
+                encode_integer_decimal(&v.to_string()).unwrap(),
+                encode_integer(v),
+                "value {}",
+                v
+            );
+        }
+        // Negative round trip beyond i128.
+        let dec = "-340282366920938463463374607431768211456"; // -(2^128)
+        let enc = encode_integer_decimal(dec).unwrap();
+        assert_eq!(integer_decimal(&enc).as_deref(), Some(dec));
     }
 
     #[test]
