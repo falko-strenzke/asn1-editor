@@ -457,13 +457,26 @@ Display: a `Signature` line in the content pane header, directly below
 since (unlike `Spec`) it is a whole-document fact, not a per-node one.
 Recomputed after every edit (the same `rebuild()` that re-runs spec
 identification), so an in-TUI edit that breaks a certificate's signature
-is reflected immediately, without saving. The candidate-issuer index
-itself is scanned once at startup and not refreshed on edits, file
-switches, or external filesystem changes. Directory scanning skips
-symlinks (rules out symlink cycles) and files over 1 MiB (real certs/CRLs
-are always tiny; this keeps scanning e.g. a `target/` or `.git/`
-directory cheap) — non-signable and unparseable files are silently
-skipped, not errors.
+is reflected immediately, without saving.
+
+The directory itself is only walked once, at startup — `signables`/
+`ca_index` are not refreshed to pick up other files changing on disk
+during the session. The *currently open file's own entry* in both is the
+one exception: every time `sig_status` is recomputed (`App::
+recompute_sig_status`, i.e. on load and after every edit), that entry is
+first replaced with one derived from the live, possibly-unsaved document,
+not the on-disk bytes the startup scan read. Without this, an edit could
+correctly update the edited file's own `sig_status` while leaving every
+*other* file's relation to it stale — e.g. editing an intermediate CA's
+certificate wouldn't retroactively show the leaves it issued as
+unverified, since `relations_for` (below) resolves issuers purely by
+searching `signables`/`ca_index`. This is why the sync lives inside
+`recompute_sig_status` rather than being folded into `rebuild()`
+ad hoc: the two are computed from the same index and must stay
+consistent with each other. Directory scanning skips symlinks (rules out
+symlink cycles) and files over 1 MiB (real certs/CRLs are always tiny;
+this keeps scanning e.g. a `target/` or `.git/` directory cheap) —
+non-signable and unparseable files are silently skipped, not errors.
 
 ### Cross-file relation graph (file browser)
 
@@ -521,11 +534,18 @@ broken targets' stubs do. The gutters take up columns only while there is
 an arrow to draw. Routing (corner/junction/color selection per row) lives
 in `tui::arrow_gutters`, a pure function unit-tested separately from any
 rendering; edges to rows hidden inside collapsed directories are skipped.
-A short colored legend sits on the pane's bottom border. Relations are
-recomputed whenever the browser selection moves; like the candidate index,
-they are a startup snapshot of on-disk state and are not refreshed when the
-open document is edited (that live feedback is the content-pane `Signature`
-line, above).
+A short colored legend sits on the pane's bottom border.
+
+`App::browser_relations` is recomputed whenever the browser selection
+moves, and also whenever `sig_status` is (`App::recompute_sig_status`,
+which syncs the open file's index entry as described above before calling
+`recompute_browser_relations`) — so editing the open document updates the
+arrows for *any* browser row currently on screen, not only the one
+matching the edited file, and not only after the browser selection next
+moves. This matters because the browser selection and the open document
+are independent (live preview aside): a user can edit file A while the
+browser happens to be showing file B's relation to A, and B's arrow must
+still reflect the edit without any navigation happening in between.
 
 ## 10. Input containers
 
@@ -722,5 +742,7 @@ certificate bundle (`[0]` constructed, empty SET, deep nesting).
   implemented. CMS SignedData is not supported — only bare X.509
   `Certificate`/`CertificateList`; `verify.rs`'s `verify_against` is
   already shaped generically enough for a future CMS `SignerInfo` decoder
-  to reuse. The candidate-issuer index is a startup-only snapshot: it is
-  not refreshed if files change on disk during the session.
+  to reuse. The candidate-issuer index is a startup-only snapshot of the
+  directory: it is not refreshed if *other* files change on disk during
+  the session (the currently open file's own entry is the one exception —
+  see §9).

@@ -48,6 +48,7 @@ pub enum Kind {
 /// Everything needed to verify one signed object's signature, extracted
 /// from a document that structurally matches `Certificate` or
 /// `CertificateList`.
+#[derive(Clone)]
 pub struct Signable {
     pub kind: Kind,
     /// Raw DER bytes of the signed `tbsCertificate`/`tbsCertList` (header

@@ -689,8 +689,7 @@ impl App {
             browser_relations: FileRelations::default(),
         };
         app.rebuild_rows();
-        app.recompute_sig_status();
-        app.recompute_browser_relations();
+        app.recompute_sig_status(); // also refreshes browser_relations
         app
     }
 
@@ -777,14 +776,37 @@ impl App {
         Ok(())
     }
 
-    /// Re-derive `sig_status` for the current document against `ca_index`.
-    /// Called after loading a document and after every edit (`rebuild()`),
-    /// so an edit that breaks a signature is reflected immediately. Not
-    /// called when no document is open — `sig_status` just stays `None`.
+    /// Re-derive `sig_status` for the current document against `ca_index`,
+    /// after first refreshing this file's own entry in `signables`/
+    /// `ca_index` from its live (possibly edited, not necessarily saved)
+    /// content — replacing whatever was captured for the same path in the
+    /// startup directory scan. Without that refresh, editing e.g. a
+    /// certificate's signature or subject would leave stale, pre-edit data
+    /// in the index: not just this file's own `sig_status` would be wrong,
+    /// but so would the browser's relation arrows for any *other* file
+    /// that names this one as its issuer — since those are resolved from
+    /// the very same index. `recompute_browser_relations` is refreshed
+    /// here too, for the same reason. Called after loading a document and
+    /// after every edit (`rebuild()`). Not called when no document is
+    /// open — `sig_status` just stays `None`, and the index keeps
+    /// whatever the startup scan found for this path (there is no live
+    /// content to prefer over it).
     fn recompute_sig_status(&mut self) {
         let der = ber::encode_forest(&self.roots);
-        self.sig_status = x509::parse_signable(&self.roots, &der)
-            .map(|signable| verify::verify_against(&self.ca_index, &signable));
+        let own_signable = x509::parse_signable(&self.roots, &der);
+
+        self.signables.retain(|f| f.path != self.path);
+        self.ca_index.retain(|c| c.path != self.path);
+        if self.file_open {
+            if let Some(signable) = own_signable.clone() {
+                let file = SignableFile { path: self.path.clone(), signable };
+                self.ca_index.extend(x509::cert_candidates(std::slice::from_ref(&file)));
+                self.signables.push(file);
+            }
+        }
+
+        self.sig_status = own_signable.map(|s| verify::verify_against(&self.ca_index, &s));
+        self.recompute_browser_relations();
     }
 
     /// Live-preview the file currently highlighted in the browser into the
@@ -2225,5 +2247,88 @@ mod tests {
         app.activate_browser_entry();
         assert_eq!(app.focus, Focus::Document);
         assert!(app.path.ends_with("a.der"));
+    }
+
+    fn open_real_file(path: &std::path::Path) -> App {
+        let raw = std::fs::read(path).unwrap();
+        let (der, container) = input::load(&raw).unwrap();
+        let roots = ber::parse_forest(&der, 0).unwrap();
+        App::new(path.to_path_buf(), path.to_path_buf(), container, roots, der.len())
+    }
+
+    fn row_of(app: &App, path: &[usize]) -> usize {
+        app.rows.iter().position(|r| r.path == path).expect("row exists")
+    }
+
+    #[test]
+    fn editing_the_open_document_refreshes_its_own_signature_status() {
+        let dir = tmp_dir("live-status");
+        std::fs::copy("testdata/chain/intermediate_ca.der", dir.join("intermediate_ca.der")).unwrap();
+        std::fs::copy("testdata/chain/server.der", dir.join("server.der")).unwrap();
+
+        let mut app = open_real_file(&dir.join("server.der"));
+        assert!(
+            matches!(app.sig_status, Some(SignatureStatus::Verified { .. })),
+            "starts out verified against the intermediate CA in the same folder"
+        );
+
+        // Corrupt the outer `signature` BIT STRING (path [0, 2] of a
+        // Certificate ::= SEQUENCE { tbsCertificate, signatureAlgorithm,
+        // signature }) through the real edit path (select, hex-edit,
+        // commit) rather than poking internal fields.
+        app.select(row_of(&app, &[0, 2]));
+        let node = app.selected_node().unwrap();
+        assert!(node.is_universal(ber::TAG_BIT_STRING));
+        let mut corrupted = node.content_octets();
+        let last = corrupted.len() - 1;
+        corrupted[last] ^= 0xFF;
+        app.mode = Mode::Edit(EditState::hex(EditKind::Content, &corrupted));
+        app.commit_edit();
+
+        assert!(app.dirty);
+        assert!(
+            matches!(app.sig_status, Some(SignatureStatus::Invalid { .. })),
+            "must reflect the corruption immediately, without saving"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn editing_a_document_refreshes_relation_arrows_for_other_selected_browser_files() {
+        // Reproduces the reported bug: editing the *open* document (in the
+        // Document pane) must refresh the relation arrows shown for
+        // whichever *other* file the Browser pane happens to have
+        // selected — the two are independent, and the arrows are derived
+        // from the same shared index the edit needs to invalidate.
+        let dir = tmp_dir("live-relations");
+        std::fs::copy("testdata/chain/intermediate_ca.der", dir.join("intermediate_ca.der")).unwrap();
+        std::fs::copy("testdata/chain/server.der", dir.join("server.der")).unwrap();
+
+        let mut app = open_real_file(&dir.join("server.der")); // the leaf is open...
+        let ca_row = app
+            .browser
+            .rows
+            .iter()
+            .position(|r| app.browser.entry_at(&r.path).unwrap().name == "intermediate_ca.der")
+            .expect("intermediate_ca.der is in the browser");
+        app.browser.select(ca_row); // ...but the browser points at its issuer.
+        app.recompute_browser_relations();
+        assert_eq!(app.browser_relations.signs.len(), 1);
+        assert!(app.browser_relations.signs[0].verified, "starts out verified");
+
+        app.select(row_of(&app, &[0, 2])); // the leaf's `signature` BIT STRING
+        let node = app.selected_node().unwrap();
+        let mut corrupted = node.content_octets();
+        let last = corrupted.len() - 1;
+        corrupted[last] ^= 0xFF;
+        app.mode = Mode::Edit(EditState::hex(EditKind::Content, &corrupted));
+        app.commit_edit(); // browser selection never moves during this edit
+
+        assert_eq!(app.browser_relations.signs.len(), 1);
+        assert!(
+            !app.browser_relations.signs[0].verified,
+            "the intermediate's outgoing arrow must go red without any navigation"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
