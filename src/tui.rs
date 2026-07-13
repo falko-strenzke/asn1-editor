@@ -41,6 +41,8 @@ use crate::verify::{FileRelations, SignatureStatus};
 
 /// Bytes of hex shown in the browse-mode content pane before truncating.
 const CONTENT_HEX_LIMIT: usize = 4096;
+const DECRYPTED_LOCKED_LABEL: &str = "🔒 decrypted content not available";
+const DECRYPTED_UNLOCKED_PREFIX: &str = "🔓 decrypted: ";
 
 /// Colors of the file-browser cryptographic relation arrows.
 const REL_SIGNER: Color = Color::Cyan; // incoming: a file that signed the selection
@@ -660,7 +662,7 @@ fn draw_tree(frame: &mut Frame, app: &mut App, area: Rect) {
                 return ListItem::new(Line::from(vec![
                     Span::raw("  ".repeat(row.depth + 1)),
                     Span::styled(
-                        "decrypted content not available",
+                        DECRYPTED_LOCKED_LABEL,
                         Style::new().fg(Color::Yellow).italic(),
                     ),
                 ]));
@@ -674,7 +676,10 @@ fn draw_tree(frame: &mut Frame, app: &mut App, area: Rect) {
             let mut spans =
                 vec![Span::raw(format!("{}{}", "  ".repeat(row.depth), marker))];
             if row.source == RowSource::Decrypted && row.path.len() == 1 {
-                spans.push(Span::styled("decrypted: ", Style::new().fg(Color::Green).bold()));
+                spans.push(Span::styled(
+                    DECRYPTED_UNLOCKED_PREFIX,
+                    Style::new().fg(Color::Green).bold(),
+                ));
             }
             let label = app.label_for_row(row);
             if let Some(field) = label.and_then(|l| l.field.as_deref()) {
@@ -1443,6 +1448,14 @@ mod tests {
     /// Cell text (without color) per row, for one side of the gutters.
     fn cells(side: &[Option<(String, Color)>]) -> Vec<Option<&str>> {
         side.iter().map(|c| c.as_ref().map(|(s, _)| s.as_str())).collect()
+    }
+
+    #[test]
+    fn decrypted_tree_labels_start_with_matching_lock_symbols() {
+        assert_eq!(DECRYPTED_LOCKED_LABEL, "🔒 decrypted content not available");
+        assert_eq!(DECRYPTED_UNLOCKED_PREFIX, "🔓 decrypted: ");
+        assert_eq!(DECRYPTED_LOCKED_LABEL.chars().next(), Some('🔒'));
+        assert_eq!(DECRYPTED_UNLOCKED_PREFIX.chars().next(), Some('🔓'));
     }
 
     #[test]
