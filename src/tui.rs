@@ -338,24 +338,74 @@ fn arrow_gutters(row_paths: &[&std::path::Path], selected: usize, rel: &FileRela
     g
 }
 
+/// Color for the open-file marker when it has unsaved changes.
+const DIRTY_MARKER: Color = Color::Yellow;
+
+/// Glyph for the open-file marker when it has unsaved changes: U+1F5AB
+/// WHITE HARD SHELL FLOPPY DISK, versus the plain dot `•` used when
+/// there's nothing to save — so the distinction survives monochrome
+/// terminals too. Unicode classifies it East Asian Width "Neutral" (not
+/// "Wide"), and `unicode-width` — the same crate ratatui's own renderer
+/// uses for cell layout — reports it as a single display column, so it
+/// needs no special handling in this pane's column-alignment math (which
+/// otherwise assumes `str::chars().count()` == display width).
+const DIRTY_GLYPH: &str = "\u{1F5AB}";
+
+/// Split `text` into up to 3 spans so that the single character at
+/// `marker_offset` gets its own `marker_style`, distinct from the rest of
+/// the row (which keeps `style`). Used to recolor just the open/dirty
+/// marker glyph without disturbing the row's width/truncation math, which
+/// operates on the plain, unsplit `text`. A no-op (single span) when
+/// `marker_style` is `None` or the marker fell outside `text` (e.g.
+/// truncated away in an extremely narrow pane).
+fn styled_with_marker(
+    text: &str,
+    style: Style,
+    marker_offset: usize,
+    marker_style: Option<Style>,
+) -> Vec<Span<'static>> {
+    let Some(marker_style) = marker_style else {
+        return vec![Span::styled(text.to_string(), style)];
+    };
+    let chars: Vec<char> = text.chars().collect();
+    if marker_offset >= chars.len() {
+        return vec![Span::styled(text.to_string(), style)];
+    }
+    let before: String = chars[..marker_offset].iter().collect();
+    let marker: String = chars[marker_offset..marker_offset + 1].iter().collect();
+    let after: String = chars[marker_offset + 1..].iter().collect();
+    let mut spans = Vec::new();
+    if !before.is_empty() {
+        spans.push(Span::styled(before, style));
+    }
+    spans.push(Span::styled(marker, marker_style));
+    if !after.is_empty() {
+        spans.push(Span::styled(after, style));
+    }
+    spans
+}
+
 fn draw_browser(frame: &mut Frame, app: &mut App, area: Rect) {
     let active = app.focus == Focus::Browser;
     let open_path = app.file_open.then_some(app.path.as_path());
 
     // Row texts and styles first, so the right-hand arrow trunk can be
-    // aligned one column past the longest visible name.
-    let texts: Vec<(String, Style)> = app
+    // aligned one column past the longest visible name. `marker_style`,
+    // when set, recolors just the single open-marker glyph at
+    // `marker_offset` (see `styled_with_marker`).
+    let texts: Vec<(String, Style, usize, Option<Style>)> = app
         .browser
         .rows
         .iter()
         .map(|row| {
             let entry = app.browser.entry_at(&row.path).expect("row paths are valid");
-            let marker = if entry.is_dir {
+            let fold_marker = if entry.is_dir {
                 if entry.expanded { "▾ " } else { "▸ " }
             } else {
                 "  "
             };
             let is_open = open_path == Some(entry.path.as_path());
+            let dirty_open = is_open && app.dirty;
             let mut style = if entry.is_dir {
                 Style::new().fg(Color::Green).bold()
             } else {
@@ -364,13 +414,21 @@ fn draw_browser(frame: &mut Frame, app: &mut App, area: Rect) {
             if is_open {
                 style = style.fg(Color::LightGreen).bold();
             }
-            let prefix = if is_open { "• " } else { "  " };
+            let prefix = if dirty_open {
+                format!("{} ", DIRTY_GLYPH)
+            } else if is_open {
+                "• ".to_string()
+            } else {
+                "  ".to_string()
+            };
             let text =
-                format!("{}{}{}{}", "  ".repeat(row.depth), marker, prefix, entry.name);
-            (text, style)
+                format!("{}{}{}{}", "  ".repeat(row.depth), fold_marker, prefix, entry.name);
+            let marker_offset = row.depth * 2 + fold_marker.chars().count();
+            let marker_style = dirty_open.then(|| Style::new().fg(DIRTY_MARKER).bold());
+            (text, style, marker_offset, marker_style)
         })
         .collect();
-    let name_width = texts.iter().map(|(t, _)| t.chars().count()).max().unwrap_or(0);
+    let name_width = texts.iter().map(|(t, ..)| t.chars().count()).max().unwrap_or(0);
 
     let row_paths: Vec<&std::path::Path> = app
         .browser
@@ -401,7 +459,7 @@ fn draw_browser(frame: &mut Frame, app: &mut App, area: Rect) {
     let items: Vec<ListItem> = texts
         .into_iter()
         .enumerate()
-        .map(|(i, (text, style))| {
+        .map(|(i, (text, style, marker_offset, marker_style))| {
             let mut spans = Vec::new();
             if has_left {
                 spans.push(match &gutters.left[i] {
@@ -417,23 +475,24 @@ fn draw_browser(frame: &mut Frame, app: &mut App, area: Rect) {
                 let len = text.chars().count();
                 if len > name_col_w {
                     let cut: String = text.chars().take(name_col_w.saturating_sub(1)).collect();
-                    spans.push(Span::styled(format!("{}…", cut), style));
+                    spans.extend(styled_with_marker(&format!("{}…", cut), style, marker_offset, marker_style));
                 } else {
-                    spans.push(Span::styled(text, style));
+                    spans.extend(styled_with_marker(&text, style, marker_offset, marker_style));
                     spans.push(Span::raw(" ".repeat(name_col_w - len)));
                 }
                 if let Some((cell, color)) = &gutters.right[i] {
                     spans.push(Span::styled(cell.clone(), Style::new().fg(*color).bold()));
                 }
             } else {
-                spans.push(Span::styled(text, style));
+                spans.extend(styled_with_marker(&text, style, marker_offset, marker_style));
             }
             ListItem::new(Line::from(spans))
         })
         .collect();
     let title = format!(" Files — {} ", app.browser.root.display());
     let legend = Line::from(vec![
-        Span::styled(" ─► signer ", Style::new().fg(REL_SIGNER)),
+        Span::styled(format!(" {} unsaved ", DIRTY_GLYPH), Style::new().fg(DIRTY_MARKER)),
+        Span::styled("─► signer ", Style::new().fg(REL_SIGNER)),
         Span::styled("─► signs ", Style::new().fg(REL_SIGNS)),
         Span::styled("─► bad ", Style::new().fg(REL_BROKEN)),
     ]);
@@ -1301,6 +1360,47 @@ mod tests {
     /// Cell text (without color) per row, for one side of the gutters.
     fn cells(side: &[Option<(String, Color)>]) -> Vec<Option<&str>> {
         side.iter().map(|c| c.as_ref().map(|(s, _)| s.as_str())).collect()
+    }
+
+    #[test]
+    fn styled_with_marker_splits_out_just_the_marker_glyph() {
+        let base = Style::new().fg(Color::LightGreen);
+        let marker = Style::new().fg(DIRTY_MARKER);
+        // "  ● a.der" — marker glyph "●" sits at char offset 2.
+        let spans = styled_with_marker("  ● a.der", base, 2, Some(marker));
+        let texts: Vec<&str> = spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(texts, ["  ", "●", " a.der"]);
+        assert_eq!(spans[0].style, base);
+        assert_eq!(spans[1].style, marker);
+        assert_eq!(spans[2].style, base);
+    }
+
+    #[test]
+    fn styled_with_marker_is_a_single_span_without_a_marker_style() {
+        let base = Style::new().fg(Color::LightGreen);
+        let spans = styled_with_marker("  • a.der", base, 2, None);
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].content.as_ref(), "  • a.der");
+        assert_eq!(spans[0].style, base);
+    }
+
+    #[test]
+    fn styled_with_marker_degrades_gracefully_if_offset_is_out_of_range() {
+        let base = Style::new();
+        let marker = Style::new().fg(DIRTY_MARKER);
+        // Simulates the marker having been truncated away in a narrow pane.
+        let spans = styled_with_marker("ab", base, 5, Some(marker));
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].content.as_ref(), "ab");
+    }
+
+    #[test]
+    fn styled_with_marker_omits_empty_before_segment() {
+        // Marker at offset 0: no "before" span should be emitted.
+        let marker = Style::new().fg(DIRTY_MARKER);
+        let spans = styled_with_marker("●x", Style::new(), 0, Some(marker));
+        let texts: Vec<&str> = spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(texts, ["●", "x"]);
     }
 
     #[test]
