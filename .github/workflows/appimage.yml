@@ -1,4 +1,4 @@
-name: Build Linux AppImage
+name: Build Release Artifacts
 
 on:
   push:
@@ -12,7 +12,8 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  TARGET: x86_64-unknown-linux-gnu
+  LINUX_TARGET: x86_64-unknown-linux-gnu
+  WINDOWS_TARGET: x86_64-pc-windows-msvc
 
 jobs:
   appimage:
@@ -26,17 +27,17 @@ jobs:
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: ${{ env.TARGET }}
+          targets: ${{ env.LINUX_TARGET }}
 
       - name: Build and test
         run: |
-          cargo test --locked --target "$TARGET"
-          cargo build --locked --release --target "$TARGET"
+          cargo test --locked --target "$LINUX_TARGET"
+          cargo build --locked --release --target "$LINUX_TARGET"
 
       - name: Assemble AppDir
         run: |
           APPDIR="$RUNNER_TEMP/asn1-editor.AppDir"
-          install -Dm755 "target/$TARGET/release/asn1-editor" "$APPDIR/usr/bin/asn1-editor"
+          install -Dm755 "target/$LINUX_TARGET/release/asn1-editor" "$APPDIR/usr/bin/asn1-editor"
           install -Dm755 packaging/appimage/AppRun "$APPDIR/AppRun"
           install -Dm644 packaging/appimage/asn1-editor.desktop "$APPDIR/asn1-editor.desktop"
           install -Dm644 packaging/appimage/asn1-editor.svg "$APPDIR/asn1-editor.svg"
@@ -76,10 +77,64 @@ jobs:
           if-no-files-found: error
           compression-level: 0
 
+  windows:
+    name: Windows portable app (x86-64)
+    runs-on: windows-2022
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ env.WINDOWS_TARGET }}
+
+      - name: Build and test
+        run: |
+          cargo test --locked --target $env:WINDOWS_TARGET
+          cargo build --locked --release --target $env:WINDOWS_TARGET
+
+      - name: Package portable application
+        id: package
+        shell: pwsh
+        run: |
+          $metadata = cargo metadata --no-deps --format-version 1 | ConvertFrom-Json
+          $version = $metadata.packages[0].version
+          $packageDir = Join-Path $env:RUNNER_TEMP "asn1-editor-windows-x86_64"
+          $specDir = Join-Path $packageDir "specs/asn1"
+          $output = Join-Path $env:GITHUB_WORKSPACE "asn1-editor-$version-windows-x86_64.zip"
+
+          New-Item -ItemType Directory -Force -Path $specDir | Out-Null
+          Copy-Item "target/$env:WINDOWS_TARGET/release/asn1-editor.exe" $packageDir
+          Copy-Item "specs/asn1/*" $specDir -Recurse
+
+          $testFile = (Resolve-Path "testdata/cert_rsa.der").Path
+          Push-Location $packageDir
+          try {
+            & ./asn1-editor.exe --dump $testFile | Out-Null
+            if ($LASTEXITCODE -ne 0) {
+              throw "Windows executable smoke test failed with exit code $LASTEXITCODE"
+            }
+          } finally {
+            Pop-Location
+          }
+
+          Compress-Archive -Path "$packageDir/*" -DestinationPath $output
+          "path=$output" | Out-File -FilePath $env:GITHUB_OUTPUT -Encoding utf8 -Append
+
+      - name: Upload Windows application
+        uses: actions/upload-artifact@v6
+        with:
+          name: asn1-editor-windows-x86_64
+          path: ${{ steps.package.outputs.path }}
+          if-no-files-found: error
+          compression-level: 0
+
   release:
     name: Publish GitHub Release
     if: startsWith(github.ref, 'refs/tags/v')
-    needs: appimage
+    needs: [appimage, windows]
     runs-on: ubuntu-22.04
     permissions:
       contents: write
@@ -91,11 +146,18 @@ jobs:
           name: asn1-editor-linux-x86_64
           path: dist
 
+      - name: Download Windows artifact
+        uses: actions/download-artifact@v7
+        with:
+          name: asn1-editor-windows-x86_64
+          path: dist
+
       - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
           gh release create "$GITHUB_REF_NAME" \
             dist/*.AppImage \
+            dist/*.zip \
             --verify-tag \
             --generate-notes
