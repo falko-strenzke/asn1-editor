@@ -26,12 +26,17 @@ Goals:
 * Accept raw DER/BER, PEM, bare base64 and hex text input, and write the
   file back in the same outer format.
 * Structural output parity with `dumpasn1` (`--dump` mode).
-
 * Identify well-known structures by matching against ASN.1 specification
   modules in `specs/asn1/` (bundled: RFC 5280 → X.509 certificates and
   CRLs, RFC 5208 → PKCS#8 private keys, RFC 5958 → asymmetric key
   packages, RFC 5915 → SEC1 EC private keys) and annotate the tree with
   the spec's field and type names (§8).
+* Resolve common PKI and cryptographic OBJECT IDENTIFIER values from a
+  deterministic built-in repository, showing a short name in the tree and
+  the numeric and full textual forms in the content pane (§8a).
+* Decrypt supported password-encrypted PKCS#8 containers into an editable
+  virtual tree and keep the plaintext and ciphertext representations
+  synchronized in both directions (§9a).
 
 Non-goals (see §14):
 
@@ -68,13 +73,14 @@ src/
   ber.rs     TLV parser + encoder + Node model + value-decoding helpers
   dump.rs    dumpasn1-style text output (used by --dump and the tests)
   input.rs   container detection (raw / PEM / base64 / hex) + re-wrapping
+  oid.rs     curated offline PKI/cryptography OID repository
   spec.rs    ASN.1 specification parser + structural matcher/labeler
   browser.rs far-left file browser: folding directory tree, independent
              of whatever document (if any) is open
   x509.rs    structural decoding of Certificate/CertificateList + a
              recursive directory scan for candidate CA certs
   verify.rs  signature verification (uses aws-lc-rs)
-  pkcs8.rs   structural decoding + password decryption of
+  pkcs8.rs   structural decoding + password decryption/re-encryption of
              EncryptedPrivateKeyInfo (PBES2; uses aws-lc-rs)
   app.rs     application state: tree, flattened rows, selection, edit logic
   tui.rs     ratatui event loop and rendering (no business logic)
@@ -82,6 +88,7 @@ tests/
   dumpasn1_compat.rs  structural comparison against the dumpasn1 binary,
                       plus a parse→encode round-trip test over testdata/
   spec_rfc5280.rs     spec parsing + identification of the DER test files
+  oid_repository.rs  test-corpus OID coverage plus ML-DSA/SLH-DSA coverage
 specs/asn1/  ASN.1 specification modules (rfc5280: certificates + CRLs;
              rfc5208: PKCS#8 private keys; rfc5958: asymmetric key packages;
              rfc5915: SEC1 EC private keys)
@@ -94,14 +101,15 @@ testdata/  DER samples (EC cert, RSA cert, SEC1 EC key, PKCS#8 key,
            one signature byte flipped, for the "does NOT verify" path
 ```
 
-Dependency rule: `ber.rs` depends on nothing; `dump.rs`/`input.rs`/
-`spec.rs` depend only on `ber.rs`; `browser.rs` depends only on the
-standard library (it knows nothing about ASN.1); `x509.rs` depends on
-`ber.rs` + `input.rs` (structural decoding only, no crypto); `verify.rs`
-depends on `x509.rs` + `aws-lc-rs`; `pkcs8.rs` depends on `ber.rs` +
-`aws-lc-rs` (the two crypto modules); `app.rs` depends on all of the
-above; `tui.rs` renders `app.rs`. External dependencies: `ratatui`,
-`aws-lc-rs`.
+Dependency rule: `ber.rs` and `oid.rs` depend on nothing; `input.rs` and
+`spec.rs` depend only on `ber.rs`, while `dump.rs` uses `ber.rs` plus the
+shared OID repository; `browser.rs` depends only on the standard library
+(it knows nothing about ASN.1); `x509.rs` depends on `ber.rs` + `input.rs`
+(structural decoding only, no crypto); `verify.rs` depends on `x509.rs` +
+`aws-lc-rs`; `pkcs8.rs` depends on `ber.rs` + `aws-lc-rs` (the two crypto
+modules); `app.rs` depends on all of the above; `tui.rs` renders `app.rs`
+and resolves OID display names through `oid.rs`. External dependencies:
+`ratatui`, `aws-lc-rs`.
 
 ## 4. Data model
 
@@ -217,6 +225,13 @@ Apply pipeline (`App::commit_edit` → `App::rebuild`):
 The re-parse in step 3 cannot fail for tree shapes produced in step 2 (our
 own encoder output is always parseable); if it ever did, the previous tree
 is kept and an internal error is shown.
+
+For ordinary rows this pipeline operates on the document forest. Rows in
+the decrypted PKCS#8 virtual forest use the same editors and structural
+operations, but `rebuild()` first serializes and re-encrypts that forest,
+then applies the pipeline to the resulting outer document (§9a). Conversely,
+an edit to the outer representation refreshes an already-unlocked virtual
+forest by decrypting it again.
 
 ### The edit menu and value editors
 
@@ -446,13 +461,52 @@ or lose its labels as edits make it conform or not conform to a spec.
 * Content pane: a `Spec` line with the selected element's field and type
   name plus the overall document type and source file.
 
-Not yet done (future work): OID-table-driven resolution of `ANY DEFINED
-BY` and OCTET STRING bodies whose type is selected by a sibling OID (e.g.
+Not yet done (future work): OID-to-*type* dispatch for `ANY DEFINED BY`
+and OCTET STRING bodies whose type is selected by a sibling OID (e.g.
 labeling an X.509 extension's `extnValue` according to its `extnID`, or an
-RSA private key by its algorithm OID) — the encapsulation post-pass above
-labels nested content only when it structurally matches a bundled type on
-its own, not when the type must be looked up from an OID; and value-level
-checks (constraints are ignored).
+RSA private key by its algorithm OID). This is separate from the OID name
+repository in §8a: the latter resolves values for display but does not map
+an algorithm/extension OID to an ASN.1 schema. The encapsulation post-pass
+above labels nested content only when it structurally matches a bundled
+type on its own. Value-level checks are also future work (constraints are
+ignored).
+
+## 8a. Built-in OID repository (`src/oid.rs`)
+
+OID name resolution is offline and deterministic. `oid.rs` owns one
+curated repository shared by the TUI and `dump.rs`; it does not read
+`dumpasn1.cfg`, contact a resolver, or allow display behavior to depend on
+the host machine. Each `OidEntry` stores:
+
+* numeric arcs and their preformatted dot notation;
+* a short descriptor, equal to the final textual token; and
+* the complete textual token chain from the root to the leaf (rendered by
+  joining the tokens with dots).
+
+The repository covers all OIDs parsed from the bundled test corpus and a
+broader practical set of PKI/cryptographic identifiers: X.500 attributes,
+X.509 certificate/CRL extensions, PKIX extended-key purposes, PKCS #1/#5/
+#7/#9, CMS content types, RSA and EC algorithms and curves, Ed25519/Ed448
+and X25519/X448, HMAC and SHA families, and AES CBC/GCM modes. It also
+contains the complete NIST CSOR signature-algorithm allocation for pure
+and pre-hash ML-DSA and SLH-DSA (`2.16.840.1.101.3.4.3.17` through
+`.46`).
+
+Display rules deliberately preserve information for unknown values:
+
+* the tree summary uses `short_name` for a known OID and dot notation for
+  an unknown OID;
+* the content header always adds an `OID` line in dot notation for a valid
+  OID node and, when it is known, a `Name` line containing the complete
+  textual chain. These lines are the final header fields immediately
+  before the blank line and raw content-octet display;
+* `--dump` uses the same `short_name` lookup, replacing its former private
+  minimal table. Unknown OIDs retain the existing numeric dump form.
+
+`tests/oid_repository.rs` recursively loads every file under `testdata/`
+and fails if any parsed OID is absent. A second test checks every ML-DSA /
+SLH-DSA assignment in the NIST range; module tests additionally enforce
+unique arcs, matching dotted/arcs forms, and `short_name == chain.last()`.
 
 ## 9. Signature verification (`src/x509.rs`, `src/verify.rs`)
 
@@ -616,12 +670,15 @@ are independent (live preview aside): a user can edit file A while the
 browser happens to be showing file B's relation to A, and B's arrow must
 still reflect the edit without any navigation happening in between.
 
-## 9a. Encrypted private-key decryption (`src/pkcs8.rs`)
+## 9a. Encrypted private-key decryption and synchronized editing (`src/pkcs8.rs`)
 
 An `EncryptedPrivateKeyInfo` (RFC 5958 §3 / RFC 5208) wraps a private key
-in a password-based encryption; its `encryptedData` OCTET STRING is opaque
-in the tree. `pkcs8.rs` can decrypt it in place (read-only — the document
-is never modified) so the user can inspect the key.
+in password-based encryption; its serialized `encryptedData` OCTET STRING
+is opaque ASN.1 content. The editor exposes the corresponding plaintext as
+a **virtual, editable ASN.1 subtree** directly below that OCTET STRING. The
+virtual nodes are not inserted into the outer `EncryptedPrivateKeyInfo`
+forest; saving always writes only the real outer tree, whose ciphertext and
+PBES2 IV are updated when the virtual tree changes.
 
 `pkcs8::parse` structurally decodes `EncryptedPrivateKeyInfo ::= SEQUENCE {
 encryptionAlgorithm AlgorithmIdentifier, encryptedData OCTET STRING }`
@@ -638,16 +695,63 @@ PKCS#7 padding is stripped and validated manually), and confirms the
 plaintext is a single ASN.1 SEQUENCE — the wrong-password signal (bad
 padding, or the rare valid-padding-but-garbage case).
 
-Flow (state in `app.rs`, keys/rendering in `tui.rs`): pressing **`z`** in
-either pane (`start_decrypt`, acting on the open document — browser
-live-preview keeps it current) opens a `Mode::Password` masked-input
-popup; `submit_password` re-parses, decrypts, and on success stores
-`App::decrypted { encrypted_path, plaintext }` (cleared on load and on any
-edit, since `rebuild` invalidates offsets). The content pane, when the
-selected node is that `encrypted_path` (`[0,1]`), inserts a green
-"Decrypted content" section — the plaintext rendered with `dump::dump` —
-between the header lines and the raw hex dump. A wrong password leaves
-`decrypted` unset and shows the error in the status bar.
+The inverse `encrypt(password, plaintext)` validates the plaintext shape,
+reuses the container's PBKDF2 parameters, applies PKCS#7 padding, and
+AES-CBC encrypts with a fresh IV. It returns both the ciphertext and IV so
+`app.rs` can replace the `encryptedData` value and the IV in the PBES2
+parameter tree together. `encrypt_with_current_iv` exists for synchronized
+editing tests and callers that explicitly need to preserve the IV.
+
+### Virtual-tree state and presentation
+
+`App::rows` distinguishes `Document`, `Decrypted`, and
+`DecryptedPlaceholder` sources. Whenever the open document parses as a
+supported `EncryptedPrivateKeyInfo`, `rebuild_rows` inserts one of the
+following immediately after, and one indentation level below, its
+`encryptedData` row:
+
+* before successful decryption, a non-editable yellow
+  **`🔒 decrypted content not available`** placeholder;
+* after decryption, the parsed plaintext forest as ordinary foldable rows.
+  The virtual root begins with a green **`🔓 decrypted: `** prefix; its
+  descendants use the normal type, summary, and specification labels.
+
+The placeholder's content pane explains that `z` supplies the password.
+Pressing **`z`** in either focused pane (`start_decrypt`, acting on the open
+document — browser live-preview keeps it current) opens a masked
+`Mode::Password` popup. On success, `submit_password` stores a `Decrypted`
+state containing the encrypted-node path, plaintext bytes, parsed roots,
+retained password, and an independent specification match for the virtual
+forest. The password is zeroed when this state is dropped. A wrong password
+leaves decryption unavailable and reports the error in the status bar.
+
+Virtual rows otherwise participate in normal navigation and editing. Value
+edits, insertion, retagging, deletion, and reordering are routed to either
+the real or virtual forest by `RowSource`. The plaintext must remain exactly
+one top-level SEQUENCE: its root cannot be deleted, retagged away from
+SEQUENCE, or given a top-level sibling. This preserves the invariant checked
+by the PKCS#8 encrypt/decrypt layer.
+
+### Bidirectional synchronization
+
+`App::rebuild` uses the selected row's source to decide which representation
+was edited:
+
+1. After an edit in the virtual `Decrypted` tree,
+   `encrypt_decrypted_tree` serializes that forest, re-encrypts it using the
+   retained password and a fresh IV, replaces both the real ciphertext and
+   IV nodes, then runs the ordinary outer-document encode/re-parse pipeline.
+2. After an edit in the serialized `Document` tree,
+   `refresh_decrypted_tree` parses the updated PBES2 parameters/ciphertext
+   and decrypts again with the retained password. On success it replaces the
+   virtual plaintext while carrying over fold state. If the changed outer
+   representation no longer parses or decrypts, the decrypted state is
+   discarded, the closed-lock placeholder returns, and the status bar
+   explains why decryption became unavailable.
+
+Thus the two views remain synchronized while the password is available,
+but only the standards-compliant encrypted representation is part of the
+saved document.
 
 ## 10. Input containers
 
@@ -709,7 +813,11 @@ Built with ratatui 0.29 (bundled crossterm backend, `ratatui::init()` /
   (magenta), red = claimed issuance whose signature does not verify.
 * **Middle pane — tree.** One row per visible node: fold marker (`▸`/`▾`),
   indentation by depth, type name (colored by tag class; bold when
-  constructed/encapsulating) and a short decoded value preview.
+  constructed/encapsulating) and a short decoded value preview. Known OID
+  values use the repository's leaf descriptor; unknown OIDs retain dot
+  notation. An encrypted PKCS#8 `encryptedData` row additionally owns the
+  closed-lock placeholder or open-lock virtual plaintext subtree described
+  in §9a, at the same position and with normal folding/navigation behavior.
 * **Right pane — content.** At the top, the build-up of the tag and the
   length octets is shown graphically: bit-field diagrams with the bit
   positions (8..1), the actual bit values, each field's width in bits and
@@ -743,11 +851,12 @@ Built with ratatui 0.29 (bundled crossterm backend, `ratatui::init()` /
   (minimal) encoding of the current content length — identical to the
   file bytes for DER input, normalized for BER inputs with redundant
   length octets. Below the diagrams: offset, header and content length,
-  decoded value (integers, OIDs dotted, strings, times, unused bits),
-  then — for the `encryptedData` node of an `EncryptedPrivateKeyInfo`
-  once decrypted with `z` (§9a) — a green "Decrypted content" section
-  showing the plaintext key as a `dump::dump` tree, and finally a
-  `hexdump -C`-style dump of the (raw) content octets.
+  and decoded value (integers, known OID leaf names, strings, times, unused
+  bits). For an OID, the final header fields are its numeric dot notation
+  and, when known, its complete textual token chain (§8a). A blank line then
+  separates the header from a `hexdump -C`-style dump of the raw content
+  octets. Decrypted PKCS#8 content is no longer duplicated here as a text
+  dump; it is selected and inspected through its virtual tree rows (§9a).
 * **Edit mode** (`e` for the type-specific editor, `E` for the edit
   menu): the right pane becomes one of the value editors of §7 — hex grid,
   text line
@@ -807,6 +916,15 @@ Two layers, both in `tests/dumpasn1_compat.rs` and run by `cargo test`:
    == x` for every test file, proving the editor rewrites files without
    collateral changes.
 
+OID coverage is verified independently in `tests/oid_repository.rs`: every
+OID node recursively parsed from every bundled test file must resolve in the
+built-in repository, and every NIST ML-DSA/SLH-DSA signature assignment in
+the registered `.17` through `.46` range must be present. Unit tests cover
+known/unknown tree summaries, numeric/full-name content details, repository
+consistency, and the closed/open lock labels. PKCS#8 tests cover initial
+decryption, wrong passwords, plaintext edits updating ciphertext, and
+ciphertext edits refreshing or invalidating the virtual tree.
+
 Beyond the automated triples check, the `--dump` output format itself
 (column widths derived from file size, `offset length:` prefix,
 2-space indent, `{`/`}` block layout, `, encapsulates {`, hex-block
@@ -838,8 +956,10 @@ certificate bundle (`[0]` constructed, empty SET, deep nesting).
   to DER framing; a byte-preserving mode would require storing original
   header bytes.
 * No undo stack (single-level: quit without saving).
-* OID names come from a small built-in table; parsing `dumpasn1.cfg` for
-  full name coverage would be a natural extension.
+* OID names come from a curated built-in repository rather than a complete
+  global registry. Unknown values remain usable and are displayed in dot
+  notation; expanding coverage requires adding a reviewed static entry (or
+  a future optional external resolver/configuration source).
 * Value display for exotic universal types (REAL, EMBEDDED PDV, …) falls
   back to hex.
 * Reading from stdin is not supported (the terminal owns stdin in a TUI).
