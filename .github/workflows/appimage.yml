@@ -80,6 +80,10 @@ jobs:
   windows:
     name: Windows portable app (x86-64)
     runs-on: windows-2022
+    env:
+      # aws-lc-sys requires NASM on Windows x86-64. Use the crate's
+      # checked-in prebuilt objects when the runner does not provide it.
+      AWS_LC_SYS_PREBUILT_NASM: '1'
 
     steps:
       - name: Check out source
