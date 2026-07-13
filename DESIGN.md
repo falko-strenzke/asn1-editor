@@ -31,7 +31,7 @@ Goals:
   modules in `specs/asn1/` (bundled: RFC 5280 → X.509 certificates and
   CRLs) and annotate the tree with the spec's field and type names (§8).
 
-Non-goals (see §13):
+Non-goals (see §14):
 
 * Schema-aware *editing* (specs annotate and identify, but edits are not
   constrained by them).
@@ -67,6 +67,11 @@ src/
   dump.rs    dumpasn1-style text output (used by --dump and the tests)
   input.rs   container detection (raw / PEM / base64 / hex) + re-wrapping
   spec.rs    ASN.1 specification parser + structural matcher/labeler
+  browser.rs far-left file browser: folding directory tree, independent
+             of whatever document (if any) is open
+  x509.rs    structural decoding of Certificate/CertificateList + a
+             recursive directory scan for candidate CA certs
+  verify.rs  signature verification (the only module using aws-lc-rs)
   app.rs     application state: tree, flattened rows, selection, edit logic
   tui.rs     ratatui event loop and rendering (no business logic)
 tests/
@@ -78,9 +83,11 @@ testdata/  DER samples (EC cert, RSA cert, EC key, PKCS#7, CRL)
 ```
 
 Dependency rule: `ber.rs` depends on nothing; `dump.rs`/`input.rs`/
-`spec.rs` depend only on `ber.rs`; `app.rs` depends on `ber.rs` +
-`input.rs` + `spec.rs`; `tui.rs` renders `app.rs`. The only external
-dependency is `ratatui`.
+`spec.rs` depend only on `ber.rs`; `browser.rs` depends only on the
+standard library (it knows nothing about ASN.1); `x509.rs` depends on
+`ber.rs` + `input.rs` (structural decoding only, no crypto); `verify.rs`
+depends on `x509.rs` + `aws-lc-rs`; `app.rs` depends on all of the above;
+`tui.rs` renders `app.rs`. External dependencies: `ratatui`, `aws-lc-rs`.
 
 ## 4. Data model
 
@@ -374,7 +381,86 @@ Not yet done (future work): resolving `ANY DEFINED BY` and OCTET STRING
 extension bodies via OID tables (e.g. labeling the contents of X.509
 extensions), and value-level checks (constraints are ignored).
 
-## 9. Input containers
+## 9. Signature verification (`src/x509.rs`, `src/verify.rs`)
+
+On startup, the directory the opened file lives in (or the directory
+itself, when the program is started with one — see §11) is scanned
+recursively for X.509 certificates, which are kept as candidate issuers.
+For the currently open document, if it structurally decodes as a
+`Certificate` or `CertificateList` (CRL), the tool reports who signed it
+and whether the signature actually verifies.
+
+This is independent of §8's spec-based identification — it works whether
+or not the RFC 5280 spec files are installed, and needs a structurally
+unambiguous decoder rather than best-effort annotation (the generic spec
+matcher gives `TBSCertificate.signature` and `Certificate.signatureAlgorithm`
+the same field name at different depths, which would be ambiguous here).
+`src/x509.rs` therefore decodes `Certificate`/`CertificateList` directly
+over `ber::Node` by fixed ASN.1 grammar position — the same style
+`dump.rs` uses to interpret universal tags — with no cryptographic
+knowledge of its own:
+
+* Both shapes are `SEQUENCE { tbs, signatureAlgorithm, signature }`; the
+  outer `tbs` element is then matched positionally against
+  `TBSCertificate` (looking for `issuer`, `validity`, `subject`,
+  `subjectPublicKeyInfo` after the optional `[0]` version) or, on
+  failure, against `TBSCertList` (`issuer` followed by a *primitive*
+  `thisUpdate` Time — the field that is constructed, `validity`, in a
+  Certificate at the same position — is what disambiguates the two
+  shapes). Only OPTIONAL/context-tagged fields vary in presence; DER
+  otherwise encodes SEQUENCE fields in fixed declaration order, so this
+  positional walk is simpler and more precise here than generic
+  structural matching.
+* `authorityKeyIdentifier`/`subjectKeyIdentifier` extension values are
+  read from the tree's own encapsulation heuristic (§5) — both extensions
+  decode to nested ASN.1 that already satisfies it, so no separate nested
+  parse is needed; if the heuristic didn't fire (a malformed extension),
+  the key identifier is just reported absent and matching falls back to
+  DN comparison.
+* Issuer/subject `Name` comparison is byte equality on the raw DER
+  encoding (sliced directly out of the document's bytes using the node's
+  `offset`/`header_len`/`content_len`, same as offsets are used
+  everywhere else in the tool) rather than a semantic RDN comparison —
+  correct because DER encoding is canonical, and much simpler than
+  writing an AttributeTypeAndValue comparator.
+* The public key bytes handed to the verifier are exactly the SPKI's
+  `subjectPublicKey` BIT STRING content (RSA: DER `RSAPublicKey`; EC: SEC1
+  uncompressed point; Ed25519: raw 32 bytes) — no re-encoding. Note this
+  is read from `Node::value` (the raw content octets, always populated),
+  not `Node::content_octets()`: RSA and ECDSA signature/key BIT STRINGs
+  routinely satisfy the encapsulation heuristic themselves (an RSA
+  `RSAPublicKey` or an ECDSA `(r, s)` signature *is* valid nested ASN.1),
+  and `content_octets()` would re-encode from the parsed children —
+  correct for DER input, but a real (if rare) risk of silently altering
+  the exact bytes a signature is defined over.
+
+`src/verify.rs` is the only module that talks to the crypto library
+(`aws-lc-rs`, chosen for its `ring`-compatible API and — unlike `ring` —
+active investment in post-quantum algorithms, positioning it best for
+adding ML-DSA/SLH-DSA verification later). It maps the signature
+algorithm OID to an `aws-lc-rs` `VerificationAlgorithm` (RSA PKCS#1 v1.5
+with SHA-1/256/384/512, ECDSA P-256/P-384 with SHA-256/384, Ed25519 — RSA-
+PSS and post-quantum algorithms are not implemented), picks a candidate
+issuer from the scanned index (an `authorityKeyIdentifier` /
+`subjectKeyIdentifier` match is preferred over issuer/subject DN
+byte-equality when available), and verifies. `verify_against` takes a
+generic `(tbs bytes, sig alg OID, signature bytes, candidate issuers)`
+shape, so a future CMS `SignerInfo` decoder can reuse it unchanged.
+
+Display: a `Signature` line in the content pane header, directly below
+`Spec` — shown once per document regardless of which node is selected,
+since (unlike `Spec`) it is a whole-document fact, not a per-node one.
+Recomputed after every edit (the same `rebuild()` that re-runs spec
+identification), so an in-TUI edit that breaks a certificate's signature
+is reflected immediately, without saving. The candidate-issuer index
+itself is scanned once at startup and not refreshed on edits, file
+switches, or external filesystem changes. Directory scanning skips
+symlinks (rules out symlink cycles) and files over 1 MiB (real certs/CRLs
+are always tiny; this keeps scanning e.g. a `target/` or `.git/`
+directory cheap) — non-signable and unparseable files are silently
+skipped, not errors.
+
+## 10. Input containers
 
 `input::load` detects, in order: PEM (`-----BEGIN <label>-----`, first
 block), raw BER/DER (must parse), hex text, base64. The decoded-from
@@ -382,25 +468,38 @@ container is remembered and `s`ave re-wraps the new DER the same way
 (PEM label preserved, 64-column base64). `-o FILE` redirects the save
 target; by default the input file is overwritten.
 
-## 10. TUI
+## 11. TUI
 
 Built with ratatui 0.29 (bundled crossterm backend, `ratatui::init()` /
 `restore()` with automatic panic-hook cleanup).
 
 ```
-┌ Structure — file.der ────────────┐┌ Content ───────────────────────────────┐
-│ ▾ SEQUENCE (3 elem)              ││ Type    INTEGER  class: universal, ...  │
-│   ▾ SEQUENCE (8 elem)            ││ Offset  10  header: 2  content: 1 bytes │
-│     ▾ [0] (1 elem)               ││ Decoded 2                               │
-│         INTEGER 2                ││                                         │
-│       INTEGER 70 60 96 41 99 …   ││ Content octets (1 bytes) — 'e' to edit: │
-│     ▸ SEQUENCE (1 elem)          ││ 00000000  02              |.|           │
-│       …                          ││                                         │
-└──────────────────────────────────┘└─────────────────────────────────────────┘
-  status message                        | q quit ↑↓ move ←→ fold ⏎ toggle e edit s save
+┌ Files — dir ──┐┌ Structure — file.der ────────────┐┌ Content ───────────────────────────────┐
+│    a.der      ││ ▾ SEQUENCE (3 elem)              ││ Type    INTEGER  class: universal, ...  │
+│  • b.der      ││   ▾ SEQUENCE (8 elem)            ││ Offset  10  header: 2  content: 1 bytes │
+│▸   sub/       ││     ▾ [0] (1 elem)               ││ Decoded 2                               │
+│    c.pem      ││         INTEGER 2                ││                                         │
+│               ││       INTEGER 70 60 96 41 99 …   ││ Content octets (1 bytes) — 'e' to edit: │
+│               ││     ▸ SEQUENCE (1 elem)          ││ 00000000  02              |.|           │
+│               ││       …                          ││                                         │
+└───────────────┘└──────────────────────────────────┘└─────────────────────────────────────────┘
+  status message      | q quit  Tab switch pane  ↑↓ move  ←→ fold  ⏎ toggle  e edit  s save
 ```
 
-* **Left pane — tree.** One row per visible node: fold marker (`▸`/`▾`),
+* **Far-left pane — file browser.** A folding directory tree (`src/browser.rs`)
+  of the directory the current file lives in (or, if the program was
+  started with a directory instead of a file, that directory, with the
+  other two panes starting empty). Fold marker (`▸`/`▾`) on directories,
+  their children read lazily on first expand; the file currently open (if
+  any) is marked with `•` even if the selection has moved elsewhere.
+  `Tab` switches keyboard focus between this pane and the document panes;
+  the focused pane gets a highlighted border. On a file, `Enter`/`Space`
+  opens it into the tree/content panes (with an unsaved-changes
+  confirmation, same two-step pattern as delete); on a directory it
+  folds/unfolds. Started with a directory and no file picked yet, `save`
+  and insert are refused with a status message — there is nothing to
+  write to.
+* **Middle pane — tree.** One row per visible node: fold marker (`▸`/`▾`),
   indentation by depth, type name (colored by tag class; bold when
   constructed/encapsulating) and a short decoded value preview.
 * **Right pane — content.** At the top, the build-up of the tag and the
@@ -449,14 +548,23 @@ Built with ratatui 0.29 (bundled crossterm backend, `ratatui::init()` /
 
 ### Key bindings
 
+`Tab` switches keyboard focus between the file browser pane and the
+document (tree/content) panes, both in and out of a loaded document; `q`
+quits regardless of focus. The rest of the browse-mode bindings below
+apply to whichever pane is focused — arrow keys and fold navigation work
+the same way in both, but `Enter`/`Space` opens a file (or folds a
+directory) in the browser versus toggling fold in the tree, and the
+editing/save/insert/delete/reorder keys only apply to the document pane.
+
 | Key | Action |
 |-----|--------|
+| `Tab` | switch focus between the file browser and the document panes |
 | `↑`/`k`, `↓`/`j` | move selection |
 | `PgUp`/`PgDn` | move selection by 15 |
 | `g`/`Home`, `G`/`End` | first / last row |
-| `←`/`h` | collapse node, or jump to parent |
-| `→`/`l` | expand node, or enter first child |
-| `Enter`/`Space` | toggle fold |
+| `←`/`h` | collapse node/directory, or jump to parent |
+| `→`/`l` | expand node/directory, or enter first child |
+| `Enter`/`Space` | toggle fold (tree); open file / toggle fold (browser) |
 | `e` | edit selected element's value (type-specific editor) |
 | `E` | edit menu: tag type / hex / base64 / raw binary / type specific |
 | `i` | insert new element after the selection (type-picker dialog, then value) |
@@ -469,7 +577,7 @@ Built with ratatui 0.29 (bundled crossterm backend, `ratatui::init()` /
 | `[` / `]` | scroll content pane |
 | `q` | quit (`q q` to discard unsaved changes) |
 
-## 11. Verification against dumpasn1
+## 12. Verification against dumpasn1
 
 Two layers, both in `tests/dumpasn1_compat.rs` and run by `cargo test`:
 
@@ -499,7 +607,7 @@ encapsulation, long INTEGER hex blocks), SEC1 EC private key (context
 tags `[0]`/`[1]`, OCTET STRING that must *not* encapsulate), PKCS#7
 certificate bundle (`[0]` constructed, empty SET, deep nesting).
 
-## 12. Error handling
+## 13. Error handling
 
 * Parse errors carry the absolute offset and are fatal at load time
   (reported on stderr).
@@ -510,7 +618,7 @@ certificate bundle (`[0]` constructed, empty SET, deep nesting).
   set.
 * Quitting with unsaved changes requires a second `q`.
 
-## 13. Limitations and future work
+## 14. Limitations and future work
 
 * Re-encoding normalizes BER (indefinite lengths, redundant length octets)
   to DER framing; a byte-preserving mode would require storing original
@@ -521,3 +629,10 @@ certificate bundle (`[0]` constructed, empty SET, deep nesting).
 * Value display for exotic universal types (REAL, EMBEDDED PDV, …) falls
   back to hex.
 * Reading from stdin is not supported (the terminal owns stdin in a TUI).
+* Signature verification (§9) covers RSA PKCS#1 v1.5, ECDSA and Ed25519;
+  RSA-PSS and post-quantum algorithms (ML-DSA/SLH-DSA) are not
+  implemented. CMS SignedData is not supported — only bare X.509
+  `Certificate`/`CertificateList`; `verify.rs`'s `verify_against` is
+  already shaped generically enough for a future CMS `SignerInfo` decoder
+  to reuse. The candidate-issuer index is a startup-only snapshot: it is
+  not refreshed if files change on disk during the session.

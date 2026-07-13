@@ -20,8 +20,11 @@ use std::path::PathBuf;
 use ratatui::widgets::ListState;
 
 use crate::ber::{self, Class, Node};
+use crate::browser::FileBrowser;
 use crate::input::{self, Container};
 use crate::spec::{self, Identification, Label, SpecDb};
+use crate::verify::{self, SignatureStatus};
+use crate::x509::{self, CaCandidate};
 
 /// Bytes per line in the hex editor; the cursor moves in units of hex digits.
 pub const EDIT_BYTES_PER_LINE: usize = 16;
@@ -589,6 +592,15 @@ pub enum Mode {
     Edit(EditState),
 }
 
+/// Which pane receives navigation keys while in `Mode::Browse`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Focus {
+    /// The file browser pane (far left).
+    Browser,
+    /// The ASN.1 structure/content panes.
+    Document,
+}
+
 pub struct App {
     pub path: PathBuf,
     pub out_path: PathBuf,
@@ -612,6 +624,24 @@ pub struct App {
     pub spec_db: SpecDb,
     /// Result of matching the document against the specifications.
     pub ident: Option<Identification>,
+    /// Far-left directory tree pane.
+    pub browser: FileBrowser,
+    /// Which pane currently receives navigation keys.
+    pub focus: Focus,
+    /// False when the program was started with a directory and no file has
+    /// been picked from the browser yet: `roots`/`rows` are empty, and
+    /// document-mutating actions (`save`, insert) are refused.
+    pub file_open: bool,
+    /// Set after the first Enter on a file in the browser while the current
+    /// document has unsaved changes; a second Enter discards them and opens.
+    pub open_confirm: bool,
+    /// Certificates found while scanning the browser's root directory on
+    /// startup, kept as candidate issuers. Static for the process lifetime
+    /// — not rescanned on edits or when switching files.
+    pub ca_index: Vec<CaCandidate>,
+    /// Signature verification result for the currently open document, if
+    /// it structurally decodes as a Certificate or CRL.
+    pub sig_status: Option<SignatureStatus>,
 }
 
 impl App {
@@ -622,6 +652,10 @@ impl App {
         roots: Vec<Node>,
         total_len: usize,
     ) -> Self {
+        let dir = path.parent().map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
+        let mut browser = FileBrowser::new(dir.clone());
+        browser.reveal(&path);
+        let ca_index = x509::scan_dir(&dir);
         let mut app = App {
             path,
             out_path,
@@ -639,9 +673,120 @@ impl App {
             content_scroll: 0,
             spec_db: SpecDb::default(),
             ident: None,
+            browser,
+            focus: Focus::Document,
+            file_open: true,
+            open_confirm: false,
+            ca_index,
+            sig_status: None,
+        };
+        app.rebuild_rows();
+        app.recompute_sig_status();
+        app
+    }
+
+    /// Started with a directory instead of a file: the browser shows that
+    /// directory and no document is loaded until one is picked (Enter).
+    pub fn new_dir(dir: PathBuf) -> Self {
+        let browser = FileBrowser::new(dir.clone());
+        let ca_index = x509::scan_dir(&dir);
+        let mut app = App {
+            path: dir.clone(),
+            out_path: dir,
+            container: Container::Raw,
+            roots: Vec::new(),
+            total_len: 0,
+            rows: Vec::new(),
+            selected: 0,
+            tree_state: ListState::default(),
+            mode: Mode::Browse,
+            status: "select a file in the browser and press Enter to open it".to_string(),
+            dirty: false,
+            quit_confirm: false,
+            delete_confirm: false,
+            content_scroll: 0,
+            spec_db: SpecDb::default(),
+            ident: None,
+            browser,
+            focus: Focus::Browser,
+            file_open: false,
+            open_confirm: false,
+            ca_index,
+            sig_status: None,
         };
         app.rebuild_rows();
         app
+    }
+
+    /// Toggle keyboard focus between the file browser and the document
+    /// panes ('Tab').
+    pub fn toggle_focus(&mut self) {
+        self.focus = match self.focus {
+            Focus::Browser => Focus::Document,
+            Focus::Document => Focus::Browser,
+        };
+        self.open_confirm = false;
+    }
+
+    /// Load `path` as the current document, replacing whatever (if
+    /// anything) was open before. Errors are non-fatal — the caller shows
+    /// them in the status bar and the browser stays as it was.
+    pub fn open_file(&mut self, path: PathBuf) -> Result<(), String> {
+        let raw = std::fs::read(&path).map_err(|e| format!("cannot read {}: {}", path.display(), e))?;
+        let (der, container) = input::load(&raw)?;
+        let roots = ber::parse_forest(&der, 0).map_err(|e| format!("ASN.1 parse error at {}", e))?;
+        self.total_len = der.len();
+        self.path = path.clone();
+        self.out_path = path;
+        self.container = container.clone();
+        self.roots = roots;
+        self.selected = 0;
+        self.mode = Mode::Browse;
+        self.dirty = false;
+        self.quit_confirm = false;
+        self.delete_confirm = false;
+        self.content_scroll = 0;
+        self.file_open = true;
+        self.rebuild_rows();
+        self.identify();
+        self.recompute_sig_status();
+        self.status = format!("loaded {} bytes ({})", self.total_len, container.describe());
+        Ok(())
+    }
+
+    /// Re-derive `sig_status` for the current document against `ca_index`.
+    /// Called after loading a document and after every edit (`rebuild()`),
+    /// so an edit that breaks a signature is reflected immediately. Not
+    /// called when no document is open — `sig_status` just stays `None`.
+    fn recompute_sig_status(&mut self) {
+        let der = ber::encode_forest(&self.roots);
+        self.sig_status = x509::parse_signable(&self.roots, &der)
+            .map(|signable| verify::verify_against(&self.ca_index, &signable));
+    }
+
+    /// Enter/Space on the selected browser row: fold a directory, or open a
+    /// file into the document panes (armed with an unsaved-changes
+    /// confirmation, mirroring `delete_selected`'s two-step pattern).
+    pub fn activate_browser_entry(&mut self) {
+        let Some(entry) = self.browser.selected_entry() else { return };
+        if entry.is_dir {
+            self.browser.toggle_expand();
+            return;
+        }
+        let path = entry.path.clone();
+        if self.file_open && self.dirty && !self.open_confirm {
+            self.open_confirm = true;
+            self.status = format!(
+                "unsaved changes — press Enter again to discard them and open {}",
+                path.display()
+            );
+            return;
+        }
+        self.open_confirm = false;
+        match self.open_file(path.clone()) {
+            Ok(()) => self.focus = Focus::Document,
+            Err(e) => self.status = format!("cannot open {}: {}", path.display(), e),
+        }
     }
 
     /// Install the specification database and identify the document.
@@ -901,6 +1046,10 @@ impl App {
     /// the first child of the selected constructed element. Both open the
     /// type-picker dialog; the value is typed afterwards.
     pub fn start_insert(&mut self, as_child: bool) {
+        if !self.file_open {
+            self.status = "no file open — select one in the browser first".to_string();
+            return;
+        }
         let (parent, index) = if self.rows.is_empty() {
             (Vec::new(), 0) // empty document: insert the first top-level element
         } else {
@@ -1245,8 +1394,10 @@ impl App {
             }
         }
         self.rebuild_rows();
-        // Edits can make the document gain or lose conformance to a spec.
+        // Edits can make the document gain or lose conformance to a spec,
+        // or break/fix its signature.
         self.identify();
+        self.recompute_sig_status();
         if let Some(path) = sel_path {
             if let Some(i) = self.rows.iter().position(|r| r.path == path) {
                 self.select(i);
@@ -1255,6 +1406,10 @@ impl App {
     }
 
     pub fn save(&mut self) {
+        if !self.file_open {
+            self.status = "no file open — select one in the browser first".to_string();
+            return;
+        }
         let der = ber::encode_forest(&self.roots);
         let out = input::wrap(&der, &self.container);
         match std::fs::write(&self.out_path, &out) {
@@ -1850,5 +2005,69 @@ mod tests {
         let node = app.node_at(&[0]).unwrap();
         assert!(node.encapsulates);
         assert_eq!(node.children.len(), 1);
+    }
+
+    fn tmp_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("asn1-editor-app-test-{}-{}", name, std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn new_dir_starts_with_no_document_and_browser_focus() {
+        let dir = tmp_dir("newdir");
+        std::fs::write(dir.join("a.der"), [0x05, 0x00]).unwrap();
+        let app = App::new_dir(dir.clone());
+        assert!(!app.file_open);
+        assert!(app.rows.is_empty());
+        assert!(app.selected_node().is_none());
+        assert_eq!(app.focus, Focus::Browser);
+        assert!(!app.browser.rows.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn save_and_insert_are_refused_without_a_file() {
+        let dir = tmp_dir("noguard");
+        let mut app = App::new_dir(dir.clone());
+        app.save();
+        assert!(app.status.contains("no file open"));
+        app.start_insert(false);
+        assert!(matches!(app.mode, Mode::Browse));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn activate_browser_entry_opens_file_and_switches_focus() {
+        let dir = tmp_dir("openfile");
+        std::fs::write(dir.join("a.der"), [0x05, 0x00]).unwrap(); // NULL
+        let mut app = App::new_dir(dir.clone());
+        app.browser.select(0); // "a.der" is the only entry
+        app.activate_browser_entry();
+        assert!(app.file_open);
+        assert_eq!(app.focus, Focus::Document);
+        assert_eq!(app.rows.len(), 1);
+        assert!(app.selected_node().unwrap().is_universal(ber::TAG_NULL));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn activate_browser_entry_warns_before_discarding_unsaved_changes() {
+        let dir = tmp_dir("confirm");
+        std::fs::write(dir.join("a.der"), [0x05, 0x00]).unwrap();
+        std::fs::write(dir.join("b.der"), [0x05, 0x00]).unwrap();
+        let mut app = App::new_dir(dir.clone());
+        app.browser.select(0); // "a.der"
+        app.activate_browser_entry(); // open it
+        app.dirty = true; // simulate an unsaved edit
+        app.browser.select(1); // "b.der"
+        app.activate_browser_entry(); // first Enter: only arms the confirmation
+        assert!(app.open_confirm);
+        assert!(app.path.ends_with("a.der"), "still on the original file");
+        app.activate_browser_entry(); // second Enter: discards and opens
+        assert!(app.path.ends_with("b.der"));
+        assert!(!app.dirty);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

@@ -29,14 +29,15 @@ use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph};
 use ratatui::{DefaultTerminal, Frame};
 
 use crate::app::{
-    App, DateTimeEditor, EditKind, EditState, Editor, HexEditor, Mode, PickerTarget, TextEditor,
-    TextFormat, DATE_FIELDS, EDIT_BYTES_PER_LINE, EDIT_DIGITS_PER_LINE, EDIT_MENU, PICKER_CLASSES,
-    PICKER_UNIVERSAL,
+    App, DateTimeEditor, EditKind, EditState, Editor, Focus, HexEditor, Mode, PickerTarget,
+    TextEditor, TextFormat, DATE_FIELDS, EDIT_BYTES_PER_LINE, EDIT_DIGITS_PER_LINE, EDIT_MENU,
+    PICKER_CLASSES, PICKER_UNIVERSAL,
 };
 use crate::ber::{
     self, Class, Node, TAG_BIT_STRING, TAG_BOOLEAN, TAG_GENERALIZED_TIME, TAG_INTEGER, TAG_NULL,
     TAG_OID, TAG_UTC_TIME,
 };
+use crate::verify::SignatureStatus;
 
 /// Bytes of hex shown in the browse-mode content pane before truncating.
 const CONTENT_HEX_LIMIT: usize = 4096;
@@ -75,30 +76,51 @@ fn event_loop(terminal: &mut DefaultTerminal, app: &mut App) -> io::Result<()> {
             Mode::TypePicker(_) => handle_picker_key(app, key),
             Mode::EditMenu(_) => handle_menu_key(app, key),
             Mode::Browse => {
-                if handle_browse_key(app, key) {
-                    return Ok(());
+                if key.code != KeyCode::Char('q') {
+                    app.quit_confirm = false;
+                }
+                match key.code {
+                    KeyCode::Char('q') => {
+                        if !app.dirty || app.quit_confirm {
+                            return Ok(());
+                        }
+                        app.quit_confirm = true;
+                        app.status = "unsaved changes — press q again to quit anyway".to_string();
+                    }
+                    KeyCode::Tab => app.toggle_focus(),
+                    _ => match app.focus {
+                        Focus::Browser => handle_browser_key(app, key),
+                        Focus::Document => handle_document_key(app, key),
+                    },
                 }
             }
         }
     }
 }
 
-/// Returns true when the application should quit.
-fn handle_browse_key(app: &mut App, key: KeyEvent) -> bool {
-    if key.code != KeyCode::Char('q') {
-        app.quit_confirm = false;
+fn handle_browser_key(app: &mut App, key: KeyEvent) {
+    if !matches!(key.code, KeyCode::Enter | KeyCode::Char(' ')) {
+        app.open_confirm = false;
     }
+    match key.code {
+        KeyCode::Up | KeyCode::Char('k') => app.browser.move_by(-1),
+        KeyCode::Down | KeyCode::Char('j') => app.browser.move_by(1),
+        KeyCode::PageUp => app.browser.move_by(-15),
+        KeyCode::PageDown => app.browser.move_by(15),
+        KeyCode::Home | KeyCode::Char('g') => app.browser.select(0),
+        KeyCode::End | KeyCode::Char('G') => app.browser.select(usize::MAX),
+        KeyCode::Left | KeyCode::Char('h') => app.browser.collapse_or_parent(),
+        KeyCode::Right | KeyCode::Char('l') => app.browser.expand_or_child(),
+        KeyCode::Enter | KeyCode::Char(' ') => app.activate_browser_entry(),
+        _ => {}
+    }
+}
+
+fn handle_document_key(app: &mut App, key: KeyEvent) {
     if key.code != KeyCode::Char('d') {
         app.delete_confirm = false;
     }
     match key.code {
-        KeyCode::Char('q') => {
-            if !app.dirty || app.quit_confirm {
-                return true;
-            }
-            app.quit_confirm = true;
-            app.status = "unsaved changes — press q again to quit anyway".to_string();
-        }
         KeyCode::Up | KeyCode::Char('k') => app.move_by(-1),
         KeyCode::Down | KeyCode::Char('j') => app.move_by(1),
         KeyCode::PageUp => app.move_by(-15),
@@ -120,7 +142,6 @@ fn handle_browse_key(app: &mut App, key: KeyEvent) -> bool {
         KeyCode::Char(']') => app.content_scroll = app.content_scroll.saturating_add(4),
         _ => {}
     }
-    false
 }
 
 fn handle_picker_key(app: &mut App, key: KeyEvent) {
@@ -183,10 +204,15 @@ fn handle_edit_key(app: &mut App, key: KeyEvent) {
 fn draw(frame: &mut Frame, app: &mut App) {
     let [main, status] =
         Layout::vertical([Constraint::Min(3), Constraint::Length(1)]).areas(frame.area());
-    let [left, right] =
-        Layout::horizontal([Constraint::Percentage(42), Constraint::Percentage(58)]).areas(main);
-    draw_tree(frame, app, left);
-    draw_content(frame, app, right);
+    let [browser, tree, content] = Layout::horizontal([
+        Constraint::Percentage(20),
+        Constraint::Percentage(34),
+        Constraint::Percentage(46),
+    ])
+    .areas(main);
+    draw_browser(frame, app, browser);
+    draw_tree(frame, app, tree);
+    draw_content(frame, app, content);
     draw_status(frame, app, status);
     if matches!(app.mode, Mode::TypePicker(_)) {
         draw_picker(frame, app, main);
@@ -194,6 +220,65 @@ fn draw(frame: &mut Frame, app: &mut App) {
     if matches!(app.mode, Mode::EditMenu(_)) {
         draw_edit_menu(frame, app, main);
     }
+}
+
+/// Border style cue for which pane currently has keyboard focus.
+fn pane_border_style(active: bool) -> Style {
+    if active {
+        Style::new().fg(Color::White).bold()
+    } else {
+        Style::new().dim()
+    }
+}
+
+fn draw_browser(frame: &mut Frame, app: &mut App, area: Rect) {
+    let active = app.focus == Focus::Browser;
+    let open_path = app.file_open.then_some(app.path.as_path());
+    let items: Vec<ListItem> = app
+        .browser
+        .rows
+        .iter()
+        .map(|row| {
+            let entry = app.browser.entry_at(&row.path).expect("row paths are valid");
+            let marker = if entry.is_dir {
+                if entry.expanded { "▾ " } else { "▸ " }
+            } else {
+                "  "
+            };
+            let is_open = open_path == Some(entry.path.as_path());
+            let mut style = if entry.is_dir {
+                Style::new().fg(Color::Green).bold()
+            } else {
+                Style::new()
+            };
+            if is_open {
+                style = style.fg(Color::LightGreen).bold();
+            }
+            let prefix = if is_open { "• " } else { "  " };
+            let text = format!(
+                "{}{}{}{}",
+                "  ".repeat(row.depth),
+                marker,
+                prefix,
+                entry.name
+            );
+            ListItem::new(Line::from(Span::styled(text, style)))
+        })
+        .collect();
+    let title = format!(" Files — {} ", app.browser.root.display());
+    let list = List::new(items)
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(pane_border_style(active))
+                .title(title),
+        )
+        .highlight_style(if active {
+            Style::new().add_modifier(Modifier::REVERSED)
+        } else {
+            Style::new().add_modifier(Modifier::UNDERLINED)
+        });
+    frame.render_stateful_widget(list, area, &mut app.browser.list_state);
 }
 
 fn class_style(node: &Node) -> Style {
@@ -312,15 +397,29 @@ fn draw_tree(frame: &mut Frame, app: &mut App, area: Rect) {
             ListItem::new(Line::from(spans))
         })
         .collect();
-    let ident_note = app
-        .ident
-        .as_ref()
-        .map(|i| format!(" — {}", i.type_name))
-        .unwrap_or_default();
-    let title = format!(" Structure — {}{} ", app.path.display(), ident_note);
+    let title = if app.file_open {
+        let ident_note = app
+            .ident
+            .as_ref()
+            .map(|i| format!(" — {}", i.type_name))
+            .unwrap_or_default();
+        format!(" Structure — {}{} ", app.path.display(), ident_note)
+    } else {
+        " Structure ".to_string()
+    };
+    let active = app.focus == Focus::Document;
     let list = List::new(items)
-        .block(Block::default().borders(Borders::ALL).title(title))
-        .highlight_style(Style::new().add_modifier(Modifier::REVERSED));
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(pane_border_style(active))
+                .title(title),
+        )
+        .highlight_style(if active {
+            Style::new().add_modifier(Modifier::REVERSED)
+        } else {
+            Style::new().add_modifier(Modifier::UNDERLINED)
+        });
     frame.render_stateful_widget(list, area, &mut app.tree_state);
 }
 
@@ -626,6 +725,42 @@ pub fn length_layout_strings(node: &Node) -> Vec<String> {
     lines
 }
 
+/// The signature verification result for the whole open document — shown
+/// once in the content pane header, right below "Spec", regardless of
+/// which node is currently selected.
+fn signature_status_line(status: &SignatureStatus) -> Line<'static> {
+    let (text, style) = match status {
+        SignatureStatus::Verified { issuer_path, issuer_summary, self_signed } => (
+            if *self_signed {
+                format!("verified — self-signed ({})", issuer_summary)
+            } else {
+                format!("verified — signed by {} ({})", issuer_summary, issuer_path.display())
+            },
+            Style::new().fg(Color::Green),
+        ),
+        SignatureStatus::Invalid { issuer_path, issuer_summary } => (
+            format!(
+                "does NOT verify — claimed issuer {} ({})",
+                issuer_summary,
+                issuer_path.display()
+            ),
+            Style::new().fg(Color::Red).bold(),
+        ),
+        SignatureStatus::IssuerNotFound => (
+            "issuer certificate not found in this directory".to_string(),
+            Style::new().fg(Color::Yellow),
+        ),
+        SignatureStatus::UnsupportedAlgorithm(name) => (
+            format!("issuer found, but signature algorithm {} is not supported", name),
+            Style::new().fg(Color::Yellow),
+        ),
+    };
+    Line::from(vec![
+        Span::styled("Signature ", Style::new().dim()),
+        Span::styled(text, style),
+    ])
+}
+
 fn draw_content_browse(frame: &mut Frame, app: &App, area: Rect) {
     let mut lines: Vec<Line> = Vec::new();
     if let Some(node) = app.selected_node() {
@@ -648,6 +783,9 @@ fn draw_content_browse(frame: &mut Frame, app: &App, area: Rect) {
                     ),
                 ]));
             }
+        }
+        if let Some(status) = &app.sig_status {
+            lines.push(signature_status_line(status));
         }
         let ids = ber::identifier_octets(node.class, node.tag, node.constructed);
         lines.push(Line::from(vec![
@@ -717,11 +855,18 @@ fn draw_content_browse(frame: &mut Frame, app: &App, area: Rect) {
             Style::new().underlined(),
         )));
         lines.extend(hex_dump_lines(&content));
+    } else if !app.file_open {
+        lines.push(Line::from("no file open — pick one in the Files pane on the left (Enter)"));
     } else {
         lines.push(Line::from("no element selected"));
     }
     let para = Paragraph::new(lines)
-        .block(Block::default().borders(Borders::ALL).title(" Content "))
+        .block(
+            Block::default()
+                .borders(Borders::ALL)
+                .border_style(pane_border_style(app.focus == Focus::Document))
+                .title(" Content "),
+        )
         .scroll((app.content_scroll, 0));
     frame.render_widget(para, area);
 }
@@ -949,8 +1094,11 @@ fn draw_edit_menu(frame: &mut Frame, app: &App, area: Rect) {
 fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
     let dirty = if app.dirty { " [modified]" } else { "" };
     let hints = match app.mode {
+        Mode::Browse if app.focus == Focus::Browser => {
+            "q quit  Tab switch pane  ↑↓ move  ←→ fold  ⏎ open/fold"
+        }
         Mode::Browse => {
-            "q quit  ↑↓ move  ←→ fold  ⏎ toggle  e edit  E edit-menu  i/I insert  d delete  J/K reorder  s save  [ ] scroll"
+            "q quit  Tab switch pane  ↑↓ move  ←→ fold  ⏎ toggle  e edit  E edit-menu  i/I insert  d delete  J/K reorder  s save  [ ] scroll"
         }
         Mode::TypePicker(_) => "←→ column  ↑↓ select  0-9 tag number  ⏎ continue  Esc cancel",
         Mode::EditMenu(_) => "↑↓ or 1-5 select  ⏎ choose  Esc cancel",

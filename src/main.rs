@@ -18,10 +18,12 @@ use std::process::ExitCode;
 use asn1_editor::{app::App, ber, dump, input, spec, tui};
 
 const USAGE: &str = "\
-Usage: asn1-editor [OPTIONS] <FILE>
+Usage: asn1-editor [OPTIONS] <FILE|DIR>
 
 TUI ASN.1 (BER/DER) viewer and editor. Accepts raw DER/BER, PEM,
-base64 and hex input files.
+base64 and hex input files. Given a directory instead of a file, it
+starts with the file browser pane showing that directory and no
+document loaded; pick a file from it (Enter) to open it.
 
 Options:
   -d, --dump        print a dumpasn1-style dump instead of starting the TUI
@@ -60,6 +62,29 @@ fn main() -> ExitCode {
     let Some(path) = file else {
         return usage_error("no input file given");
     };
+
+    if path.is_dir() {
+        if dump_mode {
+            return usage_error("--dump requires a file, not a directory");
+        }
+        if out_path.is_some() {
+            return usage_error("--out requires a file, not a directory");
+        }
+        let mut app = App::new_dir(path);
+        if let Some(dir) = spec::default_spec_dir() {
+            let (db, errors) = spec::load_dir(&dir);
+            for e in &errors {
+                eprintln!("warning: spec parse error: {}", e);
+            }
+            if !db.is_empty() {
+                app.set_spec_db(db);
+            }
+        }
+        return match tui::run(app) {
+            Ok(()) => ExitCode::SUCCESS,
+            Err(e) => fail(&format!("terminal error: {}", e)),
+        };
+    }
 
     let raw = match std::fs::read(&path) {
         Ok(b) => b,
