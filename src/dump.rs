@@ -24,36 +24,10 @@ use crate::ber::{
     self, Node, TAG_BIT_STRING, TAG_BOOLEAN, TAG_ENUMERATED, TAG_GENERALIZED_TIME, TAG_INTEGER,
     TAG_NULL, TAG_OCTET_STRING, TAG_OID, TAG_UTC_TIME,
 };
+use crate::oid;
 
 /// Bytes of hex shown before dumpasn1 prints "[ Another N bytes skipped ]".
 const HEX_DISPLAY_LIMIT: usize = 128;
-
-/// A minimal built-in OID name table (dumpasn1 loads a much larger one from
-/// dumpasn1.cfg; names are cosmetic and not part of the structure check).
-const OID_NAMES: &[(&[u64], &str)] = &[
-    (&[1, 2, 840, 10045, 2, 1], "ecPublicKey"),
-    (&[1, 2, 840, 10045, 3, 1, 7], "prime256v1"),
-    (&[1, 2, 840, 10045, 4, 3, 2], "ecdsaWithSHA256"),
-    (&[1, 2, 840, 113549, 1, 1, 1], "rsaEncryption"),
-    (&[1, 2, 840, 113549, 1, 1, 11], "sha256WithRSAEncryption"),
-    (&[1, 2, 840, 113549, 1, 7, 1], "data"),
-    (&[1, 2, 840, 113549, 1, 7, 2], "signedData"),
-    (&[1, 2, 840, 113549, 1, 9, 1], "emailAddress"),
-    (&[2, 5, 4, 3], "commonName"),
-    (&[2, 5, 4, 6], "countryName"),
-    (&[2, 5, 4, 7], "localityName"),
-    (&[2, 5, 4, 8], "stateOrProvinceName"),
-    (&[2, 5, 4, 10], "organizationName"),
-    (&[2, 5, 4, 11], "organizationalUnitName"),
-    (&[2, 5, 29, 14], "subjectKeyIdentifier"),
-    (&[2, 5, 29, 15], "keyUsage"),
-    (&[2, 5, 29, 17], "subjectAltName"),
-    (&[2, 5, 29, 19], "basicConstraints"),
-    (&[2, 5, 29, 20], "cRLNumber"),
-    (&[2, 5, 29, 31], "cRLDistributionPoints"),
-    (&[2, 5, 29, 35], "authorityKeyIdentifier"),
-    (&[2, 5, 29, 37], "extKeyUsage"),
-];
 
 pub fn dump(roots: &[Node], total_len: usize) -> String {
     let width = std::cmp::max(3, total_len.to_string().len());
@@ -151,8 +125,9 @@ fn write_primitive_value(node: &Node, depth: usize, width: usize, out: &mut Stri
                     .map(|a| a.to_string())
                     .collect::<Vec<_>>()
                     .join(" ");
-                match OID_NAMES.iter().find(|(a, _)| *a == arcs.as_slice()) {
-                    Some((_, name)) => {
+                match oid::lookup(&arcs) {
+                    Some(entry) => {
+                        let name = entry.short_name;
                         // dumpasn1 moves "name (arcs)" to a continuation
                         // line when it would wrap an 80-column display.
                         if (2 * width + 3) + 2 * depth + 18 + name.len() + 2 + text.len() >= 80 {

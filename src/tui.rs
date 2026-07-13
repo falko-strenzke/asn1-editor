@@ -37,6 +37,7 @@ use crate::ber::{
     self, Class, Node, TAG_BIT_STRING, TAG_BOOLEAN, TAG_GENERALIZED_TIME, TAG_INTEGER, TAG_NULL,
     TAG_OID, TAG_UTC_TIME,
 };
+use crate::oid;
 use crate::verify::{FileRelations, SignatureStatus};
 
 /// Bytes of hex shown in the browse-mode content pane before truncating.
@@ -614,7 +615,9 @@ fn summary(node: &Node) -> String {
             TAG_NULL => String::new(),
             TAG_OID => ber::oid_arcs(v)
                 .map(|arcs| {
-                    arcs.iter().map(|a| a.to_string()).collect::<Vec<_>>().join(".")
+                    oid::lookup(&arcs)
+                        .map(|entry| entry.short_name.to_string())
+                        .unwrap_or_else(|| oid::dotted(&arcs))
                 })
                 .unwrap_or_else(|| preview_text_or_hex(v)),
             TAG_UTC_TIME | TAG_GENERALIZED_TIME => {
@@ -635,6 +638,19 @@ fn summary(node: &Node) -> String {
         }
     };
     if text.is_empty() { text } else { format!(" {}", text) }
+}
+
+/// Dot notation and, when known, the full textual resolution for an OID node.
+fn oid_details(node: &Node) -> Option<(String, Option<String>)> {
+    if !node.is_universal(TAG_OID) {
+        return None;
+    }
+    let arcs = ber::oid_arcs(&node.value)?;
+    let entry = oid::lookup(&arcs);
+    Some((
+        oid::dotted(&arcs),
+        entry.map(|entry| entry.long_name()),
+    ))
 }
 
 fn preview_text_or_hex(v: &[u8]) -> String {
@@ -1163,6 +1179,18 @@ fn draw_content_browse(frame: &mut Frame, app: &App, area: Rect) {
                 Span::raw(decoded.trim().to_string()),
             ]));
         }
+        if let Some((dotted, long_name)) = oid_details(node) {
+            lines.push(Line::from(vec![
+                Span::styled("OID     ", Style::new().dim()),
+                Span::raw(dotted),
+            ]));
+            if let Some(long_name) = long_name {
+                lines.push(Line::from(vec![
+                    Span::styled("Name    ", Style::new().dim()),
+                    Span::raw(long_name),
+                ]));
+            }
+        }
         lines.push(Line::default());
         let content = node.content_octets();
         lines.push(Line::from(Span::styled(
@@ -1568,6 +1596,39 @@ mod tests {
         data.extend([0x00; 16]);
         let forest = parse_forest(&data, 0).unwrap();
         assert_eq!(summary(&forest[0]), " 340282366920938463463374607431768211456");
+    }
+
+    #[test]
+    fn known_oid_uses_short_tree_name_and_full_content_details() {
+        let value = ber::encode_oid("1.2.840.113549.1.5.13").unwrap();
+        let mut der = vec![0x06, value.len() as u8];
+        der.extend(value);
+        let forest = parse_forest(&der, 0).unwrap();
+        let node = &forest[0];
+
+        assert_eq!(summary(node), " PBES2");
+        assert_eq!(
+            oid_details(node),
+            Some((
+                "1.2.840.113549.1.5.13".to_string(),
+                Some("iso.member-body.us.rsadsi.pkcs.pkcs-5.PBES2".to_string())
+            ))
+        );
+    }
+
+    #[test]
+    fn unknown_oid_keeps_dot_notation_without_inventing_a_name() {
+        let value = ber::encode_oid("1.2.3.4.987654").unwrap();
+        let mut der = vec![0x06, value.len() as u8];
+        der.extend(value);
+        let forest = parse_forest(&der, 0).unwrap();
+        let node = &forest[0];
+
+        assert_eq!(summary(node), " 1.2.3.4.987654");
+        assert_eq!(
+            oid_details(node),
+            Some(("1.2.3.4.987654".to_string(), None))
+        );
     }
 
     #[test]

@@ -24,6 +24,7 @@ pub mod ber;
 pub mod browser;
 pub mod dump;
 pub mod input;
+pub mod oid;
 pub mod pkcs8;
 pub mod spec;
 pub mod tui;
