@@ -37,10 +37,15 @@ use crate::ber::{
     self, Class, Node, TAG_BIT_STRING, TAG_BOOLEAN, TAG_GENERALIZED_TIME, TAG_INTEGER, TAG_NULL,
     TAG_OID, TAG_UTC_TIME,
 };
-use crate::verify::SignatureStatus;
+use crate::verify::{FileRelations, SignatureStatus};
 
 /// Bytes of hex shown in the browse-mode content pane before truncating.
 const CONTENT_HEX_LIMIT: usize = 4096;
+
+/// Colors of the file-browser cryptographic relation arrows.
+const REL_SIGNER: Color = Color::Cyan; // incoming: a file that signed the selection
+const REL_SIGNS: Color = Color::Magenta; // outgoing: a file the selection signed
+const REL_BROKEN: Color = Color::Red; // claimed issuance whose signature fails to verify
 
 pub fn run(mut app: App) -> io::Result<()> {
     let mut terminal = ratatui::init();
@@ -114,6 +119,8 @@ fn handle_browser_key(app: &mut App, key: KeyEvent) {
         KeyCode::Enter | KeyCode::Char(' ') => app.activate_browser_entry(),
         _ => {}
     }
+    // Any of the above can move the browser selection; refresh the arrows.
+    app.recompute_browser_relations();
 }
 
 fn handle_document_key(app: &mut App, key: KeyEvent) {
@@ -231,10 +238,111 @@ fn pane_border_style(active: bool) -> Style {
     }
 }
 
+/// Width of one relation-arrow gutter cell, in characters.
+const ARROW_GUTTER_W: usize = 4;
+
+/// The routed relation arrows of the browser pane: one optional
+/// `(cell text, color)` per visible row and side. Every cell is
+/// `ARROW_GUTTER_W` characters wide.
+///
+/// Arrows really travel from their source row to their destination row as
+/// elbow connectors with two 90° turns (rounded corners), one horizontal
+/// stub at each end and a vertical trunk between them:
+///
+/// * left side — the incoming "signed by" edge, drawn from the signer row
+///   into the selected row (arrowhead `►` entering the selection);
+/// * right side — the outgoing "signs" edges, drawn from the selected row
+///   into each signed file (arrowheads `◄` entering the targets); the
+///   targets share one vertical trunk, branching with `┤` junctions.
+struct ArrowGutters {
+    left: Vec<Option<(String, Color)>>,
+    right: Vec<Option<(String, Color)>>,
+}
+
+/// Route the relation arrows for the current selection. `row_paths` holds
+/// the file path of every *visible* browser row; edges whose other end is
+/// not visible (inside a collapsed directory) are skipped — there is no
+/// row to draw them to.
+fn arrow_gutters(row_paths: &[&std::path::Path], selected: usize, rel: &FileRelations) -> ArrowGutters {
+    let n = row_paths.len();
+    let mut g = ArrowGutters { left: vec![None; n], right: vec![None; n] };
+    if selected >= n {
+        return g;
+    }
+
+    // Incoming edge, left gutter (trunk in the leftmost column):
+    //   ╭──  signer            ╭─►  selected
+    //   │                  or  │
+    //   ╰─►  selected          ╰──  signer
+    if let Some(edge) = &rel.signed_by {
+        if let Some(src) = row_paths.iter().position(|p| *p == edge.other) {
+            if src != selected {
+                let color = if edge.verified { REL_SIGNER } else { REL_BROKEN };
+                let (top, bottom) = (src.min(selected), src.max(selected));
+                for row in top..=bottom {
+                    let cell = match (row == top, row == bottom, row == selected) {
+                        (true, _, true) => "╭─► ",  // selection on top
+                        (true, _, false) => "╭── ", // signer on top
+                        (_, true, true) => "╰─► ",  // selection at bottom
+                        (_, true, false) => "╰── ", // signer at bottom
+                        _ => "│   ",                // trunk passing through
+                    };
+                    g.left[row] = Some((cell.to_string(), color));
+                }
+            }
+        }
+    }
+
+    // Outgoing edges, right gutter (shared trunk in the rightmost column):
+    //   selected  ───╮
+    //   target   ◄──┤
+    //   other        │
+    //   target   ◄──╯
+    let targets: Vec<(usize, bool)> = rel
+        .signs
+        .iter()
+        .filter_map(|e| {
+            row_paths
+                .iter()
+                .position(|p| *p == e.other)
+                .filter(|i| *i != selected)
+                .map(|i| (i, e.verified))
+        })
+        .collect();
+    if !targets.is_empty() {
+        let rows_min = targets.iter().map(|(i, _)| *i).min().unwrap().min(selected);
+        let rows_max = targets.iter().map(|(i, _)| *i).max().unwrap().max(selected);
+        // Trunk shows red only when every drawn edge is broken; a mix keeps
+        // the "signs" color, with the broken targets' stubs red.
+        let trunk_color =
+            if targets.iter().all(|(_, v)| !v) { REL_BROKEN } else { REL_SIGNS };
+        for row in rows_min..=rows_max {
+            let junction = match (row == rows_min, row == rows_max) {
+                (true, _) => '╮', // trunk continues downward only
+                (_, true) => '╯', // trunk continues upward only
+                _ => '┤',         // trunk passes through, branch to the left
+            };
+            let cell = if row == selected {
+                Some((format!("───{}", junction), trunk_color))
+            } else if let Some((_, verified)) = targets.iter().find(|(i, _)| *i == row) {
+                let color = if *verified { REL_SIGNS } else { REL_BROKEN };
+                Some((format!("◄──{}", junction), color))
+            } else {
+                Some(("   │".to_string(), trunk_color))
+            };
+            g.right[row] = cell;
+        }
+    }
+    g
+}
+
 fn draw_browser(frame: &mut Frame, app: &mut App, area: Rect) {
     let active = app.focus == Focus::Browser;
     let open_path = app.file_open.then_some(app.path.as_path());
-    let items: Vec<ListItem> = app
+
+    // Row texts and styles first, so the right-hand arrow trunk can be
+    // aligned one column past the longest visible name.
+    let texts: Vec<(String, Style)> = app
         .browser
         .rows
         .iter()
@@ -255,23 +363,85 @@ fn draw_browser(frame: &mut Frame, app: &mut App, area: Rect) {
                 style = style.fg(Color::LightGreen).bold();
             }
             let prefix = if is_open { "• " } else { "  " };
-            let text = format!(
-                "{}{}{}{}",
-                "  ".repeat(row.depth),
-                marker,
-                prefix,
-                entry.name
-            );
-            ListItem::new(Line::from(Span::styled(text, style)))
+            let text =
+                format!("{}{}{}{}", "  ".repeat(row.depth), marker, prefix, entry.name);
+            (text, style)
+        })
+        .collect();
+    let name_width = texts.iter().map(|(t, _)| t.chars().count()).max().unwrap_or(0);
+
+    let row_paths: Vec<&std::path::Path> = app
+        .browser
+        .rows
+        .iter()
+        .map(|row| {
+            app.browser
+                .entry_at(&row.path)
+                .expect("row paths are valid")
+                .path
+                .as_path()
+        })
+        .collect();
+    let gutters = arrow_gutters(&row_paths, app.browser.selected, &app.browser_relations);
+    // The gutters only take up columns while there is an arrow to show.
+    let has_left = gutters.left.iter().any(|c| c.is_some());
+    let has_right = gutters.right.iter().any(|c| c.is_some());
+
+    // Column the right-hand arrows start in: one past the longest name,
+    // but never past the pane edge — long names are truncated with '…' so
+    // the vertical trunk stays visible inside the pane.
+    let left_w = if has_left { ARROW_GUTTER_W } else { 0 };
+    let inner_w = area.width.saturating_sub(2) as usize; // pane borders
+    let name_col_w = name_width
+        .min(inner_w.saturating_sub(left_w + ARROW_GUTTER_W))
+        .max(1);
+
+    let items: Vec<ListItem> = texts
+        .into_iter()
+        .enumerate()
+        .map(|(i, (text, style))| {
+            let mut spans = Vec::new();
+            if has_left {
+                spans.push(match &gutters.left[i] {
+                    Some((cell, color)) => {
+                        Span::styled(cell.clone(), Style::new().fg(*color).bold())
+                    }
+                    None => Span::raw(" ".repeat(ARROW_GUTTER_W)),
+                });
+            }
+            if has_right {
+                // Pad (or truncate) the name so every right-hand cell
+                // starts in the same column and the trunk lines up.
+                let len = text.chars().count();
+                if len > name_col_w {
+                    let cut: String = text.chars().take(name_col_w.saturating_sub(1)).collect();
+                    spans.push(Span::styled(format!("{}…", cut), style));
+                } else {
+                    spans.push(Span::styled(text, style));
+                    spans.push(Span::raw(" ".repeat(name_col_w - len)));
+                }
+                if let Some((cell, color)) = &gutters.right[i] {
+                    spans.push(Span::styled(cell.clone(), Style::new().fg(*color).bold()));
+                }
+            } else {
+                spans.push(Span::styled(text, style));
+            }
+            ListItem::new(Line::from(spans))
         })
         .collect();
     let title = format!(" Files — {} ", app.browser.root.display());
+    let legend = Line::from(vec![
+        Span::styled(" ─► signer ", Style::new().fg(REL_SIGNER)),
+        Span::styled("─► signs ", Style::new().fg(REL_SIGNS)),
+        Span::styled("─► bad ", Style::new().fg(REL_BROKEN)),
+    ]);
     let list = List::new(items)
         .block(
             Block::default()
                 .borders(Borders::ALL)
                 .border_style(pane_border_style(active))
-                .title(title),
+                .title(title)
+                .title_bottom(legend),
         )
         .highlight_style(if active {
             Style::new().add_modifier(Modifier::REVERSED)
@@ -1116,6 +1286,79 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
 mod tests {
     use super::*;
     use crate::ber::parse_forest;
+    use crate::verify::RelationEdge;
+    use std::path::{Path, PathBuf};
+
+    fn edge(path: &str, verified: bool) -> RelationEdge {
+        RelationEdge { other: PathBuf::from(path), verified }
+    }
+
+    /// Cell text (without color) per row, for one side of the gutters.
+    fn cells(side: &[Option<(String, Color)>]) -> Vec<Option<&str>> {
+        side.iter().map(|c| c.as_ref().map(|(s, _)| s.as_str())).collect()
+    }
+
+    #[test]
+    fn incoming_arrow_routes_from_signer_below_to_selection() {
+        let rows = [Path::new("a"), Path::new("b"), Path::new("c")];
+        let rel = FileRelations { signed_by: Some(edge("c", true)), signs: vec![] };
+        let g = arrow_gutters(&rows, 0, &rel);
+        // Elbow with two corners: out of "c", up the trunk, into "a".
+        assert_eq!(cells(&g.left), [Some("╭─► "), Some("│   "), Some("╰── ")]);
+        assert!(g.left.iter().flatten().all(|(_, c)| *c == REL_SIGNER));
+        assert!(g.right.iter().all(|c| c.is_none()));
+    }
+
+    #[test]
+    fn incoming_arrow_from_signer_above_points_down_into_selection() {
+        let rows = [Path::new("a"), Path::new("b"), Path::new("c")];
+        let rel = FileRelations { signed_by: Some(edge("a", false)), signs: vec![] };
+        let g = arrow_gutters(&rows, 2, &rel);
+        assert_eq!(cells(&g.left), [Some("╭── "), Some("│   "), Some("╰─► ")]);
+        // Unverified issuance renders red.
+        assert!(g.left.iter().flatten().all(|(_, c)| *c == REL_BROKEN));
+    }
+
+    #[test]
+    fn outgoing_arrows_share_a_trunk_and_branch_into_targets() {
+        let rows = [Path::new("a"), Path::new("b"), Path::new("c"), Path::new("d")];
+        let rel = FileRelations {
+            signed_by: None,
+            signs: vec![edge("a", true), edge("d", false)],
+        };
+        let g = arrow_gutters(&rows, 1, &rel);
+        assert!(g.left.iter().all(|c| c.is_none()));
+        // Selection "b" is the source; targets above ("a") and below ("d"),
+        // with "c" passed through by the trunk.
+        assert_eq!(
+            cells(&g.right),
+            [Some("◄──╮"), Some("───┤"), Some("   │"), Some("◄──╯")]
+        );
+        // Broken target's stub is red; the rest keep the "signs" color.
+        let colors: Vec<Color> = g.right.iter().flatten().map(|(_, c)| *c).collect();
+        assert_eq!(colors, [REL_SIGNS, REL_SIGNS, REL_SIGNS, REL_BROKEN]);
+    }
+
+    #[test]
+    fn all_broken_targets_turn_the_whole_trunk_red() {
+        let rows = [Path::new("a"), Path::new("b")];
+        let rel = FileRelations { signed_by: None, signs: vec![edge("b", false)] };
+        let g = arrow_gutters(&rows, 0, &rel);
+        assert_eq!(cells(&g.right), [Some("───╮"), Some("◄──╯")]);
+        assert!(g.right.iter().flatten().all(|(_, c)| *c == REL_BROKEN));
+    }
+
+    #[test]
+    fn edges_to_invisible_rows_are_skipped() {
+        let rows = [Path::new("a"), Path::new("b")];
+        let rel = FileRelations {
+            signed_by: Some(edge("hidden/x", true)),
+            signs: vec![edge("hidden/y", true)],
+        };
+        let g = arrow_gutters(&rows, 0, &rel);
+        assert!(g.left.iter().all(|c| c.is_none()));
+        assert!(g.right.iter().all(|c| c.is_none()));
+    }
 
     #[test]
     fn tag_layout_for_sequence() {

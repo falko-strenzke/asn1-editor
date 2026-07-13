@@ -24,11 +24,11 @@
 //! chosen over `ring` specifically because it is the more likely of the
 //! two to gain PQ verification support later.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use aws_lc_rs::signature;
 
-use crate::x509::{CaCandidate, Signable};
+use crate::x509::{self, CaCandidate, Signable, SignableFile};
 
 const SHA1_WITH_RSA: &[u64] = &[1, 2, 840, 113549, 1, 1, 5];
 const SHA256_WITH_RSA: &[u64] = &[1, 2, 840, 113549, 1, 1, 11];
@@ -109,6 +109,61 @@ pub fn verify_against(index: &[CaCandidate], signable: &Signable) -> SignatureSt
     }
 }
 
+/// One cryptographic relation between the selected file and another file
+/// in the browser's scanned tree.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RelationEdge {
+    /// Path of the other file (the signer, for an incoming edge; the
+    /// signed object, for an outgoing edge).
+    pub other: PathBuf,
+    /// True when the signature cryptographically verifies; false when the
+    /// issuance is only *claimed* (an issuer is present but its signature
+    /// does not verify) — rendered in red.
+    pub verified: bool,
+}
+
+/// The cryptographic relations of one selected file to the others in the
+/// scanned tree: who signed it (incoming) and what it signed (outgoing).
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct FileRelations {
+    /// The file whose signature covers the selected file, if that signer
+    /// is present in the tree. A self-signed object has no incoming edge
+    /// (the signer is itself — no separate file to point from).
+    pub signed_by: Option<RelationEdge>,
+    /// The files the selected file signed (only non-empty when the
+    /// selected file is a CA certificate present as an issuer in the tree).
+    pub signs: Vec<RelationEdge>,
+}
+
+/// Compute the signer/signed relations of `selected` against every other
+/// signed object in `signables`. Pure logic (no rendering): for each
+/// scanned file it resolves the single issuer `verify_against` would pick,
+/// then reads off the edges touching `selected`. Self-edges (a self-signed
+/// root pointing at itself) are omitted. `signs` order follows scan order
+/// and is therefore not guaranteed stable — callers that care should sort.
+pub fn relations_for(signables: &[SignableFile], selected: &Path) -> FileRelations {
+    let candidates = x509::cert_candidates(signables);
+    let mut relations = FileRelations::default();
+    for file in signables {
+        let (issuer_path, verified) = match verify_against(&candidates, &file.signable) {
+            SignatureStatus::Verified { issuer_path, .. } => (issuer_path, true),
+            SignatureStatus::Invalid { issuer_path, .. } => (issuer_path, false),
+            // No identifiable single issuer in the tree — no edge.
+            SignatureStatus::IssuerNotFound | SignatureStatus::UnsupportedAlgorithm(_) => continue,
+        };
+        if issuer_path == file.path {
+            continue; // self-signed: no arrow from a file to itself
+        }
+        if file.path == selected {
+            relations.signed_by = Some(RelationEdge { other: issuer_path.clone(), verified });
+        }
+        if issuer_path == selected {
+            relations.signs.push(RelationEdge { other: file.path.clone(), verified });
+        }
+    }
+    relations
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -129,6 +184,98 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
+    }
+
+    // ------------------------------------------------------------------
+    // Relation-graph logic over the committed testdata/chain hierarchy:
+    //   root_ca (self-signed)
+    //     ├── intermediate_ca
+    //     │     ├── server                 (valid leaf)
+    //     │     ├── server_bad_signature   (leaf, signature corrupted)
+    //     │     └── intermediate_crl
+    //     └── root_crl
+    // These need no openssl — the files are part of the repo.
+    // ------------------------------------------------------------------
+
+    fn chain_relations(file: &str) -> FileRelations {
+        let dir = Path::new("testdata/chain");
+        let signables = x509::scan_dir_signables(dir);
+        relations_for(&signables, &dir.join(file))
+    }
+
+    fn signer(rel: &FileRelations) -> Option<(String, bool)> {
+        rel.signed_by
+            .as_ref()
+            .map(|e| (e.other.file_name().unwrap().to_string_lossy().into_owned(), e.verified))
+    }
+
+    fn signs(rel: &FileRelations) -> std::collections::BTreeMap<String, bool> {
+        rel.signs
+            .iter()
+            .map(|e| (e.other.file_name().unwrap().to_string_lossy().into_owned(), e.verified))
+            .collect()
+    }
+
+    #[test]
+    fn valid_leaf_points_back_to_its_intermediate() {
+        let rel = chain_relations("server.der");
+        assert_eq!(signer(&rel), Some(("intermediate_ca.der".to_string(), true)));
+        assert!(rel.signs.is_empty());
+    }
+
+    #[test]
+    fn broken_leaf_shows_claimed_issuer_as_unverified() {
+        let rel = chain_relations("server_bad_signature.der");
+        // Issuer is still identified (AKI/DN match), but marked unverified.
+        assert_eq!(signer(&rel), Some(("intermediate_ca.der".to_string(), false)));
+        assert!(rel.signs.is_empty());
+    }
+
+    #[test]
+    fn intermediate_is_signed_by_root_and_signs_its_children() {
+        let rel = chain_relations("intermediate_ca.der");
+        assert_eq!(signer(&rel), Some(("root_ca.der".to_string(), true)));
+        let signed = signs(&rel);
+        assert_eq!(
+            signed,
+            std::collections::BTreeMap::from([
+                ("server.der".to_string(), true),
+                ("server_bad_signature.der".to_string(), false),
+                ("intermediate_crl.der".to_string(), true),
+            ])
+        );
+        // The intermediate does not point back at its own issuer or itself.
+        assert!(!signed.contains_key("root_ca.der"));
+        assert!(!signed.contains_key("intermediate_ca.der"));
+    }
+
+    #[test]
+    fn self_signed_root_has_no_incoming_edge_but_signs_children() {
+        let rel = chain_relations("root_ca.der");
+        assert_eq!(signer(&rel), None, "a self-signed root has no separate signer");
+        let signed = signs(&rel);
+        assert_eq!(
+            signed,
+            std::collections::BTreeMap::from([
+                ("intermediate_ca.der".to_string(), true),
+                ("root_crl.der".to_string(), true),
+            ])
+        );
+        assert!(!signed.contains_key("root_ca.der"), "no self-edge");
+    }
+
+    #[test]
+    fn crls_are_signed_by_their_issuing_ca() {
+        assert_eq!(
+            signer(&chain_relations("root_crl.der")),
+            Some(("root_ca.der".to_string(), true))
+        );
+        assert!(chain_relations("root_crl.der").signs.is_empty());
+        assert_eq!(
+            signer(&chain_relations("intermediate_crl.der")),
+            Some(("intermediate_ca.der".to_string(), true))
+        );
+        assert!(chain_relations("intermediate_crl.der").signs.is_empty());
     }
 
     fn openssl_available() -> bool {

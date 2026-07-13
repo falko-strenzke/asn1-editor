@@ -335,18 +335,54 @@ fn find_attr(rdn_sequence: &Node, oid: &[u64]) -> Option<String> {
     None
 }
 
-/// Recursively scan `root` for files that parse as a Certificate,
-/// collecting them as candidate issuers. Symlinks (to files or
-/// directories) are not followed, which also rules out symlink cycles.
-/// Most files in a directory are not certs; parse failures and files that
-/// don't structurally match are silently skipped, not errors.
-pub fn scan_dir(root: &Path) -> Vec<CaCandidate> {
+/// A signed object (Certificate or CRL) found while scanning a directory,
+/// paired with the file it came from. This is the raw material for both
+/// the candidate-issuer index and the cross-file relation graph
+/// (`verify::relations_for`).
+pub struct SignableFile {
+    pub path: PathBuf,
+    pub signable: Signable,
+}
+
+/// Recursively scan `root` for files that decode as a signed object
+/// (Certificate or CRL). Symlinks (to files or directories) are not
+/// followed, which also rules out symlink cycles. Most files in a
+/// directory are neither; parse failures and files that don't
+/// structurally match are silently skipped, not errors.
+pub fn scan_dir_signables(root: &Path) -> Vec<SignableFile> {
     let mut out = Vec::new();
     scan_dir_rec(root, 0, &mut out);
     out
 }
 
-fn scan_dir_rec(dir: &Path, depth: usize, out: &mut Vec<CaCandidate>) {
+/// The subset of scanned files that are Certificates, as candidate
+/// issuers for signature verification (only certs can sign; CRLs cannot).
+pub fn cert_candidates(files: &[SignableFile]) -> Vec<CaCandidate> {
+    files.iter().filter_map(candidate_from).collect()
+}
+
+/// Convenience wrapper: scan `root` and keep only the certificate
+/// candidates. Equivalent to `cert_candidates(&scan_dir_signables(root))`.
+pub fn scan_dir(root: &Path) -> Vec<CaCandidate> {
+    cert_candidates(&scan_dir_signables(root))
+}
+
+fn candidate_from(file: &SignableFile) -> Option<CaCandidate> {
+    let s = &file.signable;
+    if s.kind != Kind::Certificate {
+        return None;
+    }
+    Some(CaCandidate {
+        path: file.path.clone(),
+        subject: s.subject.clone()?,
+        subject_summary: s.subject_summary.clone().unwrap_or_default(),
+        ski: s.ski.clone(),
+        pubkey_alg: s.pubkey_alg.clone()?,
+        pubkey: s.pubkey.clone()?,
+    })
+}
+
+fn scan_dir_rec(dir: &Path, depth: usize, out: &mut Vec<SignableFile>) {
     if depth > MAX_SCAN_DEPTH {
         return;
     }
@@ -357,14 +393,14 @@ fn scan_dir_rec(dir: &Path, depth: usize, out: &mut Vec<CaCandidate>) {
         if file_type.is_dir() {
             scan_dir_rec(&path, depth + 1, out);
         } else if file_type.is_file() {
-            if let Some(candidate) = scan_file(&path) {
-                out.push(candidate);
+            if let Some(file) = scan_file(&path) {
+                out.push(file);
             }
         }
     }
 }
 
-fn scan_file(path: &Path) -> Option<CaCandidate> {
+fn scan_file(path: &Path) -> Option<SignableFile> {
     let meta = std::fs::metadata(path).ok()?;
     if meta.len() > MAX_SCAN_FILE_SIZE {
         return None;
@@ -373,17 +409,7 @@ fn scan_file(path: &Path) -> Option<CaCandidate> {
     let (der, _container) = input::load(&raw).ok()?;
     let roots = ber::parse_forest(&der, 0).ok()?;
     let signable = parse_signable(&roots, &der)?;
-    if signable.kind != Kind::Certificate {
-        return None;
-    }
-    Some(CaCandidate {
-        path: path.to_path_buf(),
-        subject: signable.subject?,
-        subject_summary: signable.subject_summary.unwrap_or_default(),
-        ski: signable.ski,
-        pubkey_alg: signable.pubkey_alg?,
-        pubkey: signable.pubkey?,
-    })
+    Some(SignableFile { path: path.to_path_buf(), signable })
 }
 
 #[cfg(test)]
@@ -460,5 +486,18 @@ mod tests {
         std::fs::write(dir.join("big.der"), vec![0u8; (MAX_SCAN_FILE_SIZE + 1) as usize]).unwrap();
         assert!(scan_dir(&dir).is_empty());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn scan_dir_signables_includes_crls_but_candidates_are_certs_only() {
+        // The bundled chain/ folder: 4 certs (root, intermediate, server,
+        // server_bad_signature) + 2 CRLs (root, intermediate).
+        let signables = scan_dir_signables(Path::new("testdata/chain"));
+        assert_eq!(signables.len(), 6);
+        assert_eq!(signables.iter().filter(|s| s.signable.kind == Kind::Crl).count(), 2);
+        // Only the certificates become candidate issuers.
+        let candidates = cert_candidates(&signables);
+        assert_eq!(candidates.len(), 4);
+        assert!(candidates.iter().all(|c| !c.pubkey.is_empty()));
     }
 }

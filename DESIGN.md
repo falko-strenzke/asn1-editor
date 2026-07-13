@@ -465,6 +465,59 @@ are always tiny; this keeps scanning e.g. a `target/` or `.git/`
 directory cheap) — non-signable and unparseable files are silently
 skipped, not errors.
 
+### Cross-file relation graph (file browser)
+
+The same scan also drives a graphical view, in the file browser, of how
+the selected file relates cryptographically to the others. `scan_dir_signables`
+returns every signed object found (certs *and* CRLs, unlike the
+cert-only candidate index, which is derived from it via `cert_candidates`);
+`verify::relations_for(signables, selected)` then resolves, for each
+scanned file, the single issuer `verify_against` would pick, and reads off
+the two kinds of edge touching `selected`:
+
+* `signed_by` (incoming) — the one file whose signature covers `selected`;
+* `signs` (outgoing) — every file `selected` is the issuer of.
+
+Each `RelationEdge` carries a `verified` flag: true when the signature
+cryptographically checks out, false when the issuance is only *claimed*
+(the issuer is present but its signature does not verify). Self-edges (a
+self-signed root pointing at itself) are omitted — there is no second file
+to draw an arrow to. The logic is pure and unit-tested against the bundled
+`testdata/chain/` hierarchy; rendering is separate and untested.
+
+In the browser pane, the arrows are drawn as routed elbow connectors that
+really travel from source row to destination row — a horizontal stub out
+of the source, a vertical trunk, and a horizontal stub with an arrowhead
+into the destination (two 90° turns, rounded corners):
+
+```
+╭─►   • intermediate_ca ───╮     incoming (cyan): root_ca signed the
+│       intermediate_crl◄──┤       selection, arrowhead entering it on
+╰──     root_ca.der        │       the left
+        root_crl.der       │     outgoing (magenta): objects the selection
+        server.der      ◄──┤       signed, drawn to the right of the
+        server_bad_si…  ◄──╯       names, sharing one trunk with ┤/╯
+                                   branches (the last one red: claimed
+                                   but cryptographically broken)
+```
+
+**The incoming "signed by" edge is drawn to the left of the file names**
+(cyan), **outgoing "signs" edges to the right** (magenta), with names
+padded — and truncated with `…` if need be — so the shared right-hand
+trunk stays aligned inside the pane. A claimed-but-unverified edge is
+**red** (currently only reachable via a cryptographic signature failure —
+e.g. `testdata/chain/server_bad_signature.der`); when *every* drawn
+outgoing edge is broken the whole trunk turns red, otherwise only the
+broken targets' stubs do. The gutters take up columns only while there is
+an arrow to draw. Routing (corner/junction/color selection per row) lives
+in `tui::arrow_gutters`, a pure function unit-tested separately from any
+rendering; edges to rows hidden inside collapsed directories are skipped.
+A short colored legend sits on the pane's bottom border. Relations are
+recomputed whenever the browser selection moves; like the candidate index,
+they are a startup snapshot of on-disk state and are not refreshed when the
+open document is edited (that live feedback is the content-pane `Signature`
+line, above).
+
 ## 10. Input containers
 
 `input::load` detects, in order: PEM (`-----BEGIN <label>-----`, first
@@ -503,7 +556,11 @@ Built with ratatui 0.29 (bundled crossterm backend, `ratatui::init()` /
   confirmation, same two-step pattern as delete); on a directory it
   folds/unfolds. Started with a directory and no file picked yet, `save`
   and insert are refused with a status message — there is nothing to
-  write to.
+  write to. Colored elbow arrows show the selected file's cryptographic
+  relations to the other visible files (§9), routed from source row to
+  destination row: the signer's arrow enters the selection from the left
+  (cyan), arrows to the objects the selection signed leave it to the right
+  (magenta), red = claimed issuance whose signature does not verify.
 * **Middle pane — tree.** One row per visible node: fold marker (`▸`/`▾`),
   indentation by depth, type name (colored by tag class; bold when
   constructed/encapsulating) and a short decoded value preview.

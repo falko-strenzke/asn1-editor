@@ -23,8 +23,8 @@ use crate::ber::{self, Class, Node};
 use crate::browser::FileBrowser;
 use crate::input::{self, Container};
 use crate::spec::{self, Identification, Label, SpecDb};
-use crate::verify::{self, SignatureStatus};
-use crate::x509::{self, CaCandidate};
+use crate::verify::{self, FileRelations, SignatureStatus};
+use crate::x509::{self, CaCandidate, SignableFile};
 
 /// Bytes per line in the hex editor; the cursor moves in units of hex digits.
 pub const EDIT_BYTES_PER_LINE: usize = 16;
@@ -642,6 +642,15 @@ pub struct App {
     /// Signature verification result for the currently open document, if
     /// it structurally decodes as a Certificate or CRL.
     pub sig_status: Option<SignatureStatus>,
+    /// All signed objects (certs + CRLs) found in the browser tree on
+    /// startup — the source for both `ca_index` and the browser relation
+    /// graph. Static snapshot of the on-disk state.
+    pub signables: Vec<SignableFile>,
+    /// Cryptographic relations of the currently selected browser file to
+    /// the others (who signed it / what it signs). Recomputed whenever the
+    /// browser selection changes; empty when a directory or nothing is
+    /// selected.
+    pub browser_relations: FileRelations,
 }
 
 impl App {
@@ -655,7 +664,8 @@ impl App {
         let dir = path.parent().map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
         let mut browser = FileBrowser::new(dir.clone());
         browser.reveal(&path);
-        let ca_index = x509::scan_dir(&dir);
+        let signables = x509::scan_dir_signables(&dir);
+        let ca_index = x509::cert_candidates(&signables);
         let mut app = App {
             path,
             out_path,
@@ -679,9 +689,12 @@ impl App {
             open_confirm: false,
             ca_index,
             sig_status: None,
+            signables,
+            browser_relations: FileRelations::default(),
         };
         app.rebuild_rows();
         app.recompute_sig_status();
+        app.recompute_browser_relations();
         app
     }
 
@@ -689,7 +702,8 @@ impl App {
     /// directory and no document is loaded until one is picked (Enter).
     pub fn new_dir(dir: PathBuf) -> Self {
         let browser = FileBrowser::new(dir.clone());
-        let ca_index = x509::scan_dir(&dir);
+        let signables = x509::scan_dir_signables(&dir);
+        let ca_index = x509::cert_candidates(&signables);
         let mut app = App {
             path: dir.clone(),
             out_path: dir,
@@ -713,9 +727,22 @@ impl App {
             open_confirm: false,
             ca_index,
             sig_status: None,
+            signables,
+            browser_relations: FileRelations::default(),
         };
         app.rebuild_rows();
+        app.recompute_browser_relations();
         app
+    }
+
+    /// Recompute the selected browser file's cryptographic relations to
+    /// the rest of the scanned tree. Called whenever the browser selection
+    /// changes. A directory (or an empty browser) has no relations.
+    pub fn recompute_browser_relations(&mut self) {
+        self.browser_relations = match self.browser.selected_entry() {
+            Some(entry) if !entry.is_dir => verify::relations_for(&self.signables, &entry.path),
+            _ => FileRelations::default(),
+        };
     }
 
     /// Toggle keyboard focus between the file browser and the document
