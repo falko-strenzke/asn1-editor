@@ -1,0 +1,77 @@
+name: Build Linux AppImage
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  TARGET: x86_64-unknown-linux-gnu
+
+jobs:
+  appimage:
+    name: AppImage (x86-64)
+    runs-on: ubuntu-22.04
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v6
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ env.TARGET }}
+
+      - name: Build and test
+        run: |
+          cargo test --locked --target "$TARGET"
+          cargo build --locked --release --target "$TARGET"
+
+      - name: Assemble AppDir
+        run: |
+          APPDIR="$RUNNER_TEMP/asn1-editor.AppDir"
+          install -Dm755 "target/$TARGET/release/asn1-editor" "$APPDIR/usr/bin/asn1-editor"
+          install -Dm755 packaging/appimage/AppRun "$APPDIR/AppRun"
+          install -Dm644 packaging/appimage/asn1-editor.desktop "$APPDIR/asn1-editor.desktop"
+          install -Dm644 packaging/appimage/asn1-editor.svg "$APPDIR/asn1-editor.svg"
+          ln -s asn1-editor.svg "$APPDIR/.DirIcon"
+          mkdir -p "$APPDIR/usr/share/asn1-editor/specs"
+          cp -a specs/asn1 "$APPDIR/usr/share/asn1-editor/specs/"
+
+      - name: Build AppImage
+        id: package
+        env:
+          APPIMAGETOOL_URL: https://github.com/AppImage/appimagetool/releases/download/continuous/appimagetool-x86_64.AppImage
+          RUNTIME_URL: https://github.com/AppImage/type2-runtime/releases/download/continuous/runtime-x86_64
+        run: |
+          APPIMAGETOOL="$RUNNER_TEMP/appimagetool-x86_64.AppImage"
+          RUNTIME="$RUNNER_TEMP/runtime-x86_64"
+          curl --fail --location --retry 3 --output "$APPIMAGETOOL" "$APPIMAGETOOL_URL"
+          curl --fail --location --retry 3 --output "$RUNTIME" "$RUNTIME_URL"
+          chmod +x "$APPIMAGETOOL"
+
+          VERSION="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')"
+          OUTPUT="asn1-editor-${VERSION}-x86_64.AppImage"
+          ARCH=x86_64 APPIMAGE_EXTRACT_AND_RUN=1 \
+            "$APPIMAGETOOL" --runtime-file "$RUNTIME" \
+            "$RUNNER_TEMP/asn1-editor.AppDir" "$OUTPUT"
+          echo "path=$OUTPUT" >> "$GITHUB_OUTPUT"
+
+      - name: Smoke-test AppImage
+        env:
+          APPIMAGE_EXTRACT_AND_RUN: '1'
+        run: './${{ steps.package.outputs.path }} --dump testdata/cert_rsa.der > /dev/null'
+
+      - name: Upload AppImage
+        uses: actions/upload-artifact@v6
+        with:
+          name: asn1-editor-linux-x86_64
+          path: ${{ steps.package.outputs.path }}
+          if-no-files-found: error
+          compression-level: 0

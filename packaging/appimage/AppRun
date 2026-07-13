@@ -1,0 +1,8 @@
+#!/bin/sh
+set -eu
+
+APPDIR="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd)"
+export ASN1_EDITOR_SPECS="$APPDIR/usr/share/asn1-editor/specs/asn1"
+
+exec "$APPDIR/usr/bin/asn1-editor" "$@"
+

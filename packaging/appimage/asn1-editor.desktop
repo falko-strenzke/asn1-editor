@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=ASN.1 Editor
+Comment=View and edit ASN.1 BER and DER files
+Exec=asn1-editor
+Icon=asn1-editor
+Terminal=true
+Categories=Utility;
