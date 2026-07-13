@@ -29,8 +29,9 @@ Goals:
 
 * Identify well-known structures by matching against ASN.1 specification
   modules in `specs/asn1/` (bundled: RFC 5280 → X.509 certificates and
-  CRLs, RFC 5208 → PKCS#8 private keys) and annotate the tree with the
-  spec's field and type names (§8).
+  CRLs, RFC 5208 → PKCS#8 private keys, RFC 5958 → asymmetric key
+  packages, RFC 5915 → SEC1 EC private keys) and annotate the tree with
+  the spec's field and type names (§8).
 
 Non-goals (see §14):
 
@@ -80,7 +81,8 @@ tests/
                       plus a parse→encode round-trip test over testdata/
   spec_rfc5280.rs     spec parsing + identification of the DER test files
 specs/asn1/  ASN.1 specification modules (rfc5280: certificates + CRLs;
-             rfc5208: PKCS#8 private keys)
+             rfc5208: PKCS#8 private keys; rfc5958: asymmetric key packages;
+             rfc5915: SEC1 EC private keys)
 testdata/  DER samples (EC cert, RSA cert, SEC1 EC key, PKCS#8 key,
            PKCS#7, CRL)
   chain/   a 3-level ECDSA P-256 hierarchy (root CA -> intermediate CA ->
@@ -320,21 +322,37 @@ the names from their ASN.1 definition.
 contains the two modules of RFC 5280 Appendix A (PKIX1Explicit88 and
 PKIX1Implicit88), extracted verbatim from the RFC text (de-paginated,
 otherwise unmodified). `specs/asn1/rfc5208` contains the PKCS#8 module
-(RFC 5208 Appendix A → `PrivateKeyInfo`), with one documented adaptation:
-the `{{…}}` information-object-set parameters on `AlgorithmIdentifier` are
-dropped, since this subset parser does not implement information object
-classes and they do not affect the DER structure being matched. Its
-`AlgorithmIdentifier` is left as an (import) reference, resolved across
-modules against the RFC 5280 definition loaded from the same directory —
-exercising the cross-module reference resolution described below.
+(RFC 5208 Appendix A → `PrivateKeyInfo`) and `specs/asn1/rfc5958` the
+asymmetric-key-package module that obsoletes it (RFC 5958 Appendix A →
+`OneAsymmetricKey`, which is `PrivateKeyInfo` plus an optional `[1]
+publicKey` field present in version v2). Both carry documented
+adaptations for this subset parser: the `{{…}}` / `{ … }` information-
+object-set parameters on `AlgorithmIdentifier` (and, for RFC 5958, the
+`[[2: … ]]` version-bracket around `publicKey`) are dropped — none affect
+the DER structure being matched. Their `AlgorithmIdentifier` is left as an
+(import) reference, resolved across modules against the RFC 5280
+definition loaded from the same directory — exercising the cross-module
+reference resolution described below.
+
+`specs/asn1/rfc5915` contains the SEC1 EC private-key structure (RFC 5915
+Section 3 → `ECPrivateKey` — the "EC PRIVATE KEY" PEM, distinct from the
+PKCS#8 wrapping). RFC 5915 gives the type inline rather than as a wrapped
+module, so it is wrapped here in a `DEFINITIONS EXPLICIT TAGS` module (the
+DER uses constructed `[0]`/`[1]` tags); its `{{NamedCurve}}` parameter is
+dropped and the referenced `ECParameters` (from RFC 5480) is reproduced
+with just its `namedCurve` alternative.
 
 Additional files dropped into the directory are parsed automatically;
 parse failures are reported as warnings and the file is skipped. Files are
 loaded in sorted filename order and the *first* definition of a type name
 wins (so `rfc5208`, which sorts before `rfc5280`, must not redefine any
-shared type — it doesn't; it only references `AlgorithmIdentifier`). The
-directory is located via `$ASN1_EDITOR_SPECS`, then `./specs/asn1`, then
-`specs/asn1` next to an ancestor of the executable.
+shared type — it doesn't; it only references `AlgorithmIdentifier`, and
+`rfc5958` likewise only adds `OneAsymmetricKey`/`PublicKey`). Which of two
+equally-good *matches* wins is a separate, source-ordered rule (§ below):
+that is how the newer RFC 5958 interpretation is preferred over RFC 5208
+for a document both describe. The directory is located via
+`$ASN1_EDITOR_SPECS`, then `./specs/asn1`, then `specs/asn1` next to an
+ancestor of the executable.
 
 ### The specification parser
 
@@ -383,9 +401,19 @@ Every successful (sub-)match records a label `(field name, type name)`
 for the node's path; choices append the alternative name (e.g.
 `Time.utcTime`). The candidate whose match labels the **most nodes**
 wins; matches labeling fewer than two nodes (e.g. a bare `ANY`) are
-discarded as noise. With the bundled modules loaded, X.509 certificates
-identify as `Certificate`, CRLs as `CertificateList`, and PKCS#8 keys as
-`PrivateKeyInfo`.
+discarded as noise. **Ties in node count are broken in favor of the
+lexicographically greater `source`** (spec filename). Since bundled
+modules are named by RFC number, this makes a newer RFC supersede an
+older one it obsoletes when a document matches both: an RFC 5208
+`PrivateKeyInfo` and the RFC 5958 `OneAsymmetricKey` that replaces it
+match a v1 PKCS#8 key identically, and `rfc5958` (> `rfc5208`) is
+preferred, so the key is reported as `OneAsymmetricKey`. (A v2 key, whose
+`[1] publicKey` field only `OneAsymmetricKey` defines, matches only RFC
+5958 outright — no tie to break.) Within one source, ties keep the first-
+defined type. With the bundled modules loaded, X.509 certificates
+identify as `Certificate`, CRLs as `CertificateList`, PKCS#8 /
+asymmetric-key private keys as `OneAsymmetricKey`, and SEC1 EC private
+keys as `ECPrivateKey`.
 
 The identification is recomputed after every edit, so a document can gain
 or lose its labels as edits make it conform or not conform to a spec.

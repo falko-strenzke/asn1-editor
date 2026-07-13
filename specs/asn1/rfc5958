@@ -1,0 +1,65 @@
+-- ASN.1 module from RFC 5958 (August 2010), "Asymmetric Key Packages",
+-- Appendix A, which updates and obsoletes the PKCS#8 private-key syntax of
+-- RFC 5208. OneAsymmetricKey is PrivateKeyInfo with an added optional
+-- public-key field (present only in version v2); RFC 5958 also defines
+-- PrivateKeyInfo as an alias of OneAsymmetricKey for backward
+-- compatibility.
+-- Source: https://www.rfc-editor.org/rfc/rfc5958.txt
+--
+-- Adapted for this tool's ASN.1 subset parser, which implements neither
+-- information object classes nor the version-bracket / extension-marker
+-- syntax:
+--   * AlgorithmIdentifier's "{ PUBLIC-KEY, {PrivateKeyAlgorithms} }" and
+--     Attribute's "{ { OneAsymmetricKeyAttributes } }" parameter lists are
+--     dropped (they do not affect the DER structure being matched);
+--   * the "[[2: publicKey [1] PublicKey OPTIONAL ]]" version-2 extension
+--     group is written as a plain optional "publicKey [1] PublicKey
+--     OPTIONAL" field (the module's IMPLICIT TAGS default applies);
+--   * the backward-compatibility "PrivateKeyInfo ::= OneAsymmetricKey"
+--     alias is omitted, since the bundled RFC 5208 module already supplies
+--     the PrivateKeyInfo name (see specs/asn1/rfc5208).
+-- AlgorithmIdentifier and Attribute are imported; AlgorithmIdentifier
+-- resolves against the RFC 5280 module bundled alongside this file.
+
+AsymmetricKeyPackageModuleV1
+  { iso(1) member-body(2) us(840) rsadsi(113549) pkcs(1) pkcs9(9)
+    smime(16) modules(0) asymmetricKeyPkgV1(50) }
+
+DEFINITIONS IMPLICIT TAGS ::=
+
+BEGIN
+
+-- EXPORTS ALL
+
+IMPORTS
+
+AlgorithmIdentifier
+    FROM PKIX1Explicit-2009
+      { iso(1) identified-organization(3) dod(6) internet(1) security(5)
+        mechanisms(5) pkix(7) id-mod(0) id-mod-pkix1-explicit-02(51) }
+
+Attribute
+    FROM PKIX-CommonTypes-2009
+      { iso(1) identified-organization(3) dod(6) internet(1) security(5)
+        mechanisms(5) pkix(7) id-mod(0) id-mod-pkixCommon-02(57) } ;
+
+OneAsymmetricKey ::= SEQUENCE {
+    version                   Version,
+    privateKeyAlgorithm       PrivateKeyAlgorithmIdentifier,
+    privateKey                PrivateKey,
+    attributes            [0] Attributes OPTIONAL,
+    ...,
+    publicKey             [1] PublicKey OPTIONAL,
+    ... }
+
+Version ::= INTEGER { v1(0), v2(1) } (v1, ..., v2)
+
+PrivateKeyAlgorithmIdentifier ::= AlgorithmIdentifier
+
+PrivateKey ::= OCTET STRING
+
+PublicKey ::= BIT STRING
+
+Attributes ::= SET OF Attribute
+
+END

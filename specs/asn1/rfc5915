@@ -1,0 +1,34 @@
+-- ASN.1 for the elliptic-curve private-key structure of RFC 5915 (June
+-- 2010), "Elliptic Curve Private Key Structure", Section 3 — the SEC1 EC
+-- private key ("EC PRIVATE KEY" PEM), distinct from the PKCS#8 wrapping.
+-- Source: https://www.rfc-editor.org/rfc/rfc5915.txt
+--
+-- RFC 5915 gives the ECPrivateKey type inline rather than as a wrapped
+-- ASN.1 module, so it is wrapped here in a DEFINITIONS ... BEGIN ... END
+-- module with EXPLICIT TAGS (the DER uses constructed [0]/[1] tags, i.e.
+-- explicit tagging). Adaptations for this tool's subset parser, which does
+-- not implement information object classes:
+--   * the "{{ NamedCurve }}" parameter on ECParameters is dropped, and
+--   * ECParameters (imported from RFC 5480 in the original) is reproduced
+--     here with just its namedCurve alternative — implicitCurve and
+--     specifiedCurve are omitted.
+-- Neither affects the DER structure being matched.
+
+RFC5915 DEFINITIONS EXPLICIT TAGS ::=
+
+BEGIN
+
+ECPrivateKey ::= SEQUENCE {
+    version        INTEGER { ecPrivkeyVer1(1) } (ecPrivkeyVer1),
+    privateKey     OCTET STRING,
+    parameters [0] ECParameters OPTIONAL,
+    publicKey  [1] BIT STRING OPTIONAL
+}
+
+-- From RFC 5480 (imported by RFC 5915); only the namedCurve alternative
+-- is reproduced, so the parameters field labels precisely.
+ECParameters ::= CHOICE {
+    namedCurve     OBJECT IDENTIFIER
+}
+
+END

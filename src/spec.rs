@@ -592,6 +592,14 @@ struct Ctx {
 
 /// Try to identify the document (a single top-level element) against every
 /// type in the database; the match that labels the most nodes wins.
+///
+/// Ties in node count are broken in favor of the lexicographically greater
+/// `source` (spec filename). Bundled modules are named by RFC number, so
+/// this makes a newer RFC supersede an older one it obsoletes when a
+/// document matches both — e.g. an RFC 5208 PKCS#8 `PrivateKeyInfo` and
+/// the RFC 5958 `OneAsymmetricKey` that replaces it match the same v1 key
+/// identically, and `rfc5958` (> `rfc5208`) is preferred. Within one
+/// source, ties keep the first-defined type (stable file order).
 pub fn identify(db: &SpecDb, roots: &[Node]) -> Option<Identification> {
     if roots.len() != 1 {
         return None;
@@ -607,7 +615,11 @@ pub fn identify(db: &SpecDb, roots: &[Node]) -> Option<Identification> {
             if score < 2 {
                 continue;
             }
-            if best.as_ref().is_none_or(|(s, _)| score > *s) {
+            let better = match &best {
+                None => true,
+                Some((s, id)) => score > *s || (score == *s && def.source > id.source),
+            };
+            if better {
                 best = Some((
                     score,
                     Identification {
