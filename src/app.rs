@@ -15,6 +15,7 @@
 //! Application state: the parsed tree, the flattened visible rows, the
 //! selection, and the hex edit workflow.
 
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use ratatui::widgets::ListState;
@@ -22,11 +23,12 @@ use ratatui::widgets::ListState;
 use crate::ber::{self, Class, Node};
 use crate::browser::FileBrowser;
 use crate::input::{self, Container};
+use crate::pathval::{self, PathStatus};
 use crate::pkcs12;
 use crate::pkcs8;
 use crate::spec::{self, Identification, Label, SpecDb};
 use crate::verify::{self, FileRelations, SignatureStatus};
-use crate::x509::{self, CaCandidate, Signable, SignableFile};
+use crate::x509::{self, CaCandidate, Kind, Signable, SignableFile};
 
 /// Bytes per line in the hex editor; the cursor moves in units of hex digits.
 pub const EDIT_BYTES_PER_LINE: usize = 16;
@@ -780,6 +782,13 @@ pub struct App {
     /// Signature verification result for the currently open document, if
     /// it structurally decodes as a Certificate or CRL.
     pub sig_status: Option<SignatureStatus>,
+    /// Certificate files the user has marked trusted (`t`) — the trust
+    /// anchors for OpenSSL certification-path validation.
+    pub trusted_certs: BTreeSet<PathBuf>,
+    /// OpenSSL certification-path validation result for the currently open
+    /// document, if it is a certificate. Recomputed on selection and whenever
+    /// the trust set changes.
+    pub path_status: Option<PathStatus>,
     /// All signed objects (certs + CRLs) found in the browser tree on
     /// startup — the source for both `ca_index` and the browser relation
     /// graph. Static snapshot of the on-disk state.
@@ -848,6 +857,8 @@ impl App {
             open_confirm: false,
             ca_index,
             sig_status: None,
+            trusted_certs: BTreeSet::new(),
+            path_status: None,
             signables,
             browser_relations: FileRelations::default(),
             key_files,
@@ -891,6 +902,8 @@ impl App {
             open_confirm: false,
             ca_index,
             sig_status: None,
+            trusted_certs: BTreeSet::new(),
+            path_status: None,
             signables,
             browser_relations: FileRelations::default(),
             key_files,
@@ -1332,7 +1345,76 @@ impl App {
 
         self.sig_status = own_signable.map(|s| verify::verify_against(&self.ca_index, &s));
         self.refresh_own_key_file();
+        self.recompute_path_status();
         self.recompute_browser_relations();
+    }
+
+    /// Run OpenSSL certification-path validation for the open document when it
+    /// is a certificate: the trust anchors are the certificates the user
+    /// marked trusted (`trusted_certs`), and every other certificate in the
+    /// scanned tree is offered as an untrusted intermediate. The open
+    /// document's own live (possibly edited) content is used as the target and
+    /// wherever it also appears in the pool. `None` when no document is open
+    /// or it is not a certificate.
+    pub fn recompute_path_status(&mut self) {
+        let der = ber::encode_forest(&self.roots);
+        let is_cert = self.file_open
+            && x509::parse_signable(&self.roots, &der)
+                .map(|s| s.kind == Kind::Certificate)
+                .unwrap_or(false);
+        if !is_cert {
+            self.path_status = None;
+            return;
+        }
+        let mut trusted = Vec::new();
+        let mut untrusted = Vec::new();
+        for file in &self.signables {
+            if file.signable.kind != Kind::Certificate {
+                continue;
+            }
+            // Prefer the live content for the open document; read the rest.
+            let cert_der = if file.path == self.path {
+                der.clone()
+            } else {
+                match read_cert_der(&file.path) {
+                    Some(bytes) => bytes,
+                    None => continue,
+                }
+            };
+            if self.trusted_certs.contains(&file.path) {
+                trusted.push(cert_der);
+            } else {
+                untrusted.push(cert_der);
+            }
+        }
+        self.path_status = Some(pathval::validate(&der, &trusted, &untrusted));
+    }
+
+    /// `t`: toggle whether the certificate selected in the browser is a trust
+    /// anchor for path validation, then re-validate the open document.
+    pub fn toggle_trust(&mut self) {
+        let Some(entry) = self.browser.selected_entry() else { return };
+        if entry.is_dir {
+            self.status = "only a certificate can be marked trusted".to_string();
+            return;
+        }
+        let path = entry.path.clone();
+        let name = entry.name.clone();
+        let is_cert = self
+            .signables
+            .iter()
+            .any(|f| f.path == path && f.signable.kind == Kind::Certificate);
+        if !is_cert {
+            self.status = format!("{} is not a certificate — cannot mark it trusted", name);
+            return;
+        }
+        if self.trusted_certs.remove(&path) {
+            self.status = format!("{} is no longer trusted", name);
+        } else {
+            self.trusted_certs.insert(path);
+            self.status = format!("{} marked as trusted", name);
+        }
+        self.recompute_path_status();
     }
 
     /// Refresh this file's own entry in `key_files` from its live (possibly
@@ -2459,6 +2541,13 @@ fn read_plaintext_key_pkcs8(path: &Path) -> Option<Vec<u8>> {
     x509::to_pkcs8_der(&roots)
 }
 
+/// Read a certificate file and return its raw DER (unwrapping a PEM/base64/hex
+/// container). `None` if it can't be read or decoded.
+fn read_cert_der(path: &Path) -> Option<Vec<u8>> {
+    let raw = std::fs::read(path).ok()?;
+    input::load(&raw).ok().map(|(der, _)| der)
+}
+
 /// The public-key identity of the private key in `roots`, but only if the key
 /// is cryptographically usable — its private scalar must be consistent with
 /// its public key. A structurally-valid but corrupted key returns `None`, so
@@ -3445,6 +3534,58 @@ mod tests {
             app.status
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- certification-path validation -----------------------------------
+
+    fn chain(name: &str) -> PathBuf {
+        Path::new("testdata/chain").join(name)
+    }
+
+    #[test]
+    fn path_validation_needs_a_trusted_anchor() {
+        // The leaf's issuers are all present but none is trusted yet.
+        let app = open_real_file(&chain("server.der"));
+        assert!(
+            matches!(app.path_status, Some(PathStatus::Invalid { .. })),
+            "{:?}",
+            app.path_status
+        );
+    }
+
+    #[test]
+    fn trusting_the_root_validates_a_leaf_certificate() {
+        let mut app = open_real_file(&chain("server.der"));
+        // Mark the root trusted (selected in the browser). The open leaf is
+        // then validated against it, with the intermediate as an untrusted
+        // candidate.
+        browser_select_by_name(&mut app, "root_ca.der");
+        app.toggle_trust();
+        assert!(app.trusted_certs.iter().any(|p| p.ends_with("root_ca.der")));
+        assert!(
+            matches!(app.path_status, Some(PathStatus::Valid { .. })),
+            "{:?}",
+            app.path_status
+        );
+        // Pressing 't' again removes the anchor and the path is invalid again.
+        app.toggle_trust();
+        assert!(app.trusted_certs.is_empty());
+        assert!(matches!(app.path_status, Some(PathStatus::Invalid { .. })));
+    }
+
+    #[test]
+    fn a_crl_cannot_be_marked_trusted() {
+        let mut app = open_real_file(&chain("server.der"));
+        browser_select_by_name(&mut app, "root_crl.der");
+        app.toggle_trust();
+        assert!(app.trusted_certs.is_empty(), "a CRL is not a certificate");
+        assert!(app.status.contains("not a certificate"), "{}", app.status);
+    }
+
+    #[test]
+    fn a_non_certificate_document_has_no_path_status() {
+        let app = open_real_file(std::path::Path::new("testdata/private_key_pkcs8.der"));
+        assert!(app.path_status.is_none());
     }
 
     #[test]

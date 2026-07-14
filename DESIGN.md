@@ -47,6 +47,10 @@ Goals:
 * Re-sign a modified certificate or CRL with its issuer's private key, when
   that key is available in the folder (as a plaintext key, or an encrypted
   key/PKCS#12 whose password was entered this session and retained) (§9c).
+* Validate a certificate's certification path with OpenSSL against a set of
+  trust anchors the user marks in the browser (`t`), using every other
+  certificate in the tree as an untrusted intermediate, and show the result
+  in the content pane (§9d).
 
 Non-goals (see §14):
 
@@ -93,6 +97,8 @@ src/
              key↔certificate links, and normalizes a key to PKCS#8 for signing
   verify.rs  signature verification and generation (uses aws-lc-rs) + the
              pure key↔cert link matcher + the claimed-issuer lookup
+  pathval.rs certification-path validation against user-chosen trust anchors
+             (uses the openssl crate — the one place OpenSSL is used)
   pkcs8.rs   structural decoding + password decryption/re-encryption of
              EncryptedPrivateKeyInfo (PBES2; uses aws-lc-rs). Exposes a
              reusable Pbes2 (PBKDF2 + AES-CBC) decryptor shared with pkcs12.rs
@@ -129,9 +135,11 @@ shared OID repository; `browser.rs` depends only on the standard library
 (structural decoding only, no crypto); `verify.rs` depends on `x509.rs` +
 `aws-lc-rs`; `pkcs8.rs` depends on `ber.rs` + `aws-lc-rs` and `pkcs12.rs`
 depends on `ber.rs` + `pkcs8.rs` (the two crypto-using decoders; `pkcs12.rs`
-does no crypto of its own — it reuses `pkcs8::Pbes2`); `app.rs` depends on
-all of the above; `tui.rs` renders `app.rs` and resolves OID display names
-through `oid.rs`. External dependencies: `ratatui`, `aws-lc-rs`.
+does no crypto of its own — it reuses `pkcs8::Pbes2`); `pathval.rs` depends
+on the `openssl` crate + `ber.rs` (it takes raw DER, not the `Node` tree);
+`app.rs` depends on all of the above; `tui.rs` renders `app.rs` and resolves
+OID display names through `oid.rs`. External dependencies: `ratatui`,
+`aws-lc-rs`, `openssl` (the last requires a system OpenSSL to link against).
 
 ## 4. Data model
 
@@ -954,6 +962,43 @@ is re-read and re-decrypted with the retained password (the decrypted key
 material itself is not cached, only the password). This is a deliberate
 convenience/secret-exposure trade-off scoped to a single session.
 
+## 9d. Certification-path validation (`src/pathval.rs`)
+
+Beyond the single-signature check of §9 (does this object verify under its
+claimed issuer's key?), the editor validates a certificate's full
+**certification path** to a trust anchor, using OpenSSL — the `openssl`
+crate, which is the only place OpenSSL is used (all other crypto is
+`aws-lc-rs`). This is a deliberately different engine from `verify.rs`:
+OpenSSL applies the complete chain-building and validation rules (issuer
+chaining, signatures at every link, validity periods, basic constraints),
+which is exactly what path validation calls for.
+
+The user builds the trust store interactively: pressing **`t`** on a
+certificate selected in the browser toggles it in `App::trusted_certs`
+(`App::toggle_trust`; non-certificates are refused). `pathval::validate`
+then takes the target certificate's DER, the DER of every trusted anchor,
+and the DER of every *other* certificate in the scanned tree as untrusted
+intermediates, and runs an `X509StoreContext::verify_cert` over an
+`X509Store` of the anchors with the intermediates supplied as the candidate
+chain. The store is built with `X509VerifyFlags::PARTIAL_CHAIN`, so a
+trusted **intermediate** (or even a leaf) terminates a path just as a trusted
+root would — "trusted" means any certificate the user marked, not only
+self-signed roots. The result is `Valid { depth }`, `Invalid { reason }`
+(OpenSSL's verification error string, e.g. "unable to get issuer
+certificate"), or `Error { detail }` (the target isn't a parseable
+certificate).
+
+`App::path_status` holds the result for the open document when it is a
+certificate. It is recomputed by `App::recompute_path_status` — called from
+`recompute_sig_status` (so it refreshes on every selection/preview and after
+edits, using the open document's *live* content as both the target and its
+entry in the pool) and from `toggle_trust` (so changing the trust set
+re-validates the open certificate immediately). The content pane renders it
+on a `Path` line directly below the `Signature` line (§11). Trusted
+certificates are tagged `[trusted]` in the browser. Re-reading the other
+certificate files on each recompute is cheap for the small, few-file trees
+this targets.
+
 ## 10. Input containers
 
 `input::load` detects, in order: PEM (`-----BEGIN <label>-----`, first
@@ -1105,6 +1150,7 @@ document pane.
 | `Enter` / `Esc` | (edit mode) apply / cancel |
 | `s` | save (re-encode + re-wrap container) |
 | `z` | context action: decrypt an `EncryptedPrivateKeyInfo` (§9a) or PKCS#12 (§9b, prompts for a password), or re-sign a modified certificate/CRL (§9c) |
+| `t` | (browser) mark/unmark the selected certificate as a path-validation trust anchor (§9d) |
 | `[` / `]` | scroll content pane |
 | `q` | quit (`q q` to discard unsaved changes) |
 
@@ -1150,6 +1196,12 @@ the same works with an *encrypted* issuer key via a retained password, that
 re-signing falls through an invalidated key to a valid alternate (another key
 file, or an unlocked encrypted key) rather than failing on it, and that a
 missing issuer key is reported and confirming it is a no-op.
+Certification-path tests run OpenSSL over the bundled `testdata/chain`
+hierarchy: `pathval` unit tests check that trusting the root (or the
+intermediate directly) validates the leaf, that no trust anchor or a missing
+intermediate is invalid, and that a broken signature does not validate; app
+tests check that `t` toggles a certificate's trust, re-validates the open
+certificate, refuses a CRL, and leaves a non-certificate with no path status.
 
 Beyond the automated triples check, the `--dump` output format itself
 (column widths derived from file size, `offset length:` prefix,

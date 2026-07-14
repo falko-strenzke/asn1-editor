@@ -38,6 +38,7 @@ use crate::ber::{
     TAG_OID, TAG_UTC_TIME,
 };
 use crate::oid;
+use crate::pathval::PathStatus;
 use crate::verify::{FileRelations, SignatureStatus};
 
 /// Bytes of hex shown in the browse-mode content pane before truncating.
@@ -126,6 +127,7 @@ fn handle_browser_key(app: &mut App, key: KeyEvent) {
         KeyCode::Right | KeyCode::Char('l') => app.browser.expand_or_child(),
         KeyCode::Enter | KeyCode::Char(' ') => app.activate_browser_entry(),
         KeyCode::Char('z') => app.start_decrypt(),
+        KeyCode::Char('t') => app.toggle_trust(),
         _ => {}
     }
     // Any of the above can move the browser selection; live-preview the
@@ -575,8 +577,20 @@ fn draw_browser(frame: &mut Frame, app: &mut App, area: Rect) {
             } else {
                 "  ".to_string()
             };
-            let text =
-                format!("{}{}{}{}", "  ".repeat(row.depth), fold_marker, prefix, entry.name);
+            // Certificates the user trusts get a trailing marker.
+            let trust = if app.trusted_certs.contains(&entry.path) {
+                "  [trusted]"
+            } else {
+                ""
+            };
+            let text = format!(
+                "{}{}{}{}{}",
+                "  ".repeat(row.depth),
+                fold_marker,
+                prefix,
+                entry.name,
+                trust
+            );
             let marker_offset = row.depth * 2 + fold_marker.chars().count();
             let marker_style = dirty_open.then(|| Style::new().fg(DIRTY_MARKER).bold());
             (text, style, marker_offset, marker_style)
@@ -1195,6 +1209,25 @@ fn signature_status_line(status: &SignatureStatus) -> Line<'static> {
     ])
 }
 
+fn path_status_line(status: &PathStatus) -> Line<'static> {
+    let (text, style) = match status {
+        PathStatus::Valid { depth } => (
+            format!("valid — path of {} certificate(s) to a trusted anchor", depth),
+            Style::new().fg(Color::Green),
+        ),
+        PathStatus::Invalid { reason } => {
+            (format!("no valid path — {}", reason), Style::new().fg(Color::Red).bold())
+        }
+        PathStatus::Error { detail } => {
+            (format!("could not validate — {}", detail), Style::new().fg(Color::Yellow))
+        }
+    };
+    Line::from(vec![
+        Span::styled("Path      ", Style::new().dim()),
+        Span::styled(text, style),
+    ])
+}
+
 fn draw_content_browse(frame: &mut Frame, app: &App, area: Rect) {
     let mut lines: Vec<Line> = Vec::new();
     let selected_row = app.rows.get(app.selected);
@@ -1238,6 +1271,9 @@ fn draw_content_browse(frame: &mut Frame, app: &App, area: Rect) {
         }
         if let Some(status) = &app.sig_status {
             lines.push(signature_status_line(status));
+        }
+        if let Some(status) = &app.path_status {
+            lines.push(path_status_line(status));
         }
         let ids = ber::identifier_octets(node.class, node.tag, node.constructed);
         lines.push(Line::from(vec![
@@ -1561,7 +1597,7 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
     let dirty = if app.dirty { " [modified]" } else { "" };
     let hints = match app.mode {
         Mode::Browse if app.focus == Focus::Browser => {
-            "q quit  Tab switch pane  ↑↓ move+preview  ←→ fold  ⏎ switch to file/fold  z decrypt/re-sign"
+            "q quit  Tab switch pane  ↑↓ move+preview  ←→ fold  ⏎ switch to file/fold  z decrypt/re-sign  t trust"
         }
         Mode::Browse => {
             "q quit  Tab switch pane  ↑↓ move  ←→ fold  ⏎ toggle  e edit  E edit-menu  i/I insert  d delete  J/K reorder  s save  z decrypt/re-sign  [ ] scroll"

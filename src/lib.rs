@@ -25,6 +25,7 @@ pub mod browser;
 pub mod dump;
 pub mod input;
 pub mod oid;
+pub mod pathval;
 pub mod pkcs12;
 pub mod pkcs8;
 pub mod spec;
