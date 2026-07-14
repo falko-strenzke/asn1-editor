@@ -44,6 +44,9 @@ Goals:
   file and the certificate carrying its public key — including keys that
   become known only after a password is entered (§9 → Key ↔ certificate
   links).
+* Re-sign a modified certificate or CRL with its issuer's private key, when
+  that key is available in the folder (as a plaintext key, or an encrypted
+  key/PKCS#12 whose password was entered this session and retained) (§9c).
 
 Non-goals (see §14):
 
@@ -87,9 +90,9 @@ src/
   x509.rs    structural decoding of Certificate/CertificateList + a
              recursive directory scan for candidate CA certs; also extracts
              the public-key identity of a private key or certificate for the
-             key↔certificate links
-  verify.rs  signature verification (uses aws-lc-rs) + the pure key↔cert
-             link matcher
+             key↔certificate links, and normalizes a key to PKCS#8 for signing
+  verify.rs  signature verification and generation (uses aws-lc-rs) + the
+             pure key↔cert link matcher + the claimed-issuer lookup
   pkcs8.rs   structural decoding + password decryption/re-encryption of
              EncryptedPrivateKeyInfo (PBES2; uses aws-lc-rs). Exposes a
              reusable Pbes2 (PBKDF2 + AES-CBC) decryptor shared with pkcs12.rs
@@ -887,6 +890,50 @@ fold state can be toggled). An edit to the *outer* document re-derives the
 reveal with the retained password (`refresh_pkcs12_reveal`, carrying over
 fold state), or discards it if the document no longer decrypts.
 
+## 9c. Re-signing a modified object (`src/verify.rs`, `src/app.rs`)
+
+After editing a certificate or CRL its signature no longer matches the
+`tbsCertificate`/`tbsCertList`. Pressing **`z`** on such an object (once the
+`z` handler has ruled out the encrypted-container cases of §9a/§9b) opens a
+re-sign dialog. It reports whether the **issuer's** signing key — the private
+key matching the issuer certificate's public key — is available, and if so
+offers to generate a fresh signature.
+
+Availability (`App::resign_state`) requires three things: the signature
+algorithm is one `verify::sign` supports (RSA PKCS#1 v1.5 SHA-256/384/512,
+ECDSA P-256/P-384, Ed25519 — a subset of what can be *verified*, since
+`aws-lc-rs` will not sign with legacy SHA-1); the claimed issuer certificate
+is present in the scanned tree (`verify::claimed_issuers` matches by
+`authorityKeyIdentifier`/`subjectKeyIdentifier` or issuer/subject DN —
+*without* checking the current, now-broken signature); and that issuer's
+private key is reachable. Key resolution (`App::signing_key_pkcs8_for`)
+searches the same two pools as the key↔certificate links (§9): a plaintext
+key file (`x509::to_pkcs8_der`, which returns PKCS#8 as-is and wraps a bare
+SEC1 key), or a session-unlocked encrypted key / PKCS#12, re-decrypted on
+demand with its **retained password** (below). A self-signed certificate is
+its own issuer, so its own key signs it.
+
+On confirmation (`App::submit_resign`), the current `tbs` is re-derived from
+the edited tree, `verify::sign` produces a signature with the resolved
+PKCS#8 key (erroring if the key and algorithm disagree — e.g. an RSA key for
+an ECDSA algorithm), and the object's outer `signature` BIT STRING (the third
+element of the `Certificate`/`CertificateList` SEQUENCE, at path `[0, 2]`) is
+replaced with a leading unused-bits octet followed by the new signature. The
+document is re-encoded and marked dirty; the next `recompute_sig_status` then
+shows the signature verifying again. `verify.rs` gains signing (it already
+owned `aws-lc-rs` verification), keeping all signature crypto in one module.
+
+### Retained passwords
+
+To re-sign with an *encrypted* issuer key without re-prompting, the private-
+key passwords the user enters (for §9a/§9b decryption) are retained for the
+lifetime of the process in `App::retained_passwords` — a small path→password
+map, zeroed on drop. On any successful decryption the password is stored
+under the open file's path; when re-signing later needs that file's key, it
+is re-read and re-decrypted with the retained password (the decrypted key
+material itself is not cached, only the password). This is a deliberate
+convenience/secret-exposure trade-off scoped to a single session.
+
 ## 10. Input containers
 
 `input::load` detects, in order: PEM (`-----BEGIN <label>-----`, first
@@ -1037,7 +1084,7 @@ document pane.
 | `J` / `K` | move selected element down / up among its siblings |
 | `Enter` / `Esc` | (edit mode) apply / cancel |
 | `s` | save (re-encode + re-wrap container) |
-| `z` | decrypt an `EncryptedPrivateKeyInfo` (§9a) or a PKCS#12 container (§9b); prompts for a password |
+| `z` | context action: decrypt an `EncryptedPrivateKeyInfo` (§9a) or PKCS#12 (§9b, prompts for a password), or re-sign a modified certificate/CRL (§9c) |
 | `[` / `]` | scroll content pane |
 | `q` | quit (`q q` to discard unsaved changes) |
 
@@ -1074,7 +1121,12 @@ certificate, the pure `key_links_for` matcher (both directions, dedup, no
 self-links), the headless gutter routing, and — at the app level — that a
 certificate links to its plaintext key files, that an encrypted key or
 PKCS#12 links only after the password is entered, and that the link persists
-after navigating to the certificate.
+after navigating to the certificate. Re-signing tests cover the sign→verify
+round trip (including a SEC1 key wrapped to PKCS#8, and rejection of a
+wrong-type key), and — at the app level — that modifying a certificate breaks
+its signature and re-signing restores it with a plaintext issuer key, that
+the same works with an *encrypted* issuer key via a retained password, and
+that a missing issuer key is reported and confirming it is a no-op.
 
 Beyond the automated triples check, the `--dump` output format itself
 (column widths derived from file size, `offset length:` prefix,

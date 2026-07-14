@@ -25,7 +25,7 @@ use ratatui::crossterm::execute;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style, Stylize};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph};
+use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
 use ratatui::{DefaultTerminal, Frame};
 
 use crate::app::{
@@ -87,6 +87,7 @@ fn event_loop(terminal: &mut DefaultTerminal, app: &mut App) -> io::Result<()> {
             Mode::TypePicker(_) => handle_picker_key(app, key),
             Mode::EditMenu(_) => handle_menu_key(app, key),
             Mode::Password(_) => handle_password_key(app, key),
+            Mode::Resign(_) => handle_resign_key(app, key),
             Mode::Browse => {
                 if key.code != KeyCode::Char('q') {
                     app.quit_confirm = false;
@@ -180,6 +181,14 @@ fn handle_password_key(app: &mut App, key: KeyEvent) {
     }
 }
 
+fn handle_resign_key(app: &mut App, key: KeyEvent) {
+    match key.code {
+        KeyCode::Esc => app.cancel_resign(),
+        KeyCode::Enter => app.submit_resign(),
+        _ => {}
+    }
+}
+
 fn handle_picker_key(app: &mut App, key: KeyEvent) {
     match key.code {
         KeyCode::Esc => app.cancel_picker(),
@@ -259,6 +268,56 @@ fn draw(frame: &mut Frame, app: &mut App) {
     if matches!(app.mode, Mode::Password(_)) {
         draw_password(frame, app, main);
     }
+    if matches!(app.mode, Mode::Resign(_)) {
+        draw_resign(frame, app, main);
+    }
+}
+
+/// Centered popup for the re-sign dialog: whether the issuer's signing key is
+/// available and, if so, an offer to create a new signature.
+fn draw_resign(frame: &mut Frame, app: &App, area: Rect) {
+    let Mode::Resign(ref state) = app.mode else { return };
+    let width = 66.min(area.width);
+    let height = 8.min(area.height);
+    let popup = Rect {
+        x: area.x + (area.width.saturating_sub(width)) / 2,
+        y: area.y + (area.height.saturating_sub(height)) / 2,
+        width,
+        height,
+    };
+    frame.render_widget(Clear, popup);
+    let border = if state.ready { Color::Green } else { Color::Yellow };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::new().fg(border))
+        .title(" RE-SIGN — regenerate the signature ");
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+    let (status_word, status_color) = if state.ready {
+        ("available", Color::Green)
+    } else {
+        ("not available", Color::Yellow)
+    };
+    let mut lines = vec![Line::from(vec![
+        Span::styled("signing key: ", Style::new().dim()),
+        Span::styled(status_word, Style::new().fg(status_color).bold()),
+    ])];
+    if !state.issuer_summary.is_empty() {
+        lines.push(Line::from(vec![
+            Span::styled("issuer:      ", Style::new().dim()),
+            Span::raw(state.issuer_summary.clone()),
+        ]));
+    }
+    lines.push(Line::default());
+    lines.push(Line::from(Span::raw(state.detail.clone())));
+    lines.push(Line::default());
+    let hint = if state.ready {
+        "⏎ create new signature   Esc cancel"
+    } else {
+        "Esc close"
+    };
+    lines.push(Line::from(Span::styled(hint, Style::new().dim())));
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: true }), inner);
 }
 
 /// Centered popup prompting for the decrypt password (masked).
@@ -1502,15 +1561,16 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
     let dirty = if app.dirty { " [modified]" } else { "" };
     let hints = match app.mode {
         Mode::Browse if app.focus == Focus::Browser => {
-            "q quit  Tab switch pane  ↑↓ move+preview  ←→ fold  ⏎ switch to file/fold  z decrypt"
+            "q quit  Tab switch pane  ↑↓ move+preview  ←→ fold  ⏎ switch to file/fold  z decrypt/re-sign"
         }
         Mode::Browse => {
-            "q quit  Tab switch pane  ↑↓ move  ←→ fold  ⏎ toggle  e edit  E edit-menu  i/I insert  d delete  J/K reorder  s save  z decrypt  [ ] scroll"
+            "q quit  Tab switch pane  ↑↓ move  ←→ fold  ⏎ toggle  e edit  E edit-menu  i/I insert  d delete  J/K reorder  s save  z decrypt/re-sign  [ ] scroll"
         }
         Mode::TypePicker(_) => "←→ column  ↑↓ select  0-9 tag number  ⏎ continue  Esc cancel",
         Mode::EditMenu(_) => "↑↓ or 1-5 select  ⏎ choose  Esc cancel",
         Mode::Edit(_) => "Enter apply  Esc cancel",
         Mode::Password(_) => "type password  ⏎ decrypt  Esc cancel",
+        Mode::Resign(_) => "⏎ create new signature (if available)  Esc cancel",
     };
     let line = Line::from(vec![
         Span::styled(dirty, Style::new().fg(Color::Red).bold()),

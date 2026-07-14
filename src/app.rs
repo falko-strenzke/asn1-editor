@@ -26,7 +26,7 @@ use crate::pkcs12;
 use crate::pkcs8;
 use crate::spec::{self, Identification, Label, SpecDb};
 use crate::verify::{self, FileRelations, SignatureStatus};
-use crate::x509::{self, CaCandidate, SignableFile};
+use crate::x509::{self, CaCandidate, Signable, SignableFile};
 
 /// Bytes per line in the hex editor; the cursor moves in units of hex digits.
 pub const EDIT_BYTES_PER_LINE: usize = 16;
@@ -610,6 +610,48 @@ pub enum Mode {
     Edit(EditState),
     /// Password prompt for decrypting an `EncryptedPrivateKeyInfo` ('z').
     Password(PasswordState),
+    /// Re-sign dialog for a modified certificate/CRL ('z' on a signed object).
+    Resign(ResignState),
+}
+
+/// State of the re-sign dialog: whether the issuer's signing key is
+/// available and, if so, which public key identifies it (used to re-resolve
+/// the private key material when the user confirms).
+pub struct ResignState {
+    /// Short description of the signer (issuer) whose key is needed.
+    pub issuer_summary: String,
+    /// One-line explanation shown in the dialog.
+    pub detail: String,
+    /// Whether a new signature can be created.
+    pub ready: bool,
+    /// The signer's public-key identity; `Some` only when `ready`.
+    signer_key: Option<x509::PublicKeyId>,
+}
+
+/// Private-key passwords entered this session, retained (until the program
+/// quits) so an issuer's encrypted key can be re-used to re-sign a modified
+/// object without prompting again. Keyed by the file the password unlocked;
+/// zeroed on drop.
+#[derive(Default)]
+pub struct RetainedPasswords(Vec<(PathBuf, Vec<u8>)>);
+
+impl RetainedPasswords {
+    fn set(&mut self, path: PathBuf, password: Vec<u8>) {
+        self.0.retain(|(p, _)| *p != path);
+        self.0.push((path, password));
+    }
+
+    fn get(&self, path: &Path) -> Option<&[u8]> {
+        self.0.iter().find(|(p, _)| p == path).map(|(_, pw)| pw.as_slice())
+    }
+}
+
+impl Drop for RetainedPasswords {
+    fn drop(&mut self) {
+        for (_, pw) in &mut self.0 {
+            pw.fill(0);
+        }
+    }
 }
 
 /// State of the decrypt-password prompt: the (masked) characters typed so far.
@@ -754,6 +796,10 @@ pub struct App {
     /// so a link stays visible after the user browses away from the file
     /// they decrypted.
     pub unlocked_keys: Vec<(PathBuf, x509::PublicKeyId)>,
+    /// Private-key passwords entered this session (path → password), retained
+    /// so an encrypted issuer key can re-sign a modified object without
+    /// re-prompting. Zeroed when the program quits.
+    pub retained_passwords: RetainedPasswords,
     /// Editable virtual plaintext of the open document's `encryptedData`,
     /// once the user has decrypted it with 'z'.
     pub decrypted: Option<Decrypted>,
@@ -803,6 +849,7 @@ impl App {
             browser_relations: FileRelations::default(),
             key_files,
             unlocked_keys: Vec::new(),
+            retained_passwords: RetainedPasswords::default(),
             decrypted: None,
             pkcs12: None,
         };
@@ -845,6 +892,7 @@ impl App {
             browser_relations: FileRelations::default(),
             key_files,
             unlocked_keys: Vec::new(),
+            retained_passwords: RetainedPasswords::default(),
             decrypted: None,
             pkcs12: None,
         };
@@ -968,12 +1016,171 @@ impl App {
             Ok(Some(_)) => {
                 self.mode = Mode::Password(PasswordState { buf: String::new() });
                 self.status = "enter the password to decrypt this PKCS#12 file".to_string();
+                return;
             }
-            Ok(None) => {
-                self.status =
-                    "not an encrypted private key or PKCS#12 container".to_string();
+            Ok(None) => {}
+            Err(msg) => {
+                self.status = format!("cannot decrypt PKCS#12: {}", msg);
+                return;
             }
-            Err(msg) => self.status = format!("cannot decrypt PKCS#12: {}", msg),
+        }
+        // Not an encrypted container — offer to re-sign, if this is a
+        // certificate or CRL.
+        self.start_resign();
+    }
+
+    /// 'z' on a certificate or CRL: open the re-sign dialog, reporting
+    /// whether the issuer's signing key is available. Not a signed object →
+    /// just a status message.
+    pub fn start_resign(&mut self) {
+        let der = ber::encode_forest(&self.roots);
+        let signable = ber::parse_forest(&der, 0)
+            .ok()
+            .and_then(|roots| x509::parse_signable(&roots, &der));
+        let Some(signable) = signable else {
+            self.status = "not an encrypted key, PKCS#12, certificate or CRL".to_string();
+            return;
+        };
+        let state = self.resign_state(&signable);
+        self.status = if state.ready {
+            "the signing key is available — ⏎ creates a new signature".to_string()
+        } else {
+            "re-signing is not available (see the dialog)".to_string()
+        };
+        self.mode = Mode::Resign(state);
+    }
+
+    /// Determine whether the modified `signable` can be re-signed: the
+    /// algorithm must be supported, its issuer certificate must be present,
+    /// and that issuer's private key must be available (a plaintext key file,
+    /// or an encrypted key/PKCS#12 already unlocked this session).
+    fn resign_state(&self, signable: &Signable) -> ResignState {
+        if !verify::signing_supported(&signable.sig_alg) {
+            return ResignState {
+                issuer_summary: String::new(),
+                detail: "this signature algorithm is not supported for re-signing".to_string(),
+                ready: false,
+                signer_key: None,
+            };
+        }
+        let candidates = verify::claimed_issuers(&self.ca_index, signable);
+        if candidates.is_empty() {
+            return ResignState {
+                issuer_summary: "(issuer not found)".to_string(),
+                detail: "the issuer's certificate is not in this folder".to_string(),
+                ready: false,
+                signer_key: None,
+            };
+        }
+        for candidate in &candidates {
+            if let Some(id) = x509::public_key_id(&candidate.pubkey_alg, &candidate.pubkey) {
+                if self.signing_key_pkcs8_for(&id).is_some() {
+                    return ResignState {
+                        issuer_summary: candidate.subject_summary.clone(),
+                        detail: "the issuer's signing key is available".to_string(),
+                        ready: true,
+                        signer_key: Some(id),
+                    };
+                }
+            }
+        }
+        ResignState {
+            issuer_summary: candidates[0].subject_summary.clone(),
+            detail: "the issuer's private key is not available — open its key file and, \
+                     if it is encrypted, decrypt it with 'z' first"
+                .to_string(),
+            ready: false,
+            signer_key: None,
+        }
+    }
+
+    /// The PKCS#8 `PrivateKeyInfo` of the private key whose public key is
+    /// `id`, if reachable: a plaintext key file, or a session-unlocked
+    /// encrypted key / PKCS#12 re-decrypted with its retained password.
+    fn signing_key_pkcs8_for(&self, id: &x509::PublicKeyId) -> Option<Vec<u8>> {
+        for key_file in &self.key_files {
+            if key_file.key == *id {
+                if let Some(pkcs8) = read_plaintext_key_pkcs8(&key_file.path) {
+                    return Some(pkcs8);
+                }
+            }
+        }
+        for (path, pubkey) in &self.unlocked_keys {
+            if pubkey == id {
+                if let Some(pkcs8) = self.decrypt_key_pkcs8(path, id) {
+                    return Some(pkcs8);
+                }
+            }
+        }
+        None
+    }
+
+    /// Re-decrypt a session-unlocked key/PKCS#12 file with its retained
+    /// password and return the PKCS#8 for the key whose public key is `id`.
+    fn decrypt_key_pkcs8(&self, path: &Path, id: &x509::PublicKeyId) -> Option<Vec<u8>> {
+        let password = self.retained_passwords.get(path)?;
+        let raw = std::fs::read(path).ok()?;
+        let (der, _) = input::load(&raw).ok()?;
+        let roots = ber::parse_forest(&der, 0).ok()?;
+        if let Ok(Some(enc)) = pkcs8::parse(&roots) {
+            // The decrypted plaintext is itself a PKCS#8 PrivateKeyInfo.
+            return enc.decrypt(password).ok();
+        }
+        if let Ok(Some(p12)) = pkcs12::parse(&roots) {
+            for region in &p12.regions {
+                let Ok(plaintext) = region.decrypt(password) else { continue };
+                let Ok(key_roots) = ber::parse_forest(&plaintext, 0) else { continue };
+                if x509::public_key_id_of_private_key(&key_roots).as_ref() == Some(id) {
+                    return x509::to_pkcs8_der(&key_roots);
+                }
+            }
+        }
+        None
+    }
+
+    pub fn cancel_resign(&mut self) {
+        self.mode = Mode::Browse;
+        self.status = "re-signing cancelled".to_string();
+    }
+
+    /// Confirm re-signing: sign the current `tbs` with the resolved issuer
+    /// key and replace the object's outer signature.
+    pub fn submit_resign(&mut self) {
+        let Mode::Resign(ref state) = self.mode else { return };
+        let signer_key = state.signer_key.clone();
+        let ready = state.ready;
+        self.mode = Mode::Browse;
+        if !ready {
+            self.status = "re-signing is not available".to_string();
+            return;
+        }
+        let signature = (|| {
+            let der = ber::encode_forest(&self.roots);
+            let roots =
+                ber::parse_forest(&der, 0).map_err(|e| format!("re-encode failed: {}", e))?;
+            let signable = x509::parse_signable(&roots, &der)
+                .ok_or_else(|| "no longer a certificate or CRL".to_string())?;
+            let id = signer_key.ok_or_else(|| "no signing key selected".to_string())?;
+            let pkcs8 = self
+                .signing_key_pkcs8_for(&id)
+                .ok_or_else(|| "the signing key is no longer available".to_string())?;
+            verify::sign(&signable.sig_alg, &pkcs8, &signable.tbs)
+        })();
+        match signature {
+            Ok(sig) => {
+                // The outer `signature` BIT STRING is the third element of a
+                // Certificate / CertificateList; its content is one
+                // unused-bits octet (0) followed by the signature.
+                if let Some(node) = node_at_mut(&mut self.roots, &[0, 2]) {
+                    node.value = std::iter::once(0u8).chain(sig).collect();
+                    node.children.clear();
+                    node.encapsulates = false;
+                }
+                self.dirty = true;
+                self.rebuild();
+                self.status = "new signature created — 's' writes the file".to_string();
+            }
+            Err(e) => self.status = format!("re-signing failed: {}", e),
         }
     }
 
@@ -1003,6 +1210,7 @@ impl App {
     }
 
     fn submit_pkcs8_password(&mut self, password: String) {
+        let password_bytes = password.as_bytes().to_vec();
         let result = match pkcs8::parse(&self.roots) {
             Ok(Some(enc)) => enc.decrypt(password.as_bytes()).and_then(|plaintext| {
                 let roots = ber::parse_forest(&plaintext, 0)
@@ -1025,6 +1233,7 @@ impl App {
                 self.decrypted = Some(decrypted);
                 self.rebuild_rows();
                 self.cache_unlocked_keys(key.into_iter().collect());
+                self.retained_passwords.set(self.path.clone(), password_bytes);
                 self.recompute_browser_relations();
                 self.status = "decrypted content is available in the ASN.1 tree".to_string();
             }
@@ -1080,6 +1289,7 @@ impl App {
         self.pkcs12 = Some(Pkcs12Reveal { password: password.as_bytes().to_vec(), regions });
         self.rebuild_rows();
         self.cache_unlocked_keys(keys);
+        self.retained_passwords.set(self.path.clone(), password.as_bytes().to_vec());
         self.recompute_browser_relations();
         self.status = if failed == 0 {
             format!(
@@ -2225,6 +2435,15 @@ impl App {
     }
 }
 
+/// Read a plaintext private-key file and return its PKCS#8 form (SEC1 keys
+/// are wrapped), or `None` if it isn't a usable plaintext key.
+fn read_plaintext_key_pkcs8(path: &Path) -> Option<Vec<u8>> {
+    let raw = std::fs::read(path).ok()?;
+    let (der, _) = input::load(&raw).ok()?;
+    let roots = ber::parse_forest(&der, 0).ok()?;
+    x509::to_pkcs8_der(&roots)
+}
+
 fn collect_rows(
     node: &Node,
     path: Vec<usize>,
@@ -2918,10 +3137,10 @@ mod tests {
     }
 
     #[test]
-    fn decrypt_on_a_plain_certificate_is_a_no_op() {
+    fn z_on_a_certificate_opens_the_resign_dialog_and_does_not_decrypt() {
         let mut app = open_real_file(std::path::Path::new("testdata/cert_ec.der"));
         app.start_decrypt();
-        assert!(matches!(app.mode, Mode::Browse), "no prompt for a non-encrypted file");
+        assert!(matches!(app.mode, Mode::Resign(_)), "a certificate offers re-signing");
         assert!(app.pkcs12.is_none());
         assert!(app.decrypted.is_none());
     }
@@ -3019,6 +3238,84 @@ mod tests {
         enter_password(&mut app, "the wrong password");
         assert!(app.browser_relations.key_links.is_empty());
         assert!(app.unlocked_keys.is_empty());
+    }
+
+    // ---- re-signing -------------------------------------------------------
+
+    /// Flip a bit in the certificate's serialNumber so its (unchanged)
+    /// signature no longer covers the tbs, and re-parse.
+    fn modify_serial(app: &mut App) {
+        let serial = node_at_mut(&mut app.roots, &[0, 0, 1]).expect("serialNumber");
+        let last = serial.value.len() - 1;
+        serial.value[last] ^= 0x01;
+        app.dirty = true;
+        app.rebuild();
+    }
+
+    #[test]
+    fn resign_a_modified_certificate_with_a_plaintext_issuer_key() {
+        let mut app = open_real_file(&kl("cert_ec.der"));
+        assert!(matches!(app.sig_status, Some(SignatureStatus::Verified { .. })));
+        modify_serial(&mut app);
+        assert!(
+            matches!(app.sig_status, Some(SignatureStatus::Invalid { .. })),
+            "the modification must break the old signature"
+        );
+        // 'z' opens the re-sign dialog and reports the key is available.
+        app.start_resign();
+        let Mode::Resign(ref state) = app.mode else { panic!("re-sign dialog") };
+        assert!(state.ready, "self-signed key present as plaintext: {}", state.detail);
+        app.submit_resign();
+        assert!(matches!(app.mode, Mode::Browse));
+        assert!(app.dirty);
+        assert!(
+            matches!(app.sig_status, Some(SignatureStatus::Verified { .. })),
+            "the new signature must verify: {}",
+            app.status
+        );
+    }
+
+    #[test]
+    fn resign_with_an_encrypted_issuer_key_via_a_retained_password() {
+        // A folder holding only the certificate and its *encrypted* key.
+        let dir = tmp_dir("resign-enc");
+        std::fs::copy(kl("cert_ec.der"), dir.join("cert.der")).unwrap();
+        std::fs::copy(kl("key_ec_enc.der"), dir.join("key.der")).unwrap();
+
+        // Unlock the encrypted key once (retains its password).
+        let mut app = open_real_file(&dir.join("key.der"));
+        enter_password(&mut app, "asn1editor");
+        // Open the certificate and modify it.
+        app.open_file(dir.join("cert.der")).unwrap();
+        modify_serial(&mut app);
+        assert!(matches!(app.sig_status, Some(SignatureStatus::Invalid { .. })));
+        // The only issuer key present is encrypted, but its password is
+        // retained, so re-signing is available and succeeds.
+        app.start_resign();
+        let Mode::Resign(ref state) = app.mode else { panic!("re-sign dialog") };
+        assert!(state.ready, "encrypted issuer key via retained password: {}", state.detail);
+        app.submit_resign();
+        assert!(
+            matches!(app.sig_status, Some(SignatureStatus::Verified { .. })),
+            "re-signed with the encrypted issuer key: {}",
+            app.status
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resign_dialog_reports_a_missing_issuer_key() {
+        // A folder with the certificate but no key at all.
+        let dir = tmp_dir("resign-nokey");
+        std::fs::copy(kl("cert_ec.der"), dir.join("cert.der")).unwrap();
+        let mut app = open_real_file(&dir.join("cert.der"));
+        app.start_resign();
+        let Mode::Resign(ref state) = app.mode else { panic!("re-sign dialog") };
+        assert!(!state.ready, "no key present");
+        app.submit_resign();
+        // Confirming an unavailable re-sign changes nothing.
+        assert!(!app.dirty);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     fn tmp_dir(name: &str) -> PathBuf {
@@ -3306,12 +3603,14 @@ mod tests {
     }
 
     #[test]
-    fn decrypt_on_a_non_encrypted_file_is_a_no_op_with_message() {
+    fn decrypt_on_a_non_encrypted_non_signed_file_is_a_no_op_with_message() {
+        // A plaintext private key is neither an encrypted container nor a
+        // signed object, so 'z' does nothing but report that.
         let mut app = open_real_file(std::path::Path::new("testdata/private_key_pkcs8.der"));
         app.start_decrypt();
-        assert!(matches!(app.mode, Mode::Browse), "no password prompt for a plaintext key");
+        assert!(matches!(app.mode, Mode::Browse), "no dialog for a plaintext key");
         assert!(app.decrypted.is_none());
-        assert!(app.status.contains("not an encrypted private key"));
+        assert!(app.status.contains("not an encrypted key"), "{}", app.status);
     }
 
     #[test]

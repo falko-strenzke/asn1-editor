@@ -551,6 +551,90 @@ fn int_content(node: &Node) -> Option<Vec<u8>> {
     (!node.constructed && node.is_universal(TAG_INTEGER)).then(|| node.value.clone())
 }
 
+/// Return the DER of a PKCS#8 `PrivateKeyInfo` for the private key in
+/// `roots`, the form `aws-lc-rs`'s `from_pkcs8` signing constructors want. A
+/// PKCS#8 key is returned re-encoded as-is; a bare SEC1 `ECPrivateKey` is
+/// wrapped (its curve moved into the `privateKeyAlgorithm`). `None` for
+/// anything else (an encrypted key must be decrypted first).
+pub fn to_pkcs8_der(roots: &[Node]) -> Option<Vec<u8>> {
+    if roots.len() != 1 {
+        return None;
+    }
+    let root = &roots[0];
+    if !root.constructed || !root.is_universal(TAG_SEQUENCE) || root.children.len() < 2 {
+        return None;
+    }
+    let second = &root.children[1];
+    if second.constructed && second.is_universal(TAG_SEQUENCE) {
+        // Already a PKCS#8 PrivateKeyInfo.
+        return Some(ber::encode_forest(roots));
+    }
+    if !second.constructed && second.is_universal(TAG_OCTET_STRING) {
+        return wrap_sec1_as_pkcs8(root);
+    }
+    None
+}
+
+/// Wrap a SEC1 `ECPrivateKey` into a PKCS#8 `PrivateKeyInfo`: move the curve
+/// from the inner `[0] parameters` into the outer `privateKeyAlgorithm` and
+/// drop it from the inner key (the RFC 5958 canonical form).
+fn wrap_sec1_as_pkcs8(ec: &Node) -> Option<Vec<u8>> {
+    let curve = ec
+        .children
+        .iter()
+        .find(|c| c.class == Class::ContextSpecific && c.tag == 0 && c.constructed)
+        .and_then(|c| c.children.first())
+        .filter(|o| !o.constructed && o.is_universal(TAG_OID))?
+        .clone();
+    let mut inner = ec.clone();
+    inner
+        .children
+        .retain(|c| !(c.class == Class::ContextSpecific && c.tag == 0 && c.constructed));
+
+    let algorithm = universal_seq(vec![
+        universal_primitive(TAG_OID, ber::encode_oid("1.2.840.10045.2.1").ok()?), // ecPublicKey
+        curve,
+    ]);
+    let pkcs8 = universal_seq(vec![
+        universal_primitive(TAG_INTEGER, vec![0]),               // version v1
+        algorithm,                                               // privateKeyAlgorithm
+        universal_primitive(TAG_OCTET_STRING, ber::encode_node(&inner)), // privateKey
+    ]);
+    Some(ber::encode_forest(&[pkcs8]))
+}
+
+fn universal_primitive(tag: u32, value: Vec<u8>) -> Node {
+    Node {
+        class: Class::Universal,
+        tag,
+        constructed: false,
+        indefinite: false,
+        offset: 0,
+        header_len: 0,
+        content_len: 0,
+        value,
+        children: Vec::new(),
+        encapsulates: false,
+        expanded: false,
+    }
+}
+
+fn universal_seq(children: Vec<Node>) -> Node {
+    Node {
+        class: Class::Universal,
+        tag: TAG_SEQUENCE,
+        constructed: true,
+        indefinite: false,
+        offset: 0,
+        header_len: 0,
+        content_len: 0,
+        value: Vec::new(),
+        children,
+        encapsulates: false,
+        expanded: false,
+    }
+}
+
 /// A private-key file found while scanning a directory, reduced to the
 /// public-key identity it corresponds to — the raw material for the
 /// key↔certificate links in `verify::key_links_for`.

@@ -69,6 +69,72 @@ fn oid_string(oid: &[u64]) -> String {
     oid.iter().map(|a| a.to_string()).collect::<Vec<_>>().join(".")
 }
 
+/// Whether `sign` can generate a signature for this signature-algorithm OID.
+/// (A subset of what `algorithm_for` can *verify* — `aws-lc-rs` does not sign
+/// with the legacy SHA-1 RSA algorithm.)
+pub fn signing_supported(sig_alg: &[u64]) -> bool {
+    [
+        SHA256_WITH_RSA,
+        SHA384_WITH_RSA,
+        SHA512_WITH_RSA,
+        ECDSA_WITH_SHA256,
+        ECDSA_WITH_SHA384,
+        ED25519_OID,
+    ]
+    .contains(&sig_alg)
+}
+
+/// Generate a signature over `tbs` (the DER of a `tbsCertificate` /
+/// `tbsCertList`) with the private key `pkcs8_key` (a PKCS#8 `PrivateKeyInfo`)
+/// for the X.509 signature algorithm `sig_alg`. The returned bytes go
+/// straight into the object's outer `signature` BIT STRING (after the
+/// unused-bits octet). Errors if the key and algorithm disagree (e.g. an RSA
+/// key for an ECDSA algorithm) or the algorithm is unsupported for signing.
+pub fn sign(sig_alg: &[u64], pkcs8_key: &[u8], tbs: &[u8]) -> Result<Vec<u8>, String> {
+    let rng = aws_lc_rs::rand::SystemRandom::new();
+
+    let rsa_padding: Option<&'static dyn signature::RsaEncoding> = if sig_alg == SHA256_WITH_RSA {
+        Some(&signature::RSA_PKCS1_SHA256)
+    } else if sig_alg == SHA384_WITH_RSA {
+        Some(&signature::RSA_PKCS1_SHA384)
+    } else if sig_alg == SHA512_WITH_RSA {
+        Some(&signature::RSA_PKCS1_SHA512)
+    } else {
+        None
+    };
+    if let Some(padding) = rsa_padding {
+        let key = signature::RsaKeyPair::from_pkcs8(pkcs8_key)
+            .map_err(|_| "the signing key is not a usable RSA key".to_string())?;
+        let mut sig = vec![0u8; key.public_modulus_len()];
+        key.sign(padding, &rng, tbs, &mut sig)
+            .map_err(|_| "RSA signing failed".to_string())?;
+        return Ok(sig);
+    }
+
+    let ecdsa_alg: Option<&'static signature::EcdsaSigningAlgorithm> = if sig_alg == ECDSA_WITH_SHA256
+    {
+        Some(&signature::ECDSA_P256_SHA256_ASN1_SIGNING)
+    } else if sig_alg == ECDSA_WITH_SHA384 {
+        Some(&signature::ECDSA_P384_SHA384_ASN1_SIGNING)
+    } else {
+        None
+    };
+    if let Some(alg) = ecdsa_alg {
+        let key = signature::EcdsaKeyPair::from_pkcs8(alg, pkcs8_key)
+            .map_err(|_| "the signing key is not a usable ECDSA key for this curve".to_string())?;
+        let sig = key.sign(&rng, tbs).map_err(|_| "ECDSA signing failed".to_string())?;
+        return Ok(sig.as_ref().to_vec());
+    }
+
+    if sig_alg == ED25519_OID {
+        let key = signature::Ed25519KeyPair::from_pkcs8(pkcs8_key)
+            .map_err(|_| "the signing key is not a usable Ed25519 key".to_string())?;
+        return Ok(key.sign(tbs).as_ref().to_vec());
+    }
+
+    Err(format!("re-signing is not supported for algorithm {}", oid_string(sig_alg)))
+}
+
 /// Find a candidate issuer for `signable` in `index` (an
 /// `authorityKeyIdentifier`/`subjectKeyIdentifier` match is preferred
 /// over issuer/subject DN byte-equality when both AKI and at least one
@@ -76,17 +142,27 @@ fn oid_string(oid: &[u64]) -> String {
 /// With several byte-equal-DN candidates, the first one whose signature
 /// actually verifies wins; if none do, the status reports `Invalid`
 /// against the first candidate.
-pub fn verify_against(index: &[CaCandidate], signable: &Signable) -> SignatureStatus {
+/// The certificates in `index` that *claim* to be `signable`'s issuer —
+/// matched on `authorityKeyIdentifier`/`subjectKeyIdentifier` when present,
+/// else on issuer/subject DN byte-equality — **without** checking the
+/// signature. `verify_against` narrows these to the one that actually
+/// verifies; re-signing (`sign`) needs the claimed issuer even when the
+/// current signature does not verify (the whole reason to re-sign).
+pub fn claimed_issuers<'a>(index: &'a [CaCandidate], signable: &Signable) -> Vec<&'a CaCandidate> {
     let by_key_id: Vec<&CaCandidate> = signable
         .aki_key_id
         .as_ref()
         .map(|aki| index.iter().filter(|c| c.ski.as_ref() == Some(aki)).collect())
         .unwrap_or_default();
-    let candidates: Vec<&CaCandidate> = if !by_key_id.is_empty() {
-        by_key_id
-    } else {
+    if by_key_id.is_empty() {
         index.iter().filter(|c| c.subject == signable.issuer).collect()
-    };
+    } else {
+        by_key_id
+    }
+}
+
+pub fn verify_against(index: &[CaCandidate], signable: &Signable) -> SignatureStatus {
+    let candidates = claimed_issuers(index, signable);
     let Some(first) = candidates.first() else {
         return SignatureStatus::IssuerNotFound;
     };
@@ -509,6 +585,53 @@ mod tests {
             SignatureStatus::IssuerNotFound => "IssuerNotFound",
             SignatureStatus::UnsupportedAlgorithm(_) => "UnsupportedAlgorithm",
         }
+    }
+
+    #[test]
+    fn sign_produces_a_signature_the_verifier_accepts() {
+        use crate::{ber, input};
+        // The self-signed EC certificate is verified by its own key, so
+        // signing its tbs with that key must produce an acceptable signature.
+        let (cert_der, _) = input::load(&std::fs::read("testdata/keylink/cert_ec.der").unwrap()).unwrap();
+        let cert_roots = ber::parse_forest(&cert_der, 0).unwrap();
+        let signable = x509::parse_signable(&cert_roots, &cert_der).unwrap();
+        let (key_der, _) = input::load(&std::fs::read("testdata/keylink/key_ec_pkcs8.der").unwrap()).unwrap();
+
+        assert!(signing_supported(&signable.sig_alg));
+        let sig = sign(&signable.sig_alg, &key_der, &signable.tbs).expect("signing succeeds");
+
+        let alg = algorithm_for(&signable.sig_alg).unwrap();
+        let pubkey = signature::UnparsedPublicKey::new(alg, signable.pubkey.as_ref().unwrap());
+        assert!(pubkey.verify(&signable.tbs, &sig).is_ok(), "new signature must verify");
+        assert!(pubkey.verify(b"tampered", &sig).is_err(), "signature is bound to the tbs");
+    }
+
+    #[test]
+    fn sign_with_a_sec1_key_after_wrapping_to_pkcs8() {
+        use crate::{ber, input};
+        let (cert_der, _) = input::load(&std::fs::read("testdata/keylink/cert_ec.der").unwrap()).unwrap();
+        let signable =
+            x509::parse_signable(&ber::parse_forest(&cert_der, 0).unwrap(), &cert_der).unwrap();
+        // The bare SEC1 form of the same key, normalized to PKCS#8, signs and
+        // verifies just like the PKCS#8 file.
+        let (sec1_der, _) = input::load(&std::fs::read("testdata/keylink/key_ec_sec1.der").unwrap()).unwrap();
+        let pkcs8 = x509::to_pkcs8_der(&ber::parse_forest(&sec1_der, 0).unwrap())
+            .expect("SEC1 wraps to PKCS#8");
+        let sig = sign(&signable.sig_alg, &pkcs8, &signable.tbs).unwrap();
+        let alg = algorithm_for(&signable.sig_alg).unwrap();
+        let pubkey = signature::UnparsedPublicKey::new(alg, signable.pubkey.as_ref().unwrap());
+        assert!(pubkey.verify(&signable.tbs, &sig).is_ok());
+    }
+
+    #[test]
+    fn sign_rejects_a_key_of_the_wrong_type() {
+        use crate::{ber, input};
+        let (cert_der, _) = input::load(&std::fs::read("testdata/keylink/cert_ec.der").unwrap()).unwrap();
+        let cert_roots = ber::parse_forest(&cert_der, 0).unwrap();
+        let signable = x509::parse_signable(&cert_roots, &cert_der).unwrap();
+        // An RSA key cannot produce an ECDSA signature.
+        let (rsa_key, _) = input::load(&std::fs::read("testdata/keylink/key_rsa_pkcs8.der").unwrap()).unwrap();
+        assert!(sign(&signable.sig_alg, &rsa_key, &signable.tbs).is_err());
     }
 
     #[test]
