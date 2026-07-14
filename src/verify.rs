@@ -69,6 +69,35 @@ fn oid_string(oid: &[u64]) -> String {
     oid.iter().map(|a| a.to_string()).collect::<Vec<_>>().join(".")
 }
 
+/// Whether `pkcs8_key` is a *usable* private key — it loads for one of the
+/// supported algorithms, which for an EC key also confirms the private scalar
+/// is consistent with the key's embedded public key. A key whose scalar has
+/// been corrupted (but whose structure and public key remain) fails here even
+/// though it still parses structurally, so the key↔certificate link and the
+/// re-sign key search can drop it.
+pub fn private_key_usable(pkcs8_key: &[u8]) -> bool {
+    signature::EcdsaKeyPair::from_pkcs8(&signature::ECDSA_P256_SHA256_ASN1_SIGNING, pkcs8_key)
+        .is_ok()
+        || signature::EcdsaKeyPair::from_pkcs8(
+            &signature::ECDSA_P384_SHA384_ASN1_SIGNING,
+            pkcs8_key,
+        )
+        .is_ok()
+        || signature::RsaKeyPair::from_pkcs8(pkcs8_key).is_ok()
+        || signature::Ed25519KeyPair::from_pkcs8(pkcs8_key).is_ok()
+}
+
+/// Whether `signature` is a valid `sig_alg` signature over `tbs` under the
+/// public key `pubkey` (a `subjectPublicKey`, unused-bits octet stripped).
+/// Used by re-signing to confirm a freshly generated signature actually
+/// matches the issuer certificate before committing to it.
+pub fn verify_signature(sig_alg: &[u64], pubkey: &[u8], tbs: &[u8], signature: &[u8]) -> bool {
+    match algorithm_for(sig_alg) {
+        Some(alg) => signature::UnparsedPublicKey::new(alg, pubkey).verify(tbs, signature).is_ok(),
+        None => false,
+    }
+}
+
 /// Whether `sign` can generate a signature for this signature-algorithm OID.
 /// (A subset of what `algorithm_for` can *verify* — `aws-lc-rs` does not sign
 /// with the legacy SHA-1 RSA algorithm.)

@@ -614,9 +614,11 @@ pub enum Mode {
     Resign(ResignState),
 }
 
-/// State of the re-sign dialog: whether the issuer's signing key is
-/// available and, if so, which public key identifies it (used to re-resolve
-/// the private key material when the user confirms).
+/// State of the re-sign dialog: whether a new signature can be produced and,
+/// if so, the already-generated (and verified) signature to apply on confirm.
+/// The signature is computed when the dialog opens by trying every available
+/// issuer key, so "available" means a *usable* key was actually found — not
+/// merely that some key file is present.
 pub struct ResignState {
     /// Short description of the signer (issuer) whose key is needed.
     pub issuer_summary: String,
@@ -624,8 +626,9 @@ pub struct ResignState {
     pub detail: String,
     /// Whether a new signature can be created.
     pub ready: bool,
-    /// The signer's public-key identity; `Some` only when `ready`.
-    signer_key: Option<x509::PublicKeyId>,
+    /// The new signature to install on confirm; `Some` only when `ready`.
+    /// (Public data — no private key material is retained in the dialog.)
+    signature: Option<Vec<u8>>,
 }
 
 /// Private-key passwords entered this session, retained (until the program
@@ -821,7 +824,7 @@ impl App {
         browser.reveal(&path);
         let signables = x509::scan_dir_signables(&dir);
         let ca_index = x509::cert_candidates(&signables);
-        let key_files = x509::scan_dir_key_files(&dir);
+        let key_files = scan_usable_key_files(&dir);
         let mut app = App {
             path,
             out_path,
@@ -864,7 +867,7 @@ impl App {
         let browser = FileBrowser::new(dir.clone());
         let signables = x509::scan_dir_signables(&dir);
         let ca_index = x509::cert_candidates(&signables);
-        let key_files = x509::scan_dir_key_files(&dir);
+        let key_files = scan_usable_key_files(&dir);
         let mut app = App {
             path: dir.clone(),
             out_path: dir,
@@ -1050,69 +1053,82 @@ impl App {
         self.mode = Mode::Resign(state);
     }
 
-    /// Determine whether the modified `signable` can be re-signed: the
-    /// algorithm must be supported, its issuer certificate must be present,
-    /// and that issuer's private key must be available (a plaintext key file,
-    /// or an encrypted key/PKCS#12 already unlocked this session).
+    /// Determine whether the modified `signable` can be re-signed, and if so
+    /// produce the new signature. The algorithm must be supported and the
+    /// issuer certificate present; then *every* candidate private key (all
+    /// plaintext key files and session-unlocked encrypted keys/PKCS#12s whose
+    /// public key matches an issuer) is tried until one produces a signature
+    /// that actually verifies against that issuer's certificate. Trying all of
+    /// them — rather than committing to the first key that merely parses —
+    /// means an invalidated or mismatched key is skipped in favor of a valid
+    /// one (e.g. a corrupted plaintext key falls through to the SEC1 copy or
+    /// to an unlocked encrypted key).
     fn resign_state(&self, signable: &Signable) -> ResignState {
+        let not_ready = |issuer: &str, detail: &str| ResignState {
+            issuer_summary: issuer.to_string(),
+            detail: detail.to_string(),
+            ready: false,
+            signature: None,
+        };
         if !verify::signing_supported(&signable.sig_alg) {
-            return ResignState {
-                issuer_summary: String::new(),
-                detail: "this signature algorithm is not supported for re-signing".to_string(),
-                ready: false,
-                signer_key: None,
-            };
+            return not_ready("", "this signature algorithm is not supported for re-signing");
         }
         let candidates = verify::claimed_issuers(&self.ca_index, signable);
         if candidates.is_empty() {
-            return ResignState {
-                issuer_summary: "(issuer not found)".to_string(),
-                detail: "the issuer's certificate is not in this folder".to_string(),
-                ready: false,
-                signer_key: None,
-            };
+            return not_ready("(issuer not found)", "the issuer's certificate is not in this folder");
         }
         for candidate in &candidates {
-            if let Some(id) = x509::public_key_id(&candidate.pubkey_alg, &candidate.pubkey) {
-                if self.signing_key_pkcs8_for(&id).is_some() {
+            let Some(id) = x509::public_key_id(&candidate.pubkey_alg, &candidate.pubkey) else {
+                continue;
+            };
+            for material in self.signing_materials_for(&id) {
+                let Ok(signature) = verify::sign(&signable.sig_alg, &material, &signable.tbs) else {
+                    continue; // this key cannot sign (wrong type, inconsistent, …)
+                };
+                if verify::verify_signature(
+                    &signable.sig_alg,
+                    &candidate.pubkey,
+                    &signable.tbs,
+                    &signature,
+                ) {
                     return ResignState {
                         issuer_summary: candidate.subject_summary.clone(),
                         detail: "the issuer's signing key is available".to_string(),
                         ready: true,
-                        signer_key: Some(id),
+                        signature: Some(signature),
                     };
                 }
             }
         }
-        ResignState {
-            issuer_summary: candidates[0].subject_summary.clone(),
-            detail: "the issuer's private key is not available — open its key file and, \
-                     if it is encrypted, decrypt it with 'z' first"
-                .to_string(),
-            ready: false,
-            signer_key: None,
-        }
+        not_ready(
+            &candidates[0].subject_summary,
+            "the issuer's private key is not available — open its key file and, \
+             if it is encrypted, decrypt it with 'z' first",
+        )
     }
 
-    /// The PKCS#8 `PrivateKeyInfo` of the private key whose public key is
-    /// `id`, if reachable: a plaintext key file, or a session-unlocked
-    /// encrypted key / PKCS#12 re-decrypted with its retained password.
-    fn signing_key_pkcs8_for(&self, id: &x509::PublicKeyId) -> Option<Vec<u8>> {
+    /// Every reachable private key whose public key is `id`, as PKCS#8
+    /// `PrivateKeyInfo` DER: each plaintext key file (freshly re-read, so an
+    /// on-disk change is reflected) plus each session-unlocked encrypted
+    /// key/PKCS#12 (re-decrypted with its retained password). The caller
+    /// tries them in turn — none is trusted to actually work until it signs.
+    fn signing_materials_for(&self, id: &x509::PublicKeyId) -> Vec<Vec<u8>> {
+        let mut materials = Vec::new();
         for key_file in &self.key_files {
             if key_file.key == *id {
                 if let Some(pkcs8) = read_plaintext_key_pkcs8(&key_file.path) {
-                    return Some(pkcs8);
+                    materials.push(pkcs8);
                 }
             }
         }
         for (path, pubkey) in &self.unlocked_keys {
             if pubkey == id {
                 if let Some(pkcs8) = self.decrypt_key_pkcs8(path, id) {
-                    return Some(pkcs8);
+                    materials.push(pkcs8);
                 }
             }
         }
-        None
+        materials
     }
 
     /// Re-decrypt a session-unlocked key/PKCS#12 file with its retained
@@ -1143,45 +1159,28 @@ impl App {
         self.status = "re-signing cancelled".to_string();
     }
 
-    /// Confirm re-signing: sign the current `tbs` with the resolved issuer
-    /// key and replace the object's outer signature.
+    /// Confirm re-signing: install the signature the dialog already generated
+    /// and verified (over the current, unchanged `tbs`) into the object's
+    /// outer signature.
     pub fn submit_resign(&mut self) {
         let Mode::Resign(ref state) = self.mode else { return };
-        let signer_key = state.signer_key.clone();
-        let ready = state.ready;
+        let signature = if state.ready { state.signature.clone() } else { None };
         self.mode = Mode::Browse;
-        if !ready {
+        let Some(sig) = signature else {
             self.status = "re-signing is not available".to_string();
             return;
+        };
+        // The outer `signature` BIT STRING is the third element of a
+        // Certificate / CertificateList; its content is one unused-bits octet
+        // (0) followed by the signature.
+        if let Some(node) = node_at_mut(&mut self.roots, &[0, 2]) {
+            node.value = std::iter::once(0u8).chain(sig).collect();
+            node.children.clear();
+            node.encapsulates = false;
         }
-        let signature = (|| {
-            let der = ber::encode_forest(&self.roots);
-            let roots =
-                ber::parse_forest(&der, 0).map_err(|e| format!("re-encode failed: {}", e))?;
-            let signable = x509::parse_signable(&roots, &der)
-                .ok_or_else(|| "no longer a certificate or CRL".to_string())?;
-            let id = signer_key.ok_or_else(|| "no signing key selected".to_string())?;
-            let pkcs8 = self
-                .signing_key_pkcs8_for(&id)
-                .ok_or_else(|| "the signing key is no longer available".to_string())?;
-            verify::sign(&signable.sig_alg, &pkcs8, &signable.tbs)
-        })();
-        match signature {
-            Ok(sig) => {
-                // The outer `signature` BIT STRING is the third element of a
-                // Certificate / CertificateList; its content is one
-                // unused-bits octet (0) followed by the signature.
-                if let Some(node) = node_at_mut(&mut self.roots, &[0, 2]) {
-                    node.value = std::iter::once(0u8).chain(sig).collect();
-                    node.children.clear();
-                    node.encapsulates = false;
-                }
-                self.dirty = true;
-                self.rebuild();
-                self.status = "new signature created — 's' writes the file".to_string();
-            }
-            Err(e) => self.status = format!("re-signing failed: {}", e),
-        }
+        self.dirty = true;
+        self.rebuild();
+        self.status = "new signature created — 's' writes the file".to_string();
     }
 
     pub fn cancel_password(&mut self) {
@@ -1332,7 +1331,23 @@ impl App {
         }
 
         self.sig_status = own_signable.map(|s| verify::verify_against(&self.ca_index, &s));
+        self.refresh_own_key_file();
         self.recompute_browser_relations();
+    }
+
+    /// Refresh this file's own entry in `key_files` from its live (possibly
+    /// edited, unsaved) content — the key-file analog of the `signables`
+    /// refresh above. A plaintext key edited to no longer be a valid key
+    /// (its scalar corrupted, or its structure broken) loses its entry, so
+    /// its key↔certificate link disappears; a key whose public key changed
+    /// gets the new identity. Encrypted keys are never in `key_files`.
+    fn refresh_own_key_file(&mut self) {
+        self.key_files.retain(|k| k.path != self.path);
+        if self.file_open {
+            if let Some(key) = usable_key_id(&self.roots) {
+                self.key_files.push(x509::KeyFile { path: self.path.clone(), key });
+            }
+        }
     }
 
     /// Live-preview the file currently highlighted in the browser into the
@@ -2444,6 +2459,29 @@ fn read_plaintext_key_pkcs8(path: &Path) -> Option<Vec<u8>> {
     x509::to_pkcs8_der(&roots)
 }
 
+/// The public-key identity of the private key in `roots`, but only if the key
+/// is cryptographically usable — its private scalar must be consistent with
+/// its public key. A structurally-valid but corrupted key returns `None`, so
+/// it neither shows a key↔certificate link nor is offered for re-signing.
+fn usable_key_id(roots: &[Node]) -> Option<x509::PublicKeyId> {
+    let id = x509::public_key_id_of_private_key(roots)?;
+    let pkcs8 = x509::to_pkcs8_der(roots)?;
+    verify::private_key_usable(&pkcs8).then_some(id)
+}
+
+/// Scan `dir` for plaintext key files, keeping only cryptographically usable
+/// keys — a broken key never gets a key↔certificate link.
+fn scan_usable_key_files(dir: &Path) -> Vec<x509::KeyFile> {
+    x509::scan_dir_key_files(dir)
+        .into_iter()
+        .filter(|kf| {
+            read_plaintext_key_pkcs8(&kf.path)
+                .map(|pkcs8| verify::private_key_usable(&pkcs8))
+                .unwrap_or(false)
+        })
+        .collect()
+}
+
 fn collect_rows(
     node: &Node,
     path: Vec<usize>,
@@ -3240,6 +3278,36 @@ mod tests {
         assert!(app.unlocked_keys.is_empty());
     }
 
+    #[test]
+    fn invalidating_a_plaintext_key_removes_its_certificate_link() {
+        let dir = tmp_dir("keylink-invalidate");
+        std::fs::copy(kl("cert_ec.der"), dir.join("cert.der")).unwrap();
+        std::fs::copy(kl("key_ec_pkcs8.der"), dir.join("key.der")).unwrap();
+
+        // The certificate links to its valid key.
+        let mut app = open_real_file(&dir.join("cert.der"));
+        assert!(link_names(&app).contains("key.der"), "{:?}", link_names(&app));
+
+        // Open the key and corrupt its private scalar. The ASN.1 structure and
+        // embedded public key stay intact — so the old, purely structural
+        // match would still show a link — but the key is now cryptographically
+        // invalid (scalar inconsistent with the public key).
+        app.open_file(dir.join("key.der")).unwrap();
+        let scalar = node_at_mut(&mut app.roots, &[0, 2, 0, 1]).expect("EC private scalar");
+        scalar.value[0] ^= 0xFF;
+        app.dirty = true;
+        app.rebuild();
+
+        // Back on the certificate, the link to the now-invalid key is gone.
+        browser_select_by_name(&mut app, "cert.der");
+        assert!(
+            !link_names(&app).contains("key.der"),
+            "an invalidated key must not link: {:?}",
+            link_names(&app)
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     // ---- re-signing -------------------------------------------------------
 
     /// Flip a bit in the certificate's serialNumber so its (unchanged)
@@ -3250,6 +3318,30 @@ mod tests {
         serial.value[last] ^= 0x01;
         app.dirty = true;
         app.rebuild();
+    }
+
+    /// Copy the plaintext EC PKCS#8 key at `src` to `dst` with its private
+    /// scalar corrupted but its embedded public key left intact. The result
+    /// still *matches* the certificate by public key (so it is offered as a
+    /// signing candidate) but can no longer produce a valid signature.
+    fn write_corrupted_ec_pkcs8(src: &Path, dst: &Path) {
+        let (der, _) = input::load(&std::fs::read(src).unwrap()).unwrap();
+        let mut roots = ber::parse_forest(&der, 0).unwrap();
+        // PKCS#8 privateKey OCTET STRING (encapsulates) → ECPrivateKey →
+        // child [1] is the private-scalar OCTET STRING.
+        let ec = &mut roots[0].children[2].children[0];
+        ec.children[1].value[0] ^= 0xFF;
+        std::fs::write(dst, ber::encode_forest(&roots)).unwrap();
+        // Sanity: it still parses as a private key with the *same* public key,
+        // so it is a candidate the resolver must try (and skip).
+        let good = public_key_id_of_private_key_at(src);
+        let bad = public_key_id_of_private_key_at(dst);
+        assert_eq!(good, bad, "corrupted key must still match by public key");
+    }
+
+    fn public_key_id_of_private_key_at(path: &Path) -> Option<x509::PublicKeyId> {
+        let (der, _) = input::load(&std::fs::read(path).unwrap()).unwrap();
+        x509::public_key_id_of_private_key(&ber::parse_forest(&der, 0).unwrap())
     }
 
     #[test]
@@ -3298,6 +3390,58 @@ mod tests {
         assert!(
             matches!(app.sig_status, Some(SignatureStatus::Verified { .. })),
             "re-signed with the encrypted issuer key: {}",
+            app.status
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resign_falls_through_an_invalidated_key_to_a_valid_alternate() {
+        // A folder holding the certificate, an *invalidated* PKCS#8 key, and
+        // a valid SEC1 copy of the same key. Re-signing must skip the broken
+        // key and succeed with the alternate.
+        let dir = tmp_dir("resign-alt");
+        std::fs::copy(kl("cert_ec.der"), dir.join("cert.der")).unwrap();
+        write_corrupted_ec_pkcs8(&kl("key_ec_pkcs8.der"), &dir.join("broken.der"));
+        std::fs::copy(kl("key_ec_sec1.der"), dir.join("good.der")).unwrap();
+
+        let mut app = open_real_file(&dir.join("cert.der"));
+        modify_serial(&mut app);
+        assert!(matches!(app.sig_status, Some(SignatureStatus::Invalid { .. })));
+        app.start_resign();
+        let Mode::Resign(ref state) = app.mode else { panic!("re-sign dialog") };
+        assert!(state.ready, "the valid alternate key should be found: {}", state.detail);
+        app.submit_resign();
+        assert!(
+            matches!(app.sig_status, Some(SignatureStatus::Verified { .. })),
+            "re-signed with the valid alternate key: {}",
+            app.status
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resign_falls_through_an_invalidated_key_to_the_unlocked_encrypted_key() {
+        // The only plaintext key present is invalidated; the sole working key
+        // is the encrypted one, unlocked earlier this session. Re-signing must
+        // skip the broken plaintext key and use the encrypted key.
+        let dir = tmp_dir("resign-alt-enc");
+        std::fs::copy(kl("cert_ec.der"), dir.join("cert.der")).unwrap();
+        write_corrupted_ec_pkcs8(&kl("key_ec_pkcs8.der"), &dir.join("broken.der"));
+        std::fs::copy(kl("key_ec_enc.der"), dir.join("enc.der")).unwrap();
+
+        // Unlock the encrypted key first (retains its password).
+        let mut app = open_real_file(&dir.join("enc.der"));
+        enter_password(&mut app, "asn1editor");
+        app.open_file(dir.join("cert.der")).unwrap();
+        modify_serial(&mut app);
+        app.start_resign();
+        let Mode::Resign(ref state) = app.mode else { panic!("re-sign dialog") };
+        assert!(state.ready, "the unlocked encrypted key should be found: {}", state.detail);
+        app.submit_resign();
+        assert!(
+            matches!(app.sig_status, Some(SignatureStatus::Verified { .. })),
+            "re-signed with the unlocked encrypted key: {}",
             app.status
         );
         let _ = std::fs::remove_dir_all(&dir);

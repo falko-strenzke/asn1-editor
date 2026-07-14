@@ -727,7 +727,15 @@ The set of key-bearers has two halves, assembled in
 
 * **static** — plaintext key files found by `x509::scan_dir_key_files` at
   startup (a snapshot like `signables`; encrypted keys and PKCS#12
-  containers are excluded, their key being unreadable without a password);
+  containers are excluded, their key being unreadable without a password).
+  Each is kept only if it is a **cryptographically usable** key
+  (`verify::private_key_usable` loads it, which for an EC key confirms the
+  private scalar matches the embedded public key) — a structurally-valid but
+  corrupted key never shows a link. The open document's own entry is
+  refreshed from its live, possibly-edited content on every
+  `recompute_sig_status` (`App::refresh_own_key_file`, the key-file analog of
+  the `signables` refresh), so editing a key to break it removes its link
+  immediately, and changing its key updates the target;
 * **unlocked** — public keys recovered when the user decrypts an encrypted
   PKCS#8 key or a PKCS#12 (§9a/§9b) with `z`. These are cached in
   `App::unlocked_keys` keyed by file path at decryption time and **persist
@@ -905,23 +913,35 @@ ECDSA P-256/P-384, Ed25519 — a subset of what can be *verified*, since
 `aws-lc-rs` will not sign with legacy SHA-1); the claimed issuer certificate
 is present in the scanned tree (`verify::claimed_issuers` matches by
 `authorityKeyIdentifier`/`subjectKeyIdentifier` or issuer/subject DN —
-*without* checking the current, now-broken signature); and that issuer's
-private key is reachable. Key resolution (`App::signing_key_pkcs8_for`)
-searches the same two pools as the key↔certificate links (§9): a plaintext
-key file (`x509::to_pkcs8_der`, which returns PKCS#8 as-is and wraps a bare
-SEC1 key), or a session-unlocked encrypted key / PKCS#12, re-decrypted on
-demand with its **retained password** (below). A self-signed certificate is
+*without* checking the current, now-broken signature); and a **usable**
+issuer key must actually produce a valid signature.
+
+Rather than commit to the first key that merely parses, `resign_state`
+gathers *every* candidate private key — `App::signing_materials_for` collects
+all matching plaintext key files (`x509::to_pkcs8_der`, which returns PKCS#8
+as-is and wraps a bare SEC1 key) and all session-unlocked encrypted keys /
+PKCS#12s (re-decrypted on demand with their **retained password**, below),
+drawn from the same two pools as the key↔certificate links (§9). It then
+tries each in turn: `verify::sign` generates a signature and
+`verify::verify_signature` checks it against the issuer certificate's public
+key; the first signature that verifies is kept. This makes the search robust
+to a key that matches by public key but cannot sign — an invalidated,
+corrupted, or replaced plaintext key is skipped in favor of a valid
+alternate (another key file, or an unlocked encrypted key), instead of the
+whole operation failing on the first candidate. A self-signed certificate is
 its own issuer, so its own key signs it.
 
-On confirmation (`App::submit_resign`), the current `tbs` is re-derived from
-the edited tree, `verify::sign` produces a signature with the resolved
-PKCS#8 key (erroring if the key and algorithm disagree — e.g. an RSA key for
-an ECDSA algorithm), and the object's outer `signature` BIT STRING (the third
-element of the `Certificate`/`CertificateList` SEQUENCE, at path `[0, 2]`) is
-replaced with a leading unused-bits octet followed by the new signature. The
+The verified signature is computed when the dialog opens and stored in
+`ResignState` (public data — no private key material is held in the dialog).
+On confirmation (`App::submit_resign`) it is installed into the object's
+outer `signature` BIT STRING (the third element of the
+`Certificate`/`CertificateList` SEQUENCE, at path `[0, 2]`) as a leading
+unused-bits octet followed by the signature — the `tbs` cannot have changed
+while the dialog was open, so the pre-computed signature still matches. The
 document is re-encoded and marked dirty; the next `recompute_sig_status` then
-shows the signature verifying again. `verify.rs` gains signing (it already
-owned `aws-lc-rs` verification), keeping all signature crypto in one module.
+shows the signature verifying again. `verify.rs` gains signature generation
+(it already owned `aws-lc-rs` verification), keeping all signature crypto in
+one module.
 
 ### Retained passwords
 
@@ -1120,13 +1140,16 @@ read-only. Key↔certificate-link tests cover public-key extraction from EC
 certificate, the pure `key_links_for` matcher (both directions, dedup, no
 self-links), the headless gutter routing, and — at the app level — that a
 certificate links to its plaintext key files, that an encrypted key or
-PKCS#12 links only after the password is entered, and that the link persists
-after navigating to the certificate. Re-signing tests cover the sign→verify
+PKCS#12 links only after the password is entered, that the link persists
+after navigating to the certificate, and that editing a key to corrupt its
+private scalar removes the link. Re-signing tests cover the sign→verify
 round trip (including a SEC1 key wrapped to PKCS#8, and rejection of a
 wrong-type key), and — at the app level — that modifying a certificate breaks
 its signature and re-signing restores it with a plaintext issuer key, that
-the same works with an *encrypted* issuer key via a retained password, and
-that a missing issuer key is reported and confirming it is a no-op.
+the same works with an *encrypted* issuer key via a retained password, that
+re-signing falls through an invalidated key to a valid alternate (another key
+file, or an unlocked encrypted key) rather than failing on it, and that a
+missing issuer key is reported and confirming it is a no-op.
 
 Beyond the automated triples check, the `--dump` output format itself
 (column widths derived from file size, `offset length:` prefix,
