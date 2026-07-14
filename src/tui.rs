@@ -49,6 +49,7 @@ const DECRYPTED_UNLOCKED_PREFIX: &str = "🔓 decrypted: ";
 const REL_SIGNER: Color = Color::Cyan; // incoming: a file that signed the selection
 const REL_SIGNS: Color = Color::Magenta; // outgoing: a file the selection signed
 const REL_BROKEN: Color = Color::Red; // claimed issuance whose signature fails to verify
+const REL_KEY: Color = Color::LightGreen; // undirected: a private key and its certificate
 
 pub fn run(mut app: App) -> io::Result<()> {
     let mut terminal = ratatui::init();
@@ -315,8 +316,13 @@ const ARROW_GUTTER_W: usize = 4;
 ///   into the selected row (arrowhead `►` entering the selection);
 /// * right side — the outgoing "signs" edges, drawn from the selected row
 ///   into each signed file (arrowheads `◄` entering the targets); the
-///   targets share one vertical trunk, branching with `┤` junctions.
+///   targets share one vertical trunk, branching with `┤` junctions;
+/// * far-left `keylink` gutter — the undirected key↔certificate links, drawn
+///   with the same rounded elbows but **no arrowheads** (a private key is not
+///   "signed by" its certificate), in a distinct color, sharing one trunk
+///   that branches to every linked file with `├` junctions.
 struct ArrowGutters {
+    keylink: Vec<Option<(String, Color)>>,
     left: Vec<Option<(String, Color)>>,
     right: Vec<Option<(String, Color)>>,
 }
@@ -327,9 +333,38 @@ struct ArrowGutters {
 /// row to draw them to.
 fn arrow_gutters(row_paths: &[&std::path::Path], selected: usize, rel: &FileRelations) -> ArrowGutters {
     let n = row_paths.len();
-    let mut g = ArrowGutters { left: vec![None; n], right: vec![None; n] };
+    let mut g =
+        ArrowGutters { keylink: vec![None; n], left: vec![None; n], right: vec![None; n] };
     if selected >= n {
         return g;
+    }
+
+    // Key↔certificate links, dedicated leftmost gutter. Undirected: a trunk
+    // in the leftmost column with a plain `── ` stub (no arrowhead) into the
+    // selected row and each linked file:
+    //   ╭──  linked file
+    //   │
+    //   ├──  another linked file
+    //   ╰──  selected
+    let mut endpoints: Vec<usize> = rel
+        .key_links
+        .iter()
+        .filter_map(|p| row_paths.iter().position(|q| q == p))
+        .filter(|&i| i != selected)
+        .collect();
+    if !endpoints.is_empty() {
+        endpoints.push(selected);
+        let lo = *endpoints.iter().min().unwrap();
+        let hi = *endpoints.iter().max().unwrap();
+        for row in lo..=hi {
+            let cell = match (row == lo, row == hi, endpoints.contains(&row)) {
+                (true, _, _) => "╭── ", // top corner (always an endpoint)
+                (_, true, _) => "╰── ", // bottom corner
+                (_, _, true) => "├── ", // intermediate linked file
+                _ => "│   ",            // trunk passing through
+            };
+            g.keylink[row] = Some((cell.to_string(), REL_KEY));
+        }
     }
 
     // Incoming edge, left gutter (trunk in the leftmost column):
@@ -504,13 +539,14 @@ fn draw_browser(frame: &mut Frame, app: &mut App, area: Rect) {
         .collect();
     let gutters = arrow_gutters(&row_paths, app.browser.selected, &app.browser_relations);
     // The gutters only take up columns while there is an arrow to show.
+    let has_keylink = gutters.keylink.iter().any(|c| c.is_some());
     let has_left = gutters.left.iter().any(|c| c.is_some());
     let has_right = gutters.right.iter().any(|c| c.is_some());
 
     // Column the right-hand arrows start in: one past the longest name,
     // but never past the pane edge — long names are truncated with '…' so
     // the vertical trunk stays visible inside the pane.
-    let left_w = if has_left { ARROW_GUTTER_W } else { 0 };
+    let left_w = usize::from(has_keylink) * ARROW_GUTTER_W + usize::from(has_left) * ARROW_GUTTER_W;
     let inner_w = area.width.saturating_sub(2) as usize; // pane borders
     let name_col_w = name_width
         .min(inner_w.saturating_sub(left_w + ARROW_GUTTER_W))
@@ -521,13 +557,15 @@ fn draw_browser(frame: &mut Frame, app: &mut App, area: Rect) {
         .enumerate()
         .map(|(i, (text, style, marker_offset, marker_style))| {
             let mut spans = Vec::new();
+            let gutter_span = |cell: &Option<(String, Color)>| match cell {
+                Some((text, color)) => Span::styled(text.clone(), Style::new().fg(*color).bold()),
+                None => Span::raw(" ".repeat(ARROW_GUTTER_W)),
+            };
+            if has_keylink {
+                spans.push(gutter_span(&gutters.keylink[i]));
+            }
             if has_left {
-                spans.push(match &gutters.left[i] {
-                    Some((cell, color)) => {
-                        Span::styled(cell.clone(), Style::new().fg(*color).bold())
-                    }
-                    None => Span::raw(" ".repeat(ARROW_GUTTER_W)),
-                });
+                spans.push(gutter_span(&gutters.left[i]));
             }
             if has_right {
                 // Pad (or truncate) the name so every right-hand cell
@@ -555,6 +593,7 @@ fn draw_browser(frame: &mut Frame, app: &mut App, area: Rect) {
         Span::styled("─► signer ", Style::new().fg(REL_SIGNER)),
         Span::styled("─► signs ", Style::new().fg(REL_SIGNS)),
         Span::styled("─► bad ", Style::new().fg(REL_BROKEN)),
+        Span::styled("── key ", Style::new().fg(REL_KEY)),
     ]);
     let list = List::new(items)
         .block(
@@ -1549,7 +1588,7 @@ mod tests {
     #[test]
     fn incoming_arrow_routes_from_signer_below_to_selection() {
         let rows = [Path::new("a"), Path::new("b"), Path::new("c")];
-        let rel = FileRelations { signed_by: Some(edge("c", true)), signs: vec![] };
+        let rel = FileRelations { signed_by: Some(edge("c", true)), signs: vec![], key_links: vec![] };
         let g = arrow_gutters(&rows, 0, &rel);
         // Elbow with two corners: out of "c", up the trunk, into "a".
         assert_eq!(cells(&g.left), [Some("╭─► "), Some("│   "), Some("╰── ")]);
@@ -1560,7 +1599,7 @@ mod tests {
     #[test]
     fn incoming_arrow_from_signer_above_points_down_into_selection() {
         let rows = [Path::new("a"), Path::new("b"), Path::new("c")];
-        let rel = FileRelations { signed_by: Some(edge("a", false)), signs: vec![] };
+        let rel = FileRelations { signed_by: Some(edge("a", false)), signs: vec![], key_links: vec![] };
         let g = arrow_gutters(&rows, 2, &rel);
         assert_eq!(cells(&g.left), [Some("╭── "), Some("│   "), Some("╰─► ")]);
         // Unverified issuance renders red.
@@ -1573,6 +1612,7 @@ mod tests {
         let rel = FileRelations {
             signed_by: None,
             signs: vec![edge("a", true), edge("d", false)],
+            key_links: vec![],
         };
         let g = arrow_gutters(&rows, 1, &rel);
         assert!(g.left.iter().all(|c| c.is_none()));
@@ -1590,7 +1630,7 @@ mod tests {
     #[test]
     fn all_broken_targets_turn_the_whole_trunk_red() {
         let rows = [Path::new("a"), Path::new("b")];
-        let rel = FileRelations { signed_by: None, signs: vec![edge("b", false)] };
+        let rel = FileRelations { signed_by: None, signs: vec![edge("b", false)], key_links: vec![] };
         let g = arrow_gutters(&rows, 0, &rel);
         assert_eq!(cells(&g.right), [Some("───╮"), Some("◄──╯")]);
         assert!(g.right.iter().flatten().all(|(_, c)| *c == REL_BROKEN));
@@ -1602,8 +1642,36 @@ mod tests {
         let rel = FileRelations {
             signed_by: Some(edge("hidden/x", true)),
             signs: vec![edge("hidden/y", true)],
+            key_links: vec![PathBuf::from("hidden/z")],
         };
         let g = arrow_gutters(&rows, 0, &rel);
+        assert!(g.keylink.iter().all(|c| c.is_none()));
+        assert!(g.left.iter().all(|c| c.is_none()));
+        assert!(g.right.iter().all(|c| c.is_none()));
+    }
+
+    #[test]
+    fn key_links_route_as_a_headless_trunk() {
+        let rows = [Path::new("a"), Path::new("b"), Path::new("c"), Path::new("d")];
+        let rel = FileRelations {
+            signed_by: None,
+            signs: vec![],
+            key_links: vec![PathBuf::from("a"), PathBuf::from("d")],
+        };
+        let g = arrow_gutters(&rows, 1, &rel); // selection "b"
+        // Elbow from "b" to the linked files above ("a") and below ("d"),
+        // with "c" passed through by the trunk. No arrowheads.
+        assert_eq!(
+            cells(&g.keylink),
+            [Some("╭── "), Some("├── "), Some("│   "), Some("╰── ")]
+        );
+        assert!(g.keylink.iter().flatten().all(|(_, c)| *c == REL_KEY));
+        assert!(g
+            .keylink
+            .iter()
+            .flatten()
+            .all(|(cell, _)| !cell.contains('►') && !cell.contains('◄')));
+        // The signature gutters are independent and untouched.
         assert!(g.left.iter().all(|c| c.is_none()));
         assert!(g.right.iter().all(|c| c.is_none()));
     }

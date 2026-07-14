@@ -40,6 +40,10 @@ Goals:
 * Decrypt the encrypted regions of a supported PKCS#12 (`PFX`) container
   into read-only virtual subtrees, revealing the certificates and private
   keys inside (§9b).
+* Show, in the file browser, an undirected connection between a private-key
+  file and the certificate carrying its public key — including keys that
+  become known only after a password is entered (§9 → Key ↔ certificate
+  links).
 
 Non-goals (see §14):
 
@@ -81,8 +85,11 @@ src/
   browser.rs far-left file browser: folding directory tree, independent
              of whatever document (if any) is open
   x509.rs    structural decoding of Certificate/CertificateList + a
-             recursive directory scan for candidate CA certs
-  verify.rs  signature verification (uses aws-lc-rs)
+             recursive directory scan for candidate CA certs; also extracts
+             the public-key identity of a private key or certificate for the
+             key↔certificate links
+  verify.rs  signature verification (uses aws-lc-rs) + the pure key↔cert
+             link matcher
   pkcs8.rs   structural decoding + password decryption/re-encryption of
              EncryptedPrivateKeyInfo (PBES2; uses aws-lc-rs). Exposes a
              reusable Pbes2 (PBKDF2 + AES-CBC) decryptor shared with pkcs12.rs
@@ -106,6 +113,10 @@ testdata/  DER samples (EC cert, RSA cert, SEC1 EC key, PKCS#8 key,
            exercising signature verification (§9) end to end; also
            server_bad_signature.der, a structurally valid leaf cert with
            one signature byte flipped, for the "does NOT verify" path
+  keylink/ one EC key pair (cert + plaintext PKCS#8 + SEC1 + encrypted
+           PKCS#8 + PKCS#12) and one RSA pair (cert + PKCS#8), for exercising
+           the key↔certificate links; the encrypted/PKCS#12 files use the
+           password "asn1editor"
 ```
 
 Dependency rule: `ber.rs` and `oid.rs` depend on nothing; `input.rs` and
@@ -692,6 +703,52 @@ are independent (live preview aside): a user can edit file A while the
 browser happens to be showing file B's relation to A, and B's arrow must
 still reflect the edit without any navigation happening in between.
 
+### Key ↔ certificate links (file browser)
+
+Alongside the directional signature edges, the browser draws an
+**undirected** link between a private-key file and the certificate that
+carries its public key — "this folder holds the key for that cert". The
+match is structural, not cryptographic: `x509::public_key_id_of_private_key`
+recovers the public key a private key corresponds to (the EC public point a
+SEC1 `ECPrivateKey` / PKCS#8-wrapped EC key embeds in its optional
+`publicKey [1]`; the modulus and exponent of an RSA key), reducing it to a
+canonical `PublicKeyId` that compares equal to the same key extracted from a
+certificate's `subjectPublicKeyInfo` (`public_key_id_of_signable`). No point
+multiplication happens — a key without an embedded public part simply isn't
+matched. `verify::key_links_for(key_bearers, certs, selected)` is the pure
+matcher; it links a key-bearing file and a certificate file sharing a
+`PublicKeyId`, never a file to itself.
+
+The set of key-bearers has two halves, assembled in
+`App::compute_key_links`:
+
+* **static** — plaintext key files found by `x509::scan_dir_key_files` at
+  startup (a snapshot like `signables`; encrypted keys and PKCS#12
+  containers are excluded, their key being unreadable without a password);
+* **unlocked** — public keys recovered when the user decrypts an encrypted
+  PKCS#8 key or a PKCS#12 (§9a/§9b) with `z`. These are cached in
+  `App::unlocked_keys` keyed by file path at decryption time and **persist
+  across navigation**, so the link stays visible after the user browses away
+  from the file they decrypted (browsing previews/opens files, which clears
+  the live decrypted state — the cache is what carries the recovered key
+  forward). This is what "shown once the password becomes available"
+  requires: before the password there is no link; after it, the link appears
+  and remains for the session.
+
+The certificates are taken from the same `signables` scan. Because a
+PKCS#12 is not itself a certificate file, its internal certificate never
+creates an intra-file self-link; the container links to *external*
+certificate files matching its shrouded key.
+
+In the browser these links are rendered in their **own leftmost gutter**,
+separate from the signature gutters so the two never collide when a
+certificate has both a signer and a matching key present. The connector uses
+the same rounded elbow as the signature arrows but with **no arrowheads**
+(the relation has no direction) and a distinct color (`REL_KEY`, green): one
+trunk from the selected row branching (`╭`/`├`/`╰`) into every linked file.
+Routing lives in `tui::arrow_gutters` alongside the signature routing and is
+unit-tested the same way. The bottom-border legend gains a `── key` entry.
+
 ## 9a. Encrypted private-key decryption and synchronized editing (`src/pkcs8.rs`)
 
 An `EncryptedPrivateKeyInfo` (RFC 5958 §3 / RFC 5208) wraps a private key
@@ -887,7 +944,11 @@ Built with ratatui 0.29 (bundled crossterm backend, `ratatui::init()` /
   relations to the other visible files (§9), routed from source row to
   destination row: the signer's arrow enters the selection from the left
   (cyan), arrows to the objects the selection signed leave it to the right
-  (magenta), red = claimed issuance whose signature does not verify.
+  (magenta), red = claimed issuance whose signature does not verify. A
+  further leftmost gutter draws the undirected, arrowhead-less
+  key↔certificate links (green) between a private-key file and the
+  certificate carrying its public key — including keys unlocked by a
+  password this session (§9 → Key ↔ certificate links).
 * **Middle pane — tree.** One row per visible node: fold marker (`▸`/`▾`),
   indentation by depth, type name (colored by tag class; bold when
   constructed/encapsulating) and a short decoded value preview. Known OID
@@ -1007,7 +1068,13 @@ ciphertext edits refreshing or invalidating the virtual tree. PKCS#12 tests
 cover locating both encrypted regions of a real container, decrypting them,
 rejecting a wrong password, not misfiring on non-PKCS#12 files, and — at the
 app level — that the reveal appears below each ciphertext node and is
-read-only.
+read-only. Key↔certificate-link tests cover public-key extraction from EC
+(PKCS#8 and SEC1) and RSA keys and the equal/unequal comparison with a
+certificate, the pure `key_links_for` matcher (both directions, dedup, no
+self-links), the headless gutter routing, and — at the app level — that a
+certificate links to its plaintext key files, that an encrypted key or
+PKCS#12 links only after the password is entered, and that the link persists
+after navigating to the certificate.
 
 Beyond the automated triples check, the `--dump` output format itself
 (column widths derived from file size, `offset length:` prefix,

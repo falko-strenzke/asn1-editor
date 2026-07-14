@@ -28,7 +28,7 @@ use std::path::{Path, PathBuf};
 
 use aws_lc_rs::signature;
 
-use crate::x509::{self, CaCandidate, Signable, SignableFile};
+use crate::x509::{self, CaCandidate, PublicKeyId, Signable, SignableFile};
 
 const SHA1_WITH_RSA: &[u64] = &[1, 2, 840, 113549, 1, 1, 5];
 const SHA256_WITH_RSA: &[u64] = &[1, 2, 840, 113549, 1, 1, 11];
@@ -133,6 +133,54 @@ pub struct FileRelations {
     /// The files the selected file signed (only non-empty when the
     /// selected file is a CA certificate present as an issuer in the tree).
     pub signs: Vec<RelationEdge>,
+    /// Files linked to the selected file by a shared key pair: a private-key
+    /// file and the certificate carrying its public key. The relation is
+    /// undirected (a key is not "signed by" a cert) — no arrowhead is drawn.
+    /// Deduplicated; a file is never linked to itself.
+    pub key_links: Vec<PathBuf>,
+}
+
+/// Undirected key↔certificate links touching `selected`.
+///
+/// `key_bearers` pairs each private-key-bearing file with the public key it
+/// corresponds to — plaintext key files from the directory scan, plus (added
+/// by the caller) any currently-open encrypted key or PKCS#12 whose password
+/// has been supplied. `certs` pairs each certificate file with its public
+/// key. A link is drawn between a key-bearing file and a certificate file
+/// that share the same public key; a file is never linked to itself. Pure
+/// logic, no I/O — the two input lists are assembled by the caller.
+pub fn key_links_for(
+    key_bearers: &[(PathBuf, PublicKeyId)],
+    certs: &[(PathBuf, PublicKeyId)],
+    selected: &Path,
+) -> Vec<PathBuf> {
+    let mut out: Vec<PathBuf> = Vec::new();
+    let add = |path: &Path, out: &mut Vec<PathBuf>| {
+        if path != selected && !out.iter().any(|q| q == path) {
+            out.push(path.to_path_buf());
+        }
+    };
+    // The selected file bears a private key → link the certificates for it.
+    for (kp, kid) in key_bearers {
+        if kp.as_path() == selected {
+            for (cp, cid) in certs {
+                if cid == kid {
+                    add(cp, &mut out);
+                }
+            }
+        }
+    }
+    // The selected file is a certificate → link the private keys for it.
+    for (cp, cid) in certs {
+        if cp.as_path() == selected {
+            for (kp, kid) in key_bearers {
+                if kid == cid {
+                    add(kp, &mut out);
+                }
+            }
+        }
+    }
+    out
 }
 
 /// Is this certificate cryptographically self-signed — issuer equal to its
@@ -461,5 +509,52 @@ mod tests {
             SignatureStatus::IssuerNotFound => "IssuerNotFound",
             SignatureStatus::UnsupportedAlgorithm(_) => "UnsupportedAlgorithm",
         }
+    }
+
+    #[test]
+    fn key_links_connect_a_key_and_its_certificate_both_ways() {
+        let ec = PublicKeyId::Ec(vec![1, 2, 3]);
+        let other = PublicKeyId::Ec(vec![9, 9, 9]);
+        let keys = vec![
+            (PathBuf::from("key.der"), ec.clone()),
+            (PathBuf::from("other_key.der"), other.clone()),
+        ];
+        let certs = vec![
+            (PathBuf::from("cert.pem"), ec.clone()),
+            (PathBuf::from("unrelated.pem"), other),
+        ];
+        // From the key's side: link to its matching certificate only.
+        assert_eq!(
+            key_links_for(&keys, &certs, Path::new("key.der")),
+            vec![PathBuf::from("cert.pem")]
+        );
+        // From the certificate's side: link back to the matching key only.
+        assert_eq!(
+            key_links_for(&keys, &certs, Path::new("cert.pem")),
+            vec![PathBuf::from("key.der")]
+        );
+        // A file that shares no key with any other: nothing.
+        assert!(key_links_for(&keys, &certs, Path::new("nobody")).is_empty());
+    }
+
+    #[test]
+    fn key_links_dedup_and_never_point_at_the_file_itself() {
+        let ec = PublicKeyId::Ec(vec![1]);
+        // The same key in two cert files (plus a duplicate path): a key links
+        // to each distinct certificate file once.
+        let keys = vec![(PathBuf::from("k"), ec.clone())];
+        let certs = vec![
+            (PathBuf::from("c1"), ec.clone()),
+            (PathBuf::from("c1"), ec.clone()),
+            (PathBuf::from("c2"), ec.clone()),
+        ];
+        assert_eq!(
+            key_links_for(&keys, &certs, Path::new("k")),
+            vec![PathBuf::from("c1"), PathBuf::from("c2")]
+        );
+        // A file that is somehow both a bearer and a cert for the same key
+        // never links to itself.
+        let same = vec![(PathBuf::from("both"), ec.clone())];
+        assert!(key_links_for(&same, &same, Path::new("both")).is_empty());
     }
 }

@@ -23,8 +23,8 @@
 use std::path::{Path, PathBuf};
 
 use crate::ber::{
-    self, Class, Node, TAG_BIT_STRING, TAG_GENERALIZED_TIME, TAG_OCTET_STRING, TAG_OID,
-    TAG_SEQUENCE, TAG_UTC_TIME,
+    self, Class, Node, TAG_BIT_STRING, TAG_GENERALIZED_TIME, TAG_INTEGER, TAG_OCTET_STRING,
+    TAG_OID, TAG_SEQUENCE, TAG_UTC_TIME,
 };
 use crate::input;
 
@@ -32,6 +32,8 @@ const CN_OID: &[u64] = &[2, 5, 4, 3];
 const ORGANIZATION_OID: &[u64] = &[2, 5, 4, 10];
 const SUBJECT_KEY_ID_OID: &[u64] = &[2, 5, 29, 14];
 const AUTHORITY_KEY_ID_OID: &[u64] = &[2, 5, 29, 35];
+const EC_PUBLIC_KEY_OID: &[u64] = &[1, 2, 840, 10045, 2, 1];
+const RSA_ENCRYPTION_OID: &[u64] = &[1, 2, 840, 113549, 1, 1, 1];
 
 /// Real-world certs/CRLs are always tiny; files larger than this are
 /// skipped unread during a directory scan (keeps scanning e.g. a
@@ -413,6 +415,191 @@ fn scan_file(path: &Path) -> Option<SignableFile> {
     Some(SignableFile { path: path.to_path_buf(), signable })
 }
 
+// --------------------------------------------------------------------------
+// Public-key identity: telling whether a private key and a certificate
+// belong to the same key pair. This is structural only — the public key a
+// private key embeds (EC keys carry the point; RSA keys carry the modulus
+// and exponent) is compared with the certificate's `subjectPublicKey`. No
+// point multiplication or other crypto happens here.
+// --------------------------------------------------------------------------
+
+/// A canonical identity of a public key, reduced to its minimal value bytes
+/// so a key and the certificate carrying it compare equal regardless of the
+/// container each was extracted from.
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub enum PublicKeyId {
+    /// An elliptic-curve public point (`subjectPublicKey` / `ECPrivateKey`'s
+    /// `publicKey`, unused-bits octet stripped). Curve identity is implied by
+    /// the point's length and value.
+    Ec(Vec<u8>),
+    /// RSA modulus and public exponent (the two INTEGERs of `RSAPublicKey` /
+    /// `RSAPrivateKey`), by their DER content octets.
+    Rsa { modulus: Vec<u8>, exponent: Vec<u8> },
+    /// Any other algorithm: the algorithm OID plus the raw public-key bytes
+    /// (only usable when the key explicitly carries a public part, e.g. a
+    /// v2 `OneAsymmetricKey`).
+    Other { alg: Vec<u64>, key: Vec<u8> },
+}
+
+/// Build a [`PublicKeyId`] from a `subjectPublicKeyInfo`'s algorithm OID and
+/// (unused-bits-stripped) `subjectPublicKey` bytes — the form both
+/// [`Signable`] and [`CaCandidate`] already store.
+pub fn public_key_id(alg: &[u64], pubkey: &[u8]) -> Option<PublicKeyId> {
+    if alg == EC_PUBLIC_KEY_OID {
+        Some(PublicKeyId::Ec(pubkey.to_vec()))
+    } else if alg == RSA_ENCRYPTION_OID {
+        // subjectPublicKey is the DER of RSAPublicKey ::= SEQUENCE {
+        //   modulus INTEGER, publicExponent INTEGER }.
+        let roots = ber::parse_forest(pubkey, 0).ok()?;
+        let node = roots.first()?;
+        if !node.constructed || !node.is_universal(TAG_SEQUENCE) || node.children.len() < 2 {
+            return None;
+        }
+        Some(PublicKeyId::Rsa {
+            modulus: int_content(&node.children[0])?,
+            exponent: int_content(&node.children[1])?,
+        })
+    } else {
+        Some(PublicKeyId::Other { alg: alg.to_vec(), key: pubkey.to_vec() })
+    }
+}
+
+/// The public-key identity of a certificate `Signable` (returns `None` for
+/// CRLs, which carry no key).
+pub fn public_key_id_of_signable(s: &Signable) -> Option<PublicKeyId> {
+    public_key_id(s.pubkey_alg.as_deref()?, s.pubkey.as_deref()?)
+}
+
+/// The public-key identity a *private* key corresponds to, extracted
+/// structurally from a plaintext `PrivateKeyInfo` (PKCS#8 / RFC 5958) or a
+/// SEC1 `ECPrivateKey`. `None` when the shape is neither, or when the public
+/// part cannot be recovered without deriving it (e.g. an EC key stored
+/// without its optional `publicKey`).
+pub fn public_key_id_of_private_key(roots: &[Node]) -> Option<PublicKeyId> {
+    if roots.len() != 1 {
+        return None;
+    }
+    let root = &roots[0];
+    if !root.constructed || !root.is_universal(TAG_SEQUENCE) || root.children.len() < 2 {
+        return None;
+    }
+    // Distinguish the two shapes by the second element: a SEC1 `ECPrivateKey`
+    // has the private-key OCTET STRING there; a PKCS#8 `PrivateKeyInfo` has
+    // the `privateKeyAlgorithm` SEQUENCE.
+    let second = &root.children[1];
+    if !second.constructed && second.is_universal(TAG_OCTET_STRING) {
+        return ec_point_of_ec_private_key(root).map(PublicKeyId::Ec);
+    }
+    if !(second.constructed && second.is_universal(TAG_SEQUENCE)) {
+        return None;
+    }
+    // PKCS#8 PrivateKeyInfo.
+    let alg = alg_oid(second)?;
+    let private_key = root.children.get(2)?;
+    if private_key.constructed || !private_key.is_universal(TAG_OCTET_STRING) {
+        return None;
+    }
+    // The privateKey OCTET STRING encapsulates the algorithm-specific key.
+    let inner = private_key.children.first();
+    if alg == EC_PUBLIC_KEY_OID {
+        if let Some(point) = inner.and_then(ec_point_of_ec_private_key) {
+            return Some(PublicKeyId::Ec(point));
+        }
+        // A v2 OneAsymmetricKey may instead carry the point in an outer [1].
+        return context_bitstring(&root.children, 1).map(PublicKeyId::Ec);
+    }
+    if alg == RSA_ENCRYPTION_OID {
+        // RSAPrivateKey ::= SEQUENCE { version, modulus, publicExponent, ... }
+        let rsa = inner?;
+        if !rsa.constructed || !rsa.is_universal(TAG_SEQUENCE) || rsa.children.len() < 3 {
+            return None;
+        }
+        return Some(PublicKeyId::Rsa {
+            modulus: int_content(&rsa.children[1])?,
+            exponent: int_content(&rsa.children[2])?,
+        });
+    }
+    // Other algorithms are matchable only if an explicit public key is
+    // present (a v2 OneAsymmetricKey `publicKey [1]`).
+    context_bitstring(&root.children, 1).map(|key| PublicKeyId::Other { alg, key })
+}
+
+/// The EC public point of a SEC1 `ECPrivateKey ::= SEQUENCE { version,
+/// privateKey, [0] parameters?, [1] publicKey? }` — its optional `[1]
+/// publicKey` BIT STRING, unused-bits octet stripped.
+fn ec_point_of_ec_private_key(ec: &Node) -> Option<Vec<u8>> {
+    if !ec.constructed || !ec.is_universal(TAG_SEQUENCE) {
+        return None;
+    }
+    context_bitstring(&ec.children, 1)
+}
+
+/// The content of a `[tag] EXPLICIT` context node wrapping a BIT STRING,
+/// unused-bits octet stripped.
+fn context_bitstring(children: &[Node], tag: u32) -> Option<Vec<u8>> {
+    let node = children
+        .iter()
+        .find(|c| c.class == Class::ContextSpecific && c.tag == tag && c.constructed)?;
+    let bs = node.children.first()?;
+    if bs.constructed || !bs.is_universal(TAG_BIT_STRING) {
+        return None;
+    }
+    Some(strip_unused_bits(&bs.value))
+}
+
+fn int_content(node: &Node) -> Option<Vec<u8>> {
+    (!node.constructed && node.is_universal(TAG_INTEGER)).then(|| node.value.clone())
+}
+
+/// A private-key file found while scanning a directory, reduced to the
+/// public-key identity it corresponds to — the raw material for the
+/// key↔certificate links in `verify::key_links_for`.
+pub struct KeyFile {
+    pub path: PathBuf,
+    pub key: PublicKeyId,
+}
+
+/// Recursively scan `root` for files that decode as a *plaintext* private
+/// key (PKCS#8 or SEC1) whose public key can be recovered. Encrypted keys
+/// and PKCS#12 containers are not included here — their key becomes known
+/// only after a password is supplied, handled in `app.rs`. Same traversal
+/// rules as [`scan_dir_signables`] (no symlinks, size/depth caps).
+pub fn scan_dir_key_files(root: &Path) -> Vec<KeyFile> {
+    let mut out = Vec::new();
+    scan_keys_rec(root, 0, &mut out);
+    out
+}
+
+fn scan_keys_rec(dir: &Path, depth: usize, out: &mut Vec<KeyFile>) {
+    if depth > MAX_SCAN_DEPTH {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    for entry in entries.filter_map(|e| e.ok()) {
+        let Ok(file_type) = entry.file_type() else { continue };
+        let path = entry.path();
+        if file_type.is_dir() {
+            scan_keys_rec(&path, depth + 1, out);
+        } else if file_type.is_file() {
+            if let Some(key) = scan_key_file(&path) {
+                out.push(key);
+            }
+        }
+    }
+}
+
+fn scan_key_file(path: &Path) -> Option<KeyFile> {
+    let meta = std::fs::metadata(path).ok()?;
+    if meta.len() > MAX_SCAN_FILE_SIZE {
+        return None;
+    }
+    let raw = std::fs::read(path).ok()?;
+    let (der, _container) = input::load(&raw).ok()?;
+    let roots = ber::parse_forest(&der, 0).ok()?;
+    let key = public_key_id_of_private_key(&roots)?;
+    Some(KeyFile { path: path.to_path_buf(), key })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -429,6 +616,63 @@ mod tests {
         let (der, _) = input::load(&raw).unwrap();
         let roots = ber::parse_forest(&der, 0).unwrap();
         (der, roots)
+    }
+
+    fn cert_key_id(rel: &str) -> PublicKeyId {
+        let (der, roots) = parse_der(&Path::new("testdata/keylink").join(rel));
+        let signable = parse_signable(&roots, &der).expect("a certificate");
+        public_key_id_of_signable(&signable).expect("cert public key")
+    }
+
+    fn priv_key_id(rel: &str) -> Option<PublicKeyId> {
+        let (_der, roots) = parse_der(&Path::new("testdata/keylink").join(rel));
+        public_key_id_of_private_key(&roots)
+    }
+
+    #[test]
+    fn ec_private_keys_public_matches_its_certificate() {
+        let cert = cert_key_id("cert_ec.der");
+        assert!(matches!(cert, PublicKeyId::Ec(_)));
+        // Both the PKCS#8-wrapped and the bare SEC1 form recover the same
+        // point, and it equals the certificate's subjectPublicKey.
+        for key in ["key_ec_pkcs8.der", "key_ec_sec1.der"] {
+            assert_eq!(priv_key_id(key).unwrap(), cert, "{}", key);
+        }
+    }
+
+    #[test]
+    fn rsa_private_keys_public_matches_its_certificate() {
+        let cert = cert_key_id("cert_rsa.der");
+        assert!(matches!(cert, PublicKeyId::Rsa { .. }));
+        assert_eq!(priv_key_id("key_rsa_pkcs8.der").unwrap(), cert);
+    }
+
+    #[test]
+    fn unrelated_key_and_cert_do_not_match() {
+        let ec_cert = cert_key_id("cert_ec.der");
+        // A different algorithm's key never matches.
+        assert_ne!(priv_key_id("key_rsa_pkcs8.der").unwrap(), ec_cert);
+        // A different EC key (the unrelated committed sample) does not match.
+        if let Some(other) = priv_key_id("../ec_key.der") {
+            assert_ne!(other, ec_cert);
+        }
+    }
+
+    #[test]
+    fn scan_dir_key_files_finds_plaintext_keys_only() {
+        let keys = scan_dir_key_files(Path::new("testdata/keylink"));
+        let names: std::collections::BTreeSet<String> = keys
+            .iter()
+            .map(|k| k.path.file_name().unwrap().to_string_lossy().into_owned())
+            .collect();
+        assert!(names.contains("key_ec_pkcs8.der"));
+        assert!(names.contains("key_ec_sec1.der"));
+        assert!(names.contains("key_rsa_pkcs8.der"));
+        // Encrypted keys, PKCS#12 containers, and certificates are not
+        // plaintext private keys.
+        assert!(!names.contains("key_ec_enc.der"));
+        assert!(!names.contains("key_ec.p12"));
+        assert!(!names.contains("cert_ec.der"));
     }
 
     #[test]

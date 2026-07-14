@@ -15,7 +15,7 @@
 //! Application state: the parsed tree, the flattened visible rows, the
 //! selection, and the hex edit workflow.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use ratatui::widgets::ListState;
 
@@ -744,6 +744,16 @@ pub struct App {
     /// browser selection changes; empty when a directory or nothing is
     /// selected.
     pub browser_relations: FileRelations,
+    /// Plaintext private-key files found in the browser tree at startup, each
+    /// reduced to its public key — the static half of the key↔certificate
+    /// links (a snapshot, like `signables`).
+    pub key_files: Vec<x509::KeyFile>,
+    /// Public keys recovered by decrypting an encrypted key or PKCS#12 with a
+    /// password this session, tagged with the file they came from. The
+    /// dynamic half of the key↔certificate links; persists across navigation
+    /// so a link stays visible after the user browses away from the file
+    /// they decrypted.
+    pub unlocked_keys: Vec<(PathBuf, x509::PublicKeyId)>,
     /// Editable virtual plaintext of the open document's `encryptedData`,
     /// once the user has decrypted it with 'z'.
     pub decrypted: Option<Decrypted>,
@@ -765,6 +775,7 @@ impl App {
         browser.reveal(&path);
         let signables = x509::scan_dir_signables(&dir);
         let ca_index = x509::cert_candidates(&signables);
+        let key_files = x509::scan_dir_key_files(&dir);
         let mut app = App {
             path,
             out_path,
@@ -790,6 +801,8 @@ impl App {
             sig_status: None,
             signables,
             browser_relations: FileRelations::default(),
+            key_files,
+            unlocked_keys: Vec::new(),
             decrypted: None,
             pkcs12: None,
         };
@@ -804,6 +817,7 @@ impl App {
         let browser = FileBrowser::new(dir.clone());
         let signables = x509::scan_dir_signables(&dir);
         let ca_index = x509::cert_candidates(&signables);
+        let key_files = x509::scan_dir_key_files(&dir);
         let mut app = App {
             path: dir.clone(),
             out_path: dir,
@@ -829,6 +843,8 @@ impl App {
             sig_status: None,
             signables,
             browser_relations: FileRelations::default(),
+            key_files,
+            unlocked_keys: Vec::new(),
             decrypted: None,
             pkcs12: None,
         };
@@ -839,12 +855,52 @@ impl App {
 
     /// Recompute the selected browser file's cryptographic relations to
     /// the rest of the scanned tree. Called whenever the browser selection
-    /// chaDecryptedPlaceholdernges. A directory (or an empty browser) has no relations.
+    /// changes. A directory (or an empty browser) has no relations.
     pub fn recompute_browser_relations(&mut self) {
-        self.browser_relations = match self.browser.selected_entry() {
-            Some(entry) if !entry.is_dir => verify::relations_for(&self.signables, &entry.path),
-            _ => FileRelations::default(),
+        let selected = match self.browser.selected_entry() {
+            Some(entry) if !entry.is_dir => entry.path.clone(),
+            _ => {
+                self.browser_relations = FileRelations::default();
+                return;
+            }
         };
+        let mut relations = verify::relations_for(&self.signables, &selected);
+        relations.key_links = self.compute_key_links(&selected);
+        self.browser_relations = relations;
+    }
+
+    /// Undirected key↔certificate links touching `selected`: the private-key
+    /// files (plaintext scans, plus any encrypted key or PKCS#12 whose
+    /// password has been supplied this session) matched to the certificate
+    /// files carrying their public key.
+    fn compute_key_links(&self, selected: &Path) -> Vec<PathBuf> {
+        let certs: Vec<(PathBuf, x509::PublicKeyId)> = self
+            .signables
+            .iter()
+            .filter_map(|f| Some((f.path.clone(), x509::public_key_id_of_signable(&f.signable)?)))
+            .collect();
+        // Plaintext key files found on disk, plus keys unlocked by a password
+        // this session (encrypted PKCS#8 / PKCS#12). The unlocked cache
+        // persists across navigation, so a link stays visible after the user
+        // browses away from the file they decrypted.
+        let mut bearers: Vec<(PathBuf, x509::PublicKeyId)> = self
+            .key_files
+            .iter()
+            .map(|k| (k.path.clone(), k.key.clone()))
+            .collect();
+        bearers.extend(self.unlocked_keys.iter().cloned());
+        verify::key_links_for(&bearers, &certs, selected)
+    }
+
+    /// Record the public key(s) recovered by decrypting the open document, so
+    /// the key↔certificate link survives navigating away from it. Replaces
+    /// any prior entries for the same path.
+    fn cache_unlocked_keys(&mut self, keys: Vec<x509::PublicKeyId>) {
+        let path = self.path.clone();
+        self.unlocked_keys.retain(|(p, _)| *p != path);
+        for key in keys {
+            self.unlocked_keys.push((path.clone(), key));
+        }
     }
 
     /// Toggle keyboard focus between the file browser and the document
@@ -965,8 +1021,11 @@ impl App {
         };
         match result {
             Ok(decrypted) => {
+                let key = x509::public_key_id_of_private_key(&decrypted.roots);
                 self.decrypted = Some(decrypted);
                 self.rebuild_rows();
+                self.cache_unlocked_keys(key.into_iter().collect());
+                self.recompute_browser_relations();
                 self.status = "decrypted content is available in the ASN.1 tree".to_string();
             }
             Err(msg) => {
@@ -1011,8 +1070,17 @@ impl App {
         }
         let total = regions.len() + failed;
         let n = regions.len();
+        // Remember each shrouded key's public key for the key↔certificate
+        // links, so the connection persists after browsing away.
+        let keys: Vec<x509::PublicKeyId> = regions
+            .iter()
+            .filter(|r| r.kind == pkcs12::RegionKind::ShroudedKey)
+            .filter_map(|r| x509::public_key_id_of_private_key(&r.roots))
+            .collect();
         self.pkcs12 = Some(Pkcs12Reveal { password: password.as_bytes().to_vec(), regions });
         self.rebuild_rows();
+        self.cache_unlocked_keys(keys);
+        self.recompute_browser_relations();
         self.status = if failed == 0 {
             format!(
                 "decrypted {} PKCS#12 region{} — shown in the ASN.1 tree",
@@ -2856,6 +2924,101 @@ mod tests {
         assert!(matches!(app.mode, Mode::Browse), "no prompt for a non-encrypted file");
         assert!(app.pkcs12.is_none());
         assert!(app.decrypted.is_none());
+    }
+
+    // ---- key ↔ certificate links -----------------------------------------
+
+    fn link_names(app: &App) -> std::collections::BTreeSet<String> {
+        app.browser_relations
+            .key_links
+            .iter()
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+            .collect()
+    }
+
+    fn browser_select_by_name(app: &mut App, name: &str) {
+        let idx = app
+            .browser
+            .rows
+            .iter()
+            .position(|r| {
+                app.browser.entry_at(&r.path).map(|e| e.name == name).unwrap_or(false)
+            })
+            .unwrap_or_else(|| panic!("no browser row named {}", name));
+        app.browser.select(idx);
+        app.recompute_browser_relations();
+    }
+
+    fn kl(name: &str) -> PathBuf {
+        Path::new("testdata/keylink").join(name)
+    }
+
+    fn enter_password(app: &mut App, password: &str) {
+        app.start_decrypt();
+        if let Mode::Password(ref mut p) = app.mode {
+            for c in password.chars() {
+                p.insert_char(c);
+            }
+        }
+        app.submit_password();
+    }
+
+    #[test]
+    fn certificate_links_to_its_plaintext_key_files() {
+        // Opening the EC certificate: its private key exists in the folder as
+        // both a PKCS#8 and a SEC1 file, so both are linked. The encrypted
+        // key and the PKCS#12 need a password and are not linked yet.
+        let app = open_real_file(&kl("cert_ec.der"));
+        let links = link_names(&app);
+        assert!(links.contains("key_ec_pkcs8.der"), "{:?}", links);
+        assert!(links.contains("key_ec_sec1.der"), "{:?}", links);
+        assert!(!links.contains("key_ec_enc.der"));
+        assert!(!links.contains("key_ec.p12"));
+        // The RSA certificate links only to the RSA key.
+        let app = open_real_file(&kl("cert_rsa.der"));
+        let links = link_names(&app);
+        assert!(links.contains("key_rsa_pkcs8.der"), "{:?}", links);
+        assert!(!links.iter().any(|n| n.contains("ec")));
+    }
+
+    #[test]
+    fn encrypted_key_links_to_its_certificate_after_the_password() {
+        let mut app = open_real_file(&kl("key_ec_enc.der"));
+        // Locked: the key is unknown, so no link yet.
+        assert!(app.browser_relations.key_links.is_empty());
+        enter_password(&mut app, "asn1editor");
+        // The encrypted key is still the selected browser row; it now links
+        // to its certificate.
+        assert_eq!(link_names(&app), ["cert_ec.der".to_string()].into_iter().collect());
+    }
+
+    #[test]
+    fn pkcs12_links_to_a_matching_certificate_after_the_password() {
+        let mut app = open_real_file(&kl("key_ec.p12"));
+        assert!(app.browser_relations.key_links.is_empty());
+        enter_password(&mut app, "asn1editor");
+        assert!(link_names(&app).contains("cert_ec.der"));
+    }
+
+    #[test]
+    fn unlocked_key_link_persists_after_navigating_to_the_certificate() {
+        let mut app = open_real_file(&kl("key_ec_enc.der"));
+        enter_password(&mut app, "asn1editor");
+        // Navigate to (open) the certificate — this clears the decrypted
+        // state, but the recovered public key stays cached.
+        app.open_file(kl("cert_ec.der")).unwrap();
+        assert!(app.decrypted.is_none());
+        browser_select_by_name(&mut app, "cert_ec.der");
+        // The certificate still links back to the (now closed) encrypted key.
+        assert!(link_names(&app).contains("key_ec_enc.der"), "{:?}", link_names(&app));
+    }
+
+    #[test]
+    fn wrong_password_creates_no_key_link() {
+        let mut app = open_real_file(&kl("key_ec_enc.der"));
+        enter_password(&mut app, "the wrong password");
+        assert!(app.browser_relations.key_links.is_empty());
+        assert!(app.unlocked_keys.is_empty());
     }
 
     fn tmp_dir(name: &str) -> PathBuf {
