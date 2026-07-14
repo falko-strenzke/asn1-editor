@@ -1106,7 +1106,7 @@ fn draw_content_browse(frame: &mut Frame, app: &App, area: Rect) {
             Style::new().fg(Color::Yellow).bold(),
         )));
         lines.push(Line::default());
-        lines.push(Line::from("Press 'z' and enter the PKCS#8 password to decrypt it."));
+        lines.push(Line::from("Press 'z' and enter the password to decrypt it."));
     } else if let Some(node) = app.selected_node() {
         lines.push(Line::from(vec![
             Span::styled("Type    ", Style::new().dim()),

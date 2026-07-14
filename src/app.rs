@@ -839,7 +839,7 @@ impl App {
 
     /// Recompute the selected browser file's cryptographic relations to
     /// the rest of the scanned tree. Called whenever the browser selection
-    /// changes. A directory (or an empty browser) has no relations.
+    /// chaDecryptedPlaceholdernges. A directory (or an empty browser) has no relations.
     pub fn recompute_browser_relations(&mut self) {
         self.browser_relations = match self.browser.selected_entry() {
             Some(entry) if !entry.is_dir => verify::relations_for(&self.signables, &entry.path),
@@ -1206,6 +1206,9 @@ impl App {
         for (i, node) in self.roots.iter().enumerate() {
             collect_rows(node, vec![i], 0, RowSource::Document, &mut rows);
         }
+        // A PKCS#8 encrypted key (handled by the `encrypted_path` branch) and
+        // a PKCS#12 container (handled below) are mutually exclusive.
+        let is_pkcs8 = encrypted_path.is_some();
         if let Some(encrypted_path) = encrypted_path {
             if let Some(encrypted_row) = rows.iter().position(|r| {
                 r.source == RowSource::Document && r.path == encrypted_path
@@ -1253,6 +1256,31 @@ impl App {
             inserts.sort_by(|a, b| b.0.cmp(&a.0));
             for (at, region_rows) in inserts {
                 rows.splice(at..at, region_rows);
+            }
+        } else if !is_pkcs8 {
+            // Not yet decrypted: if this is a PKCS#12 container, show the
+            // same closed-lock placeholder below each encrypted region that a
+            // locked PKCS#8 `encryptedData` node shows.
+            if let Ok(Some(p12)) = pkcs12::parse(&self.roots) {
+                let mut inserts: Vec<(usize, Row)> = Vec::new();
+                for region in &p12.regions {
+                    if let Some(cipher_row) = rows.iter().position(|r| {
+                        r.source == RowSource::Document && r.path == region.cipher_path
+                    }) {
+                        inserts.push((
+                            cipher_row + 1,
+                            Row {
+                                path: region.cipher_path.clone(),
+                                depth: rows[cipher_row].depth + 1,
+                                source: RowSource::DecryptedPlaceholder,
+                            },
+                        ));
+                    }
+                }
+                inserts.sort_by(|a, b| b.0.cmp(&a.0));
+                for (at, row) in inserts {
+                    rows.insert(at, row);
+                }
             }
         }
         self.rows = rows;
@@ -2748,6 +2776,23 @@ mod tests {
     #[test]
     fn pkcs12_reveal_shows_decrypted_regions_read_only() {
         let mut app = open_real_file(std::path::Path::new("testdata/pkcs12.der"));
+        // Before decryption, each encrypted region shows the same closed-lock
+        // placeholder as a locked PKCS#8 key, one level below its ciphertext.
+        let cipher_paths: Vec<Vec<usize>> = pkcs12::parse(&app.roots)
+            .unwrap()
+            .unwrap()
+            .regions
+            .iter()
+            .map(|r| r.cipher_path.clone())
+            .collect();
+        assert_eq!(cipher_paths.len(), 2);
+        for cipher_path in &cipher_paths {
+            let cipher_row = row_of_source(&app, RowSource::Document, cipher_path);
+            let placeholder = row_of_source(&app, RowSource::DecryptedPlaceholder, cipher_path);
+            assert_eq!(app.rows[placeholder].depth, app.rows[cipher_row].depth + 1);
+            assert_eq!(placeholder, cipher_row + 1, "placeholder sits just below the ciphertext");
+        }
+
         // 'z' recognizes the PKCS#12 file and opens the password prompt.
         app.start_decrypt();
         assert!(matches!(app.mode, Mode::Password(_)), "password prompt for PKCS#12");

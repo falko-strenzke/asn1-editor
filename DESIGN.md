@@ -817,9 +817,13 @@ password fails them all and reads as a single "wrong password" error.
 `App::pkcs12` holds the reveal: the retained password (zeroed on drop) and
 one `RevealedRegion` per decrypted region, each carrying the ciphertext
 path, kind, parsed plaintext forest, and an independent specification
-match. `rebuild_rows` splices each region's rows (source
-`RowSource::Pkcs12Revealed(index)`) below its ciphertext node, and the tree
-labels each region root with a green **`🔓 <kind>: `** prefix. These rows
+match. Before decryption (`App::pkcs12` is `None`), `rebuild_rows` shows the
+same closed-lock **`🔒 decrypted content not available`** placeholder below
+*each* encrypted region that a locked PKCS#8 `encryptedData` node shows —
+reusing the shared `RowSource::DecryptedPlaceholder`. After decryption it
+splices each region's rows (source `RowSource::Pkcs12Revealed(index)`) below
+its ciphertext node, and the tree labels each region root with a green
+**`🔓 <kind>: `** prefix. These rows
 navigate and fold like any other, but every mutating action refuses the
 source with a "read-only" status (mutable node access is granted only so
 fold state can be toggled). An edit to the *outer* document re-derives the
@@ -891,8 +895,9 @@ Built with ratatui 0.29 (bundled crossterm backend, `ratatui::init()` /
   notation. An encrypted PKCS#8 `encryptedData` row additionally owns the
   closed-lock placeholder or open-lock virtual plaintext subtree described
   in §9a, at the same position and with normal folding/navigation behavior;
-  a PKCS#12 container's ciphertext rows likewise own the open-lock,
-  read-only reveal subtrees of §9b (green `🔓 <kind>: ` region roots).
+  a PKCS#12 container's ciphertext rows likewise own the closed-lock
+  placeholder (before decryption) or the open-lock, read-only reveal
+  subtrees of §9b (green `🔓 <kind>: ` region roots).
 * **Right pane — content.** At the top, the build-up of the tag and the
   length octets is shown graphically: bit-field diagrams with the bit
   positions (8..1), the actual bit values, each field's width in bits and
