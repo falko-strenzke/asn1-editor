@@ -21,6 +21,12 @@
 //! (`…1.5.12`, PRF HMAC-SHA1/256/384/512) key-derivation and an
 //! AES-128/256-CBC encryption scheme. Anything else is reported as
 //! unsupported rather than mishandled.
+//!
+//! The password-based-encryption core is factored into [`Pbes2`], a
+//! self-contained PBES2 (PBKDF2 + AES-CBC) decryptor/encryptor keyed off an
+//! `AlgorithmIdentifier` node. `EncryptedPrivateKeyInfo` is one PBES2 user;
+//! the PKCS#12 module (`pkcs12.rs`) reuses the same `Pbes2` for its
+//! encrypted content and shrouded key bags.
 
 use std::num::NonZeroU32;
 
@@ -63,6 +69,127 @@ impl Prf {
     }
 }
 
+/// A PBES2 (`1.2.840.113549.1.5.13`) scheme decoded from an
+/// `AlgorithmIdentifier`: a PBKDF2 key-derivation and an AES-128/256-CBC
+/// cipher. This is the reusable password-based-encryption core shared by
+/// `EncryptedPrivateKeyInfo` (PKCS#8) and PKCS#12; it holds no ciphertext
+/// and does no ASN.1 shape checks on the plaintext — callers add those.
+pub struct Pbes2 {
+    salt: Vec<u8>,
+    iterations: u32,
+    prf: Prf,
+    key_len: usize,
+    iv: Vec<u8>,
+}
+
+impl Pbes2 {
+    /// Decode a `contentEncryptionAlgorithm` / `encryptionAlgorithm`
+    /// `AlgorithmIdentifier` node.
+    ///
+    /// * `Ok(None)` — a well-formed `AlgorithmIdentifier` whose algorithm is
+    ///   not PBES2; the caller decides whether that is an error.
+    /// * `Err(msg)` — the algorithm *is* PBES2 but the parameters are
+    ///   malformed or use a KDF/cipher this tool doesn't implement.
+    /// * `Ok(Some(_))` — a supported PBES2 scheme.
+    pub fn from_algorithm_identifier(alg: &Node) -> Result<Option<Pbes2>, String> {
+        if !alg.constructed || !alg.is_universal(TAG_SEQUENCE) || alg.children.is_empty() {
+            return Ok(None);
+        }
+        let Some(alg_oid) = oid_of(&alg.children[0]) else { return Ok(None) };
+        if alg_oid != OID_PBES2 {
+            return Ok(None);
+        }
+        // From here on we know it's PBES2; unsupported specifics are errors.
+        let params = alg.children.get(1).ok_or("PBES2: missing parameters")?;
+        if !params.constructed || !params.is_universal(TAG_SEQUENCE) || params.children.len() != 2 {
+            return Err("PBES2: malformed parameters".to_string());
+        }
+        let (salt, iterations, prf, kdf_key_len) = parse_pbkdf2(&params.children[0])?;
+        let (key_len, iv) = parse_scheme(&params.children[1])?;
+        let key_len = kdf_key_len.unwrap_or(key_len);
+        Ok(Some(Pbes2 { salt, iterations, prf, key_len, iv }))
+    }
+
+    /// The AES-CBC IV of this scheme.
+    pub fn iv(&self) -> &[u8] {
+        &self.iv
+    }
+
+    fn derived_key(&self, password: &[u8]) -> Result<Vec<u8>, String> {
+        let iterations = NonZeroU32::new(self.iterations)
+            .ok_or("PBKDF2 iteration count must be positive")?;
+        let mut key = vec![0u8; self.key_len];
+        pbkdf2::derive(self.prf.algorithm(), iterations, &self.salt, password, &mut key);
+        Ok(key)
+    }
+
+    /// PBKDF2-derive the key and AES-CBC decrypt `ciphertext`, then strip and
+    /// validate PKCS#7 padding. A wrong password almost always shows up as
+    /// bad padding here; callers that know the expected plaintext shape add a
+    /// second structural check on top.
+    pub fn decrypt(&self, password: &[u8], ciphertext: &[u8]) -> Result<Vec<u8>, String> {
+        if ciphertext.is_empty() || !ciphertext.len().is_multiple_of(AES_BLOCK) {
+            return Err("ciphertext length is not a whole number of AES blocks".to_string());
+        }
+        let key = self.derived_key(password)?;
+        let cipher_alg = if self.key_len == 16 { &AES_128 } else { &AES_256 };
+        let unbound = UnboundCipherKey::new(cipher_alg, &key)
+            .map_err(|_| "invalid derived key".to_string())?;
+        let decrypting = DecryptingKey::cbc(unbound).map_err(|_| "cipher init failed".to_string())?;
+        let iv: [u8; IV_LEN_128_BIT] =
+            self.iv.clone().try_into().map_err(|_| "bad IV length".to_string())?;
+        let context = DecryptionContext::Iv128(FixedLength::from(iv));
+
+        let mut buf = ciphertext.to_vec();
+        let plain = decrypting
+            .decrypt(&mut buf, context)
+            .map_err(|_| "decryption failed".to_string())?;
+        Ok(strip_pkcs7(plain)?.to_vec())
+    }
+
+    /// AES-CBC encrypt `plaintext` (PKCS#7 padded) with a fresh IV, returning
+    /// `(ciphertext, iv)`.
+    pub fn encrypt(&self, password: &[u8], plaintext: &[u8]) -> Result<(Vec<u8>, Vec<u8>), String> {
+        self.encrypt_with_context(password, plaintext, None)
+    }
+
+    /// AES-CBC encrypt `plaintext` reusing this scheme's stored IV.
+    pub fn encrypt_with_iv(&self, password: &[u8], plaintext: &[u8]) -> Result<Vec<u8>, String> {
+        self.encrypt_with_context(password, plaintext, Some(&self.iv))
+            .map(|(ciphertext, _)| ciphertext)
+    }
+
+    fn encrypt_with_context(
+        &self,
+        password: &[u8],
+        plaintext: &[u8],
+        iv: Option<&[u8]>,
+    ) -> Result<(Vec<u8>, Vec<u8>), String> {
+        let key = self.derived_key(password)?;
+        let cipher_alg = if self.key_len == 16 { &AES_128 } else { &AES_256 };
+        let unbound = UnboundCipherKey::new(cipher_alg, &key)
+            .map_err(|_| "invalid derived key".to_string())?;
+        let encrypting = PaddedBlockEncryptingKey::cbc_pkcs7(unbound)
+            .map_err(|_| "cipher init failed".to_string())?;
+        let mut ciphertext = plaintext.to_vec();
+        let context = if let Some(iv) = iv {
+            let iv: [u8; IV_LEN_128_BIT] =
+                iv.try_into().map_err(|_| "bad IV length".to_string())?;
+            encrypting
+                .less_safe_encrypt(&mut ciphertext, EncryptionContext::Iv128(FixedLength::from(iv)))
+                .map_err(|_| "encryption failed".to_string())?
+        } else {
+            encrypting
+                .encrypt(&mut ciphertext)
+                .map_err(|_| "encryption failed".to_string())?
+        };
+        let iv: &[u8] = (&context)
+            .try_into()
+            .map_err(|_| "cipher did not return an IV".to_string())?;
+        Ok((ciphertext, iv.to_vec()))
+    }
+}
+
 /// A decoded `EncryptedPrivateKeyInfo` using a supported PBES2 scheme,
 /// ready to decrypt with a password.
 pub struct EncryptedPrivateKey {
@@ -71,11 +198,7 @@ pub struct EncryptedPrivateKey {
     pub encrypted_path: Vec<usize>,
     /// Tree path of the AES-CBC IV OCTET STRING.
     pub iv_path: Vec<usize>,
-    salt: Vec<u8>,
-    iterations: u32,
-    prf: Prf,
-    key_len: usize,
-    iv: Vec<u8>,
+    pbes2: Pbes2,
     ciphertext: Vec<u8>,
 }
 
@@ -101,31 +224,20 @@ pub fn parse(roots: &[Node]) -> Result<Option<EncryptedPrivateKey>, String> {
         return Ok(None);
     }
     // encryptionAlgorithm.algorithm must be PBES2 for this to be an
-    // encrypted key we recognize at all.
-    let Some(alg_oid) = oid_of(&alg.children[0]) else { return Ok(None) };
-    if alg_oid != OID_PBES2 {
-        // Some other encryption; report it as an (unsupported) encrypted key.
-        return Err(format!("unsupported key encryption scheme (OID {})", oid_str(&alg_oid)));
-    }
-
-    // From here on we know it's an encrypted key; unsupported specifics are
-    // errors, not `None`.
-    let params = alg.children.get(1).ok_or("PBES2: missing parameters")?;
-    if !params.constructed || !params.is_universal(TAG_SEQUENCE) || params.children.len() != 2 {
-        return Err("PBES2: malformed parameters".to_string());
-    }
-    let (salt, iterations, prf, kdf_key_len) = parse_pbkdf2(&params.children[0])?;
-    let (key_len, iv) = parse_scheme(&params.children[1])?;
-    let key_len = kdf_key_len.unwrap_or(key_len);
+    // encrypted key we support. A different encryption OID is still an
+    // encrypted key, just an unsupported one.
+    let pbes2 = match Pbes2::from_algorithm_identifier(alg)? {
+        Some(pbes2) => pbes2,
+        None => {
+            let oid = oid_of(&alg.children[0]).ok_or("malformed encryptionAlgorithm")?;
+            return Err(format!("unsupported key encryption scheme (OID {})", oid_str(&oid)));
+        }
+    };
 
     Ok(Some(EncryptedPrivateKey {
         encrypted_path: vec![0, 1],
         iv_path: vec![0, 0, 1, 1, 1],
-        salt,
-        iterations,
-        prf,
-        key_len,
-        iv,
+        pbes2,
         ciphertext: enc_data.value.clone(),
     }))
 }
@@ -212,12 +324,9 @@ fn parse_scheme(scheme: &Node) -> Result<(usize, Vec<u8>), String> {
 }
 
 impl EncryptedPrivateKey {
-    fn derived_key(&self, password: &[u8]) -> Result<Vec<u8>, String> {
-        let iterations = NonZeroU32::new(self.iterations)
-            .ok_or("PBKDF2 iteration count must be positive")?;
-        let mut key = vec![0u8; self.key_len];
-        pbkdf2::derive(self.prf.algorithm(), iterations, &self.salt, password, &mut key);
-        Ok(key)
+    /// The AES-CBC IV currently stored in the container.
+    pub fn iv(&self) -> &[u8] {
+        self.pbes2.iv()
     }
 
     /// Derive the key with PBKDF2, AES-CBC decrypt, strip PKCS#7 padding,
@@ -226,30 +335,10 @@ impl EncryptedPrivateKey {
     /// padding; the ASN.1 check catches the rare case where random
     /// plaintext happens to end in valid padding.
     pub fn decrypt(&self, password: &[u8]) -> Result<Vec<u8>, String> {
-        if self.ciphertext.is_empty() || !self.ciphertext.len().is_multiple_of(AES_BLOCK) {
-            return Err("ciphertext length is not a whole number of AES blocks".to_string());
-        }
-        let key = self.derived_key(password)?;
-
-        let cipher_alg = if self.key_len == 16 { &AES_128 } else { &AES_256 };
-        let unbound = UnboundCipherKey::new(cipher_alg, &key)
-            .map_err(|_| "invalid derived key".to_string())?;
-        let decrypting = DecryptingKey::cbc(unbound).map_err(|_| "cipher init failed".to_string())?;
-        let iv: [u8; IV_LEN_128_BIT] =
-            self.iv.clone().try_into().map_err(|_| "bad IV length".to_string())?;
-        let context = DecryptionContext::Iv128(FixedLength::from(iv));
-
-        let mut buf = self.ciphertext.clone();
-        let plain = decrypting
-            .decrypt(&mut buf, context)
-            .map_err(|_| "decryption failed".to_string())?;
-        let plain = strip_pkcs7(plain)?;
-
+        let plain = self.pbes2.decrypt(password, &self.ciphertext)?;
         // Wrong-password sanity check: a real PrivateKeyInfo is one SEQUENCE.
-        match ber::parse_forest(plain, 0) {
-            Ok(roots) if roots.len() == 1 && roots[0].is_universal(TAG_SEQUENCE) => {
-                Ok(plain.to_vec())
-            }
+        match ber::parse_forest(&plain, 0) {
+            Ok(roots) if roots.len() == 1 && roots[0].is_universal(TAG_SEQUENCE) => Ok(plain),
             _ => Err("decryption failed (wrong password?)".to_string()),
         }
     }
@@ -258,7 +347,8 @@ impl EncryptedPrivateKey {
     /// parameters and a fresh AES-CBC IV. The caller stores both returned
     /// values in the outer `EncryptedPrivateKeyInfo` tree.
     pub fn encrypt(&self, password: &[u8], plaintext: &[u8]) -> Result<(Vec<u8>, Vec<u8>), String> {
-        self.encrypt_with_context(password, plaintext, None)
+        self.check_plaintext_shape(plaintext)?;
+        self.pbes2.encrypt(password, plaintext)
     }
 
     /// Encrypt using the IV already stored in the container. This primarily
@@ -269,50 +359,18 @@ impl EncryptedPrivateKey {
         password: &[u8],
         plaintext: &[u8],
     ) -> Result<Vec<u8>, String> {
-        self.encrypt_with_context(password, plaintext, Some(&self.iv))
-            .map(|(ciphertext, _)| ciphertext)
+        self.check_plaintext_shape(plaintext)?;
+        self.pbes2.encrypt_with_iv(password, plaintext)
     }
 
-    fn encrypt_with_context(
-        &self,
-        password: &[u8],
-        plaintext: &[u8],
-        iv: Option<&[u8]>,
-    ) -> Result<(Vec<u8>, Vec<u8>), String> {
-        // Refuse to turn arbitrary bytes into an object that claims to be a
-        // PKCS#8 private key. Tree edits normally guarantee this already;
-        // this also protects whole-content edits.
+    /// Refuse to turn arbitrary bytes into an object that claims to be a
+    /// PKCS#8 private key. Tree edits normally guarantee this already; this
+    /// also protects whole-content edits.
+    fn check_plaintext_shape(&self, plaintext: &[u8]) -> Result<(), String> {
         match ber::parse_forest(plaintext, 0) {
-            Ok(roots) if roots.len() == 1 && roots[0].is_universal(TAG_SEQUENCE) => {}
-            _ => return Err("decrypted content must be one ASN.1 SEQUENCE".to_string()),
+            Ok(roots) if roots.len() == 1 && roots[0].is_universal(TAG_SEQUENCE) => Ok(()),
+            _ => Err("decrypted content must be one ASN.1 SEQUENCE".to_string()),
         }
-
-        let key = self.derived_key(password)?;
-        let cipher_alg = if self.key_len == 16 { &AES_128 } else { &AES_256 };
-        let unbound = UnboundCipherKey::new(cipher_alg, &key)
-            .map_err(|_| "invalid derived key".to_string())?;
-        let encrypting = PaddedBlockEncryptingKey::cbc_pkcs7(unbound)
-            .map_err(|_| "cipher init failed".to_string())?;
-        let mut ciphertext = plaintext.to_vec();
-        let context = if let Some(iv) = iv {
-            let iv: [u8; IV_LEN_128_BIT] = iv
-                .try_into()
-                .map_err(|_| "bad IV length".to_string())?;
-            encrypting
-                .less_safe_encrypt(
-                    &mut ciphertext,
-                    EncryptionContext::Iv128(FixedLength::from(iv)),
-                )
-                .map_err(|_| "encryption failed".to_string())?
-        } else {
-            encrypting
-                .encrypt(&mut ciphertext)
-                .map_err(|_| "encryption failed".to_string())?
-        };
-        let iv: &[u8] = (&context)
-            .try_into()
-            .map_err(|_| "cipher did not return an IV".to_string())?;
-        Ok((ciphertext, iv.to_vec()))
     }
 }
 
@@ -330,14 +388,14 @@ fn strip_pkcs7(data: &[u8]) -> Result<&[u8], String> {
     Ok(&data[..data.len() - pad])
 }
 
-fn oid_of(node: &Node) -> Option<Vec<u64>> {
+pub(crate) fn oid_of(node: &Node) -> Option<Vec<u64>> {
     if node.constructed || !node.is_universal(TAG_OID) {
         return None;
     }
     ber::oid_arcs(&node.value)
 }
 
-fn oid_str(oid: &[u64]) -> String {
+pub(crate) fn oid_str(oid: &[u64]) -> String {
     oid.iter().map(|a| a.to_string()).collect::<Vec<_>>().join(".")
 }
 
@@ -358,11 +416,11 @@ mod tests {
         let roots = parse_file("testdata/enc_pkcs8.der");
         let enc = parse(&roots).unwrap().expect("supported encrypted key");
         assert_eq!(enc.encrypted_path, [0, 1]);
-        assert_eq!(enc.salt.len(), 16);
-        assert_eq!(enc.iterations, 2048);
-        assert_eq!(enc.prf, Prf::HmacSha256);
-        assert_eq!(enc.key_len, 32); // AES-256
-        assert_eq!(enc.iv.len(), 16);
+        assert_eq!(enc.pbes2.salt.len(), 16);
+        assert_eq!(enc.pbes2.iterations, 2048);
+        assert_eq!(enc.pbes2.prf, Prf::HmacSha256);
+        assert_eq!(enc.pbes2.key_len, 32); // AES-256
+        assert_eq!(enc.iv().len(), 16);
         assert!(!enc.ciphertext.is_empty() && enc.ciphertext.len().is_multiple_of(16));
     }
 
@@ -402,7 +460,7 @@ mod tests {
         );
 
         let (ciphertext, iv) = enc.encrypt(b"asn1editor", &plain).unwrap();
-        assert_ne!(iv, enc.iv, "normal re-encryption must generate a fresh IV");
+        assert_ne!(iv, enc.iv(), "normal re-encryption must generate a fresh IV");
         let mut fresh_iv_roots = roots;
         node_at_mut_for_test(&mut fresh_iv_roots, &enc.encrypted_path).value = ciphertext;
         node_at_mut_for_test(&mut fresh_iv_roots, &enc.iv_path).value = iv;

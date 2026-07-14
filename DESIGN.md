@@ -29,14 +29,17 @@ Goals:
 * Identify well-known structures by matching against ASN.1 specification
   modules in `specs/asn1/` (bundled: RFC 5280 → X.509 certificates and
   CRLs, RFC 5208 → PKCS#8 private keys, RFC 5958 → asymmetric key
-  packages, RFC 5915 → SEC1 EC private keys) and annotate the tree with
-  the spec's field and type names (§8).
+  packages, RFC 5915 → SEC1 EC private keys, RFC 7292 → PKCS#12) and
+  annotate the tree with the spec's field and type names (§8).
 * Resolve common PKI and cryptographic OBJECT IDENTIFIER values from a
   deterministic built-in repository, showing a short name in the tree and
   the numeric and full textual forms in the content pane (§8a).
 * Decrypt supported password-encrypted PKCS#8 containers into an editable
   virtual tree and keep the plaintext and ciphertext representations
   synchronized in both directions (§9a).
+* Decrypt the encrypted regions of a supported PKCS#12 (`PFX`) container
+  into read-only virtual subtrees, revealing the certificates and private
+  keys inside (§9b).
 
 Non-goals (see §14):
 
@@ -81,7 +84,10 @@ src/
              recursive directory scan for candidate CA certs
   verify.rs  signature verification (uses aws-lc-rs)
   pkcs8.rs   structural decoding + password decryption/re-encryption of
-             EncryptedPrivateKeyInfo (PBES2; uses aws-lc-rs)
+             EncryptedPrivateKeyInfo (PBES2; uses aws-lc-rs). Exposes a
+             reusable Pbes2 (PBKDF2 + AES-CBC) decryptor shared with pkcs12.rs
+  pkcs12.rs  structural decoding + read-only password decryption of PKCS#12
+             (PFX) containers; reuses pkcs8::Pbes2
   app.rs     application state: tree, flattened rows, selection, edit logic
   tui.rs     ratatui event loop and rendering (no business logic)
 tests/
@@ -91,9 +97,10 @@ tests/
   oid_repository.rs  test-corpus OID coverage plus ML-DSA/SLH-DSA coverage
 specs/asn1/  ASN.1 specification modules (rfc5280: certificates + CRLs;
              rfc5208: PKCS#8 private keys; rfc5958: asymmetric key packages;
-             rfc5915: SEC1 EC private keys)
+             rfc5915: SEC1 EC private keys; rfc7292: PKCS#12)
 testdata/  DER samples (EC cert, RSA cert, SEC1 EC key, PKCS#8 key,
-           encrypted PKCS#8 key [password "asn1editor"], PKCS#7, CRL)
+           encrypted PKCS#8 key [password "asn1editor"], PKCS#12
+           [password "asn1editor"], PKCS#7, CRL)
   chain/   a 3-level ECDSA P-256 hierarchy (root CA -> intermediate CA ->
            TLS server leaf) plus CRLs from the root and intermediate, for
            exercising signature verification (§9) end to end; also
@@ -106,10 +113,11 @@ Dependency rule: `ber.rs` and `oid.rs` depend on nothing; `input.rs` and
 shared OID repository; `browser.rs` depends only on the standard library
 (it knows nothing about ASN.1); `x509.rs` depends on `ber.rs` + `input.rs`
 (structural decoding only, no crypto); `verify.rs` depends on `x509.rs` +
-`aws-lc-rs`; `pkcs8.rs` depends on `ber.rs` + `aws-lc-rs` (the two crypto
-modules); `app.rs` depends on all of the above; `tui.rs` renders `app.rs`
-and resolves OID display names through `oid.rs`. External dependencies:
-`ratatui`, `aws-lc-rs`.
+`aws-lc-rs`; `pkcs8.rs` depends on `ber.rs` + `aws-lc-rs` and `pkcs12.rs`
+depends on `ber.rs` + `pkcs8.rs` (the two crypto-using decoders; `pkcs12.rs`
+does no crypto of its own — it reuses `pkcs8::Pbes2`); `app.rs` depends on
+all of the above; `tui.rs` renders `app.rs` and resolves OID display names
+through `oid.rs`. External dependencies: `ratatui`, `aws-lc-rs`.
 
 ## 4. Data model
 
@@ -362,6 +370,19 @@ DER uses constructed `[0]`/`[1]` tags); its `{{NamedCurve}}` parameter is
 dropped and the referenced `ECParameters` (from RFC 5480) is reproduced
 with just its `namedCurve` alternative.
 
+`specs/asn1/rfc7292` contains the PKCS#12 `PFX` structure (RFC 7292
+Appendix C) together with the PKCS#7 `ContentInfo`/`EncryptedData` types it
+builds on, so a `.p12`/`.pfx` identifies as `PFX` and its bags, safe
+contents, and encryption parameters are labeled. Two adaptations avoid the
+subset parser's and matcher's sharp edges: the open-type bag/attribute
+fields (`BAG-TYPE.&Type`, etc.) become `[0] EXPLICIT ANY` / `SET OF ANY`
+(the concrete bag contents are still named by the encapsulation pass), and
+the `DigestInfo` used by `MacData.mac` is inlined into `MacData` rather than
+given its own top-level name — a standalone `SEQUENCE { AlgorithmIdentifier,
+OCTET STRING }` is structurally identical to an `EncryptedPrivateKeyInfo`,
+and as a named candidate root it would win the source-ordered tie (rfc7292 >
+rfc5958) and mislabel encrypted PKCS#8 keys.
+
 Additional files dropped into the directory are parsed automatically;
 parse failures are reported as warnings and the file is skipped. Files are
 loaded in sorted filename order and the *first* definition of a type name
@@ -564,8 +585,9 @@ knowledge of its own:
 `src/verify.rs` is one of the two modules that talk to the crypto library
 (`aws-lc-rs`, chosen for its `ring`-compatible API and — unlike `ring` —
 active investment in post-quantum algorithms, positioning it best for
-adding ML-DSA/SLH-DSA verification later; `pkcs8.rs`, §9a, is the other).
-It maps the signature
+adding ML-DSA/SLH-DSA verification later; `pkcs8.rs`, §9a, is the other —
+`pkcs12.rs`, §9b, decrypts too but only through `pkcs8::Pbes2`, so it does
+not touch `aws-lc-rs` directly). It maps the signature
 algorithm OID to an `aws-lc-rs` `VerificationAlgorithm` (RSA PKCS#1 v1.5
 with SHA-1/256/384/512, ECDSA P-256/P-384 with SHA-256/384, Ed25519 — RSA-
 PSS and post-quantum algorithms are not implemented), picks a candidate
@@ -753,6 +775,57 @@ Thus the two views remain synchronized while the password is available,
 but only the standards-compliant encrypted representation is part of the
 saved document.
 
+## 9b. PKCS#12 read-only decryption (`src/pkcs12.rs`)
+
+A PKCS#12 (`PFX`, RFC 7292) container nests its content in a
+`ContentInfo`-wrapped `AuthenticatedSafe`, and can hold **several**
+independently password-encrypted regions rather than the single one of an
+`EncryptedPrivateKeyInfo`: any number of `EncryptedData` content blobs
+(typically the certificate bags) and `PKCS8ShroudedKeyBag`s (the private
+keys). Pressing **`z`** on such a file therefore reveals a *set* of
+decrypted subtrees, one below each ciphertext node — the same key that
+decrypts a lone PKCS#8 key (§9a), routed to whichever container shape the
+open document matches (the two are structurally disjoint, so
+`start_decrypt`/`submit_password` simply try `pkcs8::parse` then
+`pkcs12::parse`).
+
+The reveal is **read-only**, for a concrete reason: the container's
+integrity `MacData` is keyed with the RFC 7292 Appendix B key-derivation,
+which `aws-lc-rs` does not expose, so an edited PKCS#12 could not be
+re-MAC'd into a file other tools would accept. Rather than offer editing
+that cannot be saved correctly, the decrypted subtrees are shown for
+inspection only; the outer document is never modified by decryption.
+
+`pkcs12::parse` walks the `PFX` positionally (`PFX → ContentInfo →
+AuthenticatedSafe → ContentInfo* / SafeBag*`, descending through the
+encapsulated OCTET STRINGs the BER parser already exposes as children) and
+records every decryptable region: its ciphertext-node path in the outer
+forest, its kind, and the PBES2 scheme decoded from the region's
+`AlgorithmIdentifier`. The password-based encryption must be **PBES2**
+(PBKDF2 + AES-128/256-CBC) — the scheme current tools emit by default and
+the one already implemented for §9a; `pkcs12.rs` reuses `pkcs8::Pbes2`
+(the shared PBKDF2/AES-CBC core) verbatim and adds no crypto of its own.
+Legacy `pbeWithSHAAnd*` schemes (RFC 7292 Appendix B KDF) are reported as
+unsupported. `parse`'s three-way return mirrors `pkcs8::parse`: `Ok(None)`
+(not a PKCS#12), `Err(msg)` (a PKCS#12 with nothing decryptable — no
+encrypted content, or an unsupported scheme), `Ok(Some)` (at least one
+supported region). `Region::decrypt` decrypts and confirms the plaintext
+is a single ASN.1 SEQUENCE (a `SafeContents` or a `PrivateKeyInfo`) — the
+wrong-password signal; because one password protects every region, a wrong
+password fails them all and reads as a single "wrong password" error.
+
+`App::pkcs12` holds the reveal: the retained password (zeroed on drop) and
+one `RevealedRegion` per decrypted region, each carrying the ciphertext
+path, kind, parsed plaintext forest, and an independent specification
+match. `rebuild_rows` splices each region's rows (source
+`RowSource::Pkcs12Revealed(index)`) below its ciphertext node, and the tree
+labels each region root with a green **`🔓 <kind>: `** prefix. These rows
+navigate and fold like any other, but every mutating action refuses the
+source with a "read-only" status (mutable node access is granted only so
+fold state can be toggled). An edit to the *outer* document re-derives the
+reveal with the retained password (`refresh_pkcs12_reveal`, carrying over
+fold state), or discards it if the document no longer decrypts.
+
 ## 10. Input containers
 
 `input::load` detects, in order: PEM (`-----BEGIN <label>-----`, first
@@ -817,7 +890,9 @@ Built with ratatui 0.29 (bundled crossterm backend, `ratatui::init()` /
   values use the repository's leaf descriptor; unknown OIDs retain dot
   notation. An encrypted PKCS#8 `encryptedData` row additionally owns the
   closed-lock placeholder or open-lock virtual plaintext subtree described
-  in §9a, at the same position and with normal folding/navigation behavior.
+  in §9a, at the same position and with normal folding/navigation behavior;
+  a PKCS#12 container's ciphertext rows likewise own the open-lock,
+  read-only reveal subtrees of §9b (green `🔓 <kind>: ` region roots).
 * **Right pane — content.** At the top, the build-up of the tag and the
   length octets is shown graphically: bit-field diagrams with the bit
   positions (8..1), the actual bit values, each field's width in bits and
@@ -896,7 +971,7 @@ document pane.
 | `J` / `K` | move selected element down / up among its siblings |
 | `Enter` / `Esc` | (edit mode) apply / cancel |
 | `s` | save (re-encode + re-wrap container) |
-| `z` | decrypt an `EncryptedPrivateKeyInfo` (prompts for a password) |
+| `z` | decrypt an `EncryptedPrivateKeyInfo` (§9a) or a PKCS#12 container (§9b); prompts for a password |
 | `[` / `]` | scroll content pane |
 | `q` | quit (`q q` to discard unsaved changes) |
 
@@ -923,7 +998,11 @@ the registered `.17` through `.46` range must be present. Unit tests cover
 known/unknown tree summaries, numeric/full-name content details, repository
 consistency, and the closed/open lock labels. PKCS#8 tests cover initial
 decryption, wrong passwords, plaintext edits updating ciphertext, and
-ciphertext edits refreshing or invalidating the virtual tree.
+ciphertext edits refreshing or invalidating the virtual tree. PKCS#12 tests
+cover locating both encrypted regions of a real container, decrypting them,
+rejecting a wrong password, not misfiring on non-PKCS#12 files, and — at the
+app level — that the reveal appears below each ciphertext node and is
+read-only.
 
 Beyond the automated triples check, the `--dump` output format itself
 (column widths derived from file size, `offset length:` prefix,
@@ -937,7 +1016,9 @@ configuration.
 Test corpus: EC P-256 certificate, RSA-2048 certificate (BIT STRING
 encapsulation, long INTEGER hex blocks), SEC1 EC private key (context
 tags `[0]`/`[1]`, OCTET STRING that must *not* encapsulate), PKCS#7
-certificate bundle (`[0]` constructed, empty SET, deep nesting).
+certificate bundle (`[0]` constructed, empty SET, deep nesting), encrypted
+PKCS#8 key and PKCS#12 container (both PBES2/PBKDF2/AES-256-CBC, password
+"asn1editor").
 
 ## 13. Error handling
 

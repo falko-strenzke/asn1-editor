@@ -1,0 +1,110 @@
+-- ASN.1 module extracted from RFC 7292 (July 2014), "PKCS #12: Personal
+-- Information Exchange Syntax v1.1", Appendix C, plus the PKCS#7 content
+-- types (ContentInfo, EncryptedData, DigestInfo) it imports from RFC 2315,
+-- reproduced here so a PKCS#12 `PFX` structurally identifies without an
+-- external PKCS#7 module.
+-- Source: https://www.rfc-editor.org/rfc/rfc7292.txt
+--
+-- Adapted for this tool's ASN.1 subset parser, which implements neither
+-- information object classes nor the version-bracket / extension-marker
+-- syntax:
+--   * the `BAG-TYPE.&id` / `BAG-TYPE.&Type` / `ATTRIBUTE.&id` open-type
+--     fields of SafeBag, CertBag, CRLBag and the attribute syntax are
+--     written as `OBJECT IDENTIFIER` + `[0] EXPLICIT ANY` / `SET OF ANY`
+--     (the concrete bag/attribute contents are still labeled by this tool's
+--     encapsulation pass, which identifies each nested item on its own);
+--   * `PKCS12Attribute` is spelled `Attribute` here to avoid clashing with
+--     the imported name of the same purpose, and its value set is `SET OF
+--     ANY`;
+--   * version-bracketed and DEFAULT components (`iterations INTEGER
+--     DEFAULT 1`) are written as plain OPTIONAL fields — the DER structure
+--     matched is unchanged.
+-- AlgorithmIdentifier is imported and resolves against the bundled RFC 5280
+-- module (cross-module reference resolution), exactly as the RFC 5208 and
+-- RFC 5958 modules do.
+
+PKCS-12 { iso(1) member-body(2) us(840) rsadsi(113549) pkcs(1)
+  pkcs-12(12) modules(0) pkcs-12(1) }
+
+DEFINITIONS IMPLICIT TAGS ::=
+
+BEGIN
+
+-- EXPORTS ALL
+
+IMPORTS
+
+AlgorithmIdentifier
+    FROM PKIX1Explicit-2009
+      { iso(1) identified-organization(3) dod(6) internet(1) security(5)
+        mechanisms(5) pkix(7) id-mod(0) id-mod-pkix1-explicit-02(51) } ;
+
+-- The PFX PDU
+
+PFX ::= SEQUENCE {
+    version     INTEGER,
+    authSafe    ContentInfo,
+    macData     MacData OPTIONAL }
+
+MacData ::= SEQUENCE {
+    -- mac is a DigestInfo. It is inlined here rather than given its own
+    -- top-level name because a standalone `SEQUENCE { AlgorithmIdentifier,
+    -- OCTET STRING }` is structurally identical to an
+    -- `EncryptedPrivateKeyInfo`, and this tool identifies a document by
+    -- whichever top-level type labels the most nodes (with the newer source
+    -- winning ties) — a named DigestInfo would hijack that identification.
+    mac         SEQUENCE {
+        digestAlgorithm   AlgorithmIdentifier,
+        digest            OCTET STRING },
+    macSalt     OCTET STRING,
+    iterations  INTEGER OPTIONAL }
+
+-- PKCS#7 content types (RFC 2315), reduced to what PKCS#12 uses
+
+ContentInfo ::= SEQUENCE {
+    contentType   OBJECT IDENTIFIER,
+    content   [0] EXPLICIT ANY OPTIONAL }
+
+EncryptedData ::= SEQUENCE {
+    version                INTEGER,
+    encryptedContentInfo   EncryptedContentInfo }
+
+EncryptedContentInfo ::= SEQUENCE {
+    contentType                  OBJECT IDENTIFIER,
+    contentEncryptionAlgorithm   AlgorithmIdentifier,
+    encryptedContent         [0] IMPLICIT OCTET STRING OPTIONAL }
+
+-- The authenticated safe and its bags
+
+AuthenticatedSafe ::= SEQUENCE OF ContentInfo
+
+SafeContents ::= SEQUENCE OF SafeBag
+
+SafeBag ::= SEQUENCE {
+    bagId           OBJECT IDENTIFIER,
+    bagValue    [0] EXPLICIT ANY,
+    bagAttributes   SET OF Attribute OPTIONAL }
+
+Attribute ::= SEQUENCE {
+    attrId       OBJECT IDENTIFIER,
+    attrValues   SET OF ANY }
+
+-- Bag value syntaxes
+
+CertBag ::= SEQUENCE {
+    certId      OBJECT IDENTIFIER,
+    certValue   [0] EXPLICIT ANY }
+
+CRLBag ::= SEQUENCE {
+    crlId       OBJECT IDENTIFIER,
+    crlValue    [0] EXPLICIT ANY }
+
+SecretBag ::= SEQUENCE {
+    secretTypeId    OBJECT IDENTIFIER,
+    secretValue [0] EXPLICIT ANY }
+
+-- KeyBag carries a PKCS#8 PrivateKeyInfo; PKCS8ShroudedKeyBag carries an
+-- EncryptedPrivateKeyInfo. Both resolve against the bundled RFC 5208 / 5958
+-- modules via this tool's encapsulation pass, so no local alias is needed.
+
+END

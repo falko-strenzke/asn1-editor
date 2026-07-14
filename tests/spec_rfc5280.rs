@@ -174,6 +174,24 @@ fn encrypted_pkcs8_key_is_identified() {
 }
 
 #[test]
+fn pkcs12_is_identified_as_pfx() {
+    let db = rfc5280_db();
+    let data = std::fs::read(manifest("testdata/pkcs12.der")).unwrap();
+    let roots = ber::parse_forest(&data, 0).unwrap();
+    let ident = spec::identify(&db, &roots).expect("PKCS#12 identified");
+    assert_eq!(ident.type_name, "PFX");
+    assert_eq!(ident.source, "rfc7292");
+    let label = |path: &[usize]| ident.labels.get(path).unwrap();
+    // PFX ::= SEQUENCE { version, authSafe ContentInfo, macData }
+    assert_eq!(label(&[0, 0]).field.as_deref(), Some("version"));
+    assert_eq!(label(&[0, 1]).field.as_deref(), Some("authSafe"));
+    assert_eq!(label(&[0, 1]).type_name, "ContentInfo");
+    assert_eq!(label(&[0, 2]).field.as_deref(), Some("macData"));
+    // ContentInfo ::= SEQUENCE { contentType, content [0] }
+    assert_eq!(label(&[0, 1, 0]).field.as_deref(), Some("contentType"));
+}
+
+#[test]
 fn rfc5958_is_preferred_over_rfc5208() {
     let data = std::fs::read(manifest("testdata/private_key_pkcs8.der")).unwrap();
     let roots = ber::parse_forest(&data, 0).unwrap();

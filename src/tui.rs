@@ -697,6 +697,20 @@ fn draw_tree(frame: &mut Frame, app: &mut App, area: Rect) {
                     Style::new().fg(Color::Green).bold(),
                 ));
             }
+            if let RowSource::Pkcs12Revealed(idx) = row.source {
+                if row.path.len() == 1 {
+                    let kind = app
+                        .pkcs12
+                        .as_ref()
+                        .and_then(|p| p.regions.get(idx))
+                        .map(|r| r.kind.label())
+                        .unwrap_or("decrypted");
+                    spans.push(Span::styled(
+                        format!("🔓 {}: ", kind),
+                        Style::new().fg(Color::Green).bold(),
+                    ));
+                }
+            }
             let label = app.label_for_row(row);
             if let Some(field) = label.and_then(|l| l.field.as_deref()) {
                 spans.push(Span::styled(
@@ -1104,6 +1118,11 @@ fn draw_content_browse(frame: &mut Frame, app: &App, area: Rect) {
                     RowSource::Document => app.ident.as_ref(),
                     RowSource::Decrypted => app.decrypted.as_ref().and_then(|d| d.ident.as_ref()),
                     RowSource::DecryptedPlaceholder => None,
+                    RowSource::Pkcs12Revealed(idx) => app
+                        .pkcs12
+                        .as_ref()
+                        .and_then(|p| p.regions.get(idx))
+                        .and_then(|r| r.ident.as_ref()),
                 }
                 .expect("label implies identification");
                 let field = label.field.as_deref().unwrap_or("-");

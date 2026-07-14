@@ -396,6 +396,72 @@ pub static OIDS: &[OidEntry] = &[
             "emailAddress"
         ]
     ),
+    // PKCS#9 attributes carried by PKCS#12 SafeBags (RFC 7292 / RFC 2985).
+    oid!(
+        "1.2.840.113549.1.9.20",
+        [1, 2, 840, 113549, 1, 9, 20],
+        "friendlyName",
+        [
+            "iso",
+            "member-body",
+            "us",
+            "rsadsi",
+            "pkcs",
+            "pkcs-9",
+            "friendlyName"
+        ]
+    ),
+    oid!(
+        "1.2.840.113549.1.9.21",
+        [1, 2, 840, 113549, 1, 9, 21],
+        "localKeyId",
+        [
+            "iso",
+            "member-body",
+            "us",
+            "rsadsi",
+            "pkcs",
+            "pkcs-9",
+            "localKeyId"
+        ]
+    ),
+    // PKCS#12 bag types (RFC 7292 §4.2), bagtypes ::= {pkcs-12 10 1}.
+    oid!(
+        "1.2.840.113549.1.12.10.1.1",
+        [1, 2, 840, 113549, 1, 12, 10, 1, 1],
+        "keyBag",
+        ["iso", "member-body", "us", "rsadsi", "pkcs", "pkcs-12", "bagtypes", "keyBag"]
+    ),
+    oid!(
+        "1.2.840.113549.1.12.10.1.2",
+        [1, 2, 840, 113549, 1, 12, 10, 1, 2],
+        "pkcs8ShroudedKeyBag",
+        ["iso", "member-body", "us", "rsadsi", "pkcs", "pkcs-12", "bagtypes", "pkcs8ShroudedKeyBag"]
+    ),
+    oid!(
+        "1.2.840.113549.1.12.10.1.3",
+        [1, 2, 840, 113549, 1, 12, 10, 1, 3],
+        "certBag",
+        ["iso", "member-body", "us", "rsadsi", "pkcs", "pkcs-12", "bagtypes", "certBag"]
+    ),
+    oid!(
+        "1.2.840.113549.1.12.10.1.4",
+        [1, 2, 840, 113549, 1, 12, 10, 1, 4],
+        "crlBag",
+        ["iso", "member-body", "us", "rsadsi", "pkcs", "pkcs-12", "bagtypes", "crlBag"]
+    ),
+    oid!(
+        "1.2.840.113549.1.12.10.1.5",
+        [1, 2, 840, 113549, 1, 12, 10, 1, 5],
+        "secretBag",
+        ["iso", "member-body", "us", "rsadsi", "pkcs", "pkcs-12", "bagtypes", "secretBag"]
+    ),
+    oid!(
+        "1.2.840.113549.1.12.10.1.6",
+        [1, 2, 840, 113549, 1, 12, 10, 1, 6],
+        "safeContentsBag",
+        ["iso", "member-body", "us", "rsadsi", "pkcs", "pkcs-12", "bagtypes", "safeContentsBag"]
+    ),
     oid!(
         "1.2.840.113549.2.7",
         [1, 2, 840, 113549, 2, 7],
