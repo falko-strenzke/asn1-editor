@@ -1439,7 +1439,11 @@ impl App {
         }
         self.dirty = true;
         self.rebuild();
-        self.status = "new signature created — 's' writes the file".to_string();
+        // Auto-save the re-signed object in place, matching the re-key flow.
+        self.status = match self.write_current() {
+            Ok(_) => format!("new signature created — saved {}", file_name_string(&self.out_path)),
+            Err(e) => format!("new signature created — SAVE FAILED ({}); 's' retries", e),
+        };
     }
 
     // ---- public-key modification ('e' on subjectPublicKeyInfo) -----------
@@ -4634,7 +4638,13 @@ mod tests {
 
     #[test]
     fn resign_a_modified_certificate_with_a_plaintext_issuer_key() {
-        let mut app = open_real_file(&kl("cert_ec.der"));
+        // A scratch copy of the self-signed certificate and its plaintext key
+        // (re-signing auto-saves, so never open the committed fixtures directly).
+        let dir = tmp_dir("resign-plain");
+        std::fs::copy(kl("cert_ec.der"), dir.join("cert.der")).unwrap();
+        std::fs::copy(kl("key_ec_pkcs8.der"), dir.join("key.der")).unwrap();
+
+        let mut app = open_real_file(&dir.join("cert.der"));
         assert!(matches!(app.sig_status, Some(SignatureStatus::Verified { .. })));
         modify_serial(&mut app);
         assert!(
@@ -4647,12 +4657,15 @@ mod tests {
         assert!(state.ready, "self-signed key present as plaintext: {}", state.detail);
         app.submit_resign();
         assert!(matches!(app.mode, Mode::Browse));
-        assert!(app.dirty);
+        // The re-signed certificate is auto-saved (no separate 's').
+        assert!(!app.dirty, "the re-signed certificate should be saved automatically");
+        assert!(app.status.contains("saved"), "status: {}", app.status);
         assert!(
             matches!(app.sig_status, Some(SignatureStatus::Verified { .. })),
             "the new signature must verify: {}",
             app.status
         );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

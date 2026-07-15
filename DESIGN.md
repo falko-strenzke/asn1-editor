@@ -998,10 +998,13 @@ outer `signature` BIT STRING (the third element of the
 `Certificate`/`CertificateList` SEQUENCE, at path `[0, 2]`) as a leading
 unused-bits octet followed by the signature — the `tbs` cannot have changed
 while the dialog was open, so the pre-computed signature still matches. The
-document is re-encoded and marked dirty; the next `recompute_sig_status` then
-shows the signature verifying again. `verify.rs` gains signature generation
-(it already owned `aws-lc-rs` verification), keeping all signature crypto in
-one module.
+document is re-encoded and then **auto-saved** in place (`write_current`, the
+same helper the re-key flow uses), so the freshly signed object lands on disk
+without a separate `s` (the status line reports the save, or a `SAVE FAILED`
+note leaving the document dirty for a manual retry); the intervening
+`recompute_sig_status` shows the signature verifying again. `verify.rs` gains
+signature generation (it already owned `aws-lc-rs` verification), keeping all
+signature crypto in one module.
 
 ### Retained passwords
 
