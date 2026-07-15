@@ -1351,7 +1351,7 @@ impl App {
             for region in &p12.regions {
                 let Ok(plaintext) = region.decrypt(password) else { continue };
                 let Ok(key_roots) = ber::parse_forest(&plaintext, 0) else { continue };
-                if x509::public_key_id_of_private_key(&key_roots).as_ref() == Some(id) {
+                if private_key_public_id(&key_roots).as_ref() == Some(id) {
                     return x509::to_pkcs8_der(&key_roots);
                 }
             }
@@ -1757,7 +1757,7 @@ impl App {
         };
         match result {
             Ok(decrypted) => {
-                let key = x509::public_key_id_of_private_key(&decrypted.roots);
+                let key = private_key_public_id(&decrypted.roots);
                 self.decrypted = Some(decrypted);
                 self.rebuild_rows();
                 self.cache_unlocked_keys(key.into_iter().collect());
@@ -1812,7 +1812,7 @@ impl App {
         let keys: Vec<x509::PublicKeyId> = regions
             .iter()
             .filter(|r| r.kind == pkcs12::RegionKind::ShroudedKey)
-            .filter_map(|r| x509::public_key_id_of_private_key(&r.roots))
+            .filter_map(|r| private_key_public_id(&r.roots))
             .collect();
         self.pkcs12 = Some(Pkcs12Reveal {
             password: password.as_bytes().to_vec(),
@@ -3270,25 +3270,53 @@ fn resign_issued_file(path: &Path, alg: keygen::KeyAlgorithm, key_pkcs8: &[u8]) 
     std::fs::write(path, out).map_err(|e| e.to_string())
 }
 
-/// The public-key identity of the private key in `roots`, but only if the key
-/// is cryptographically usable — its private scalar must be consistent with
-/// its public key. A structurally-valid but corrupted key returns `None`, so
-/// it neither shows a key↔certificate link nor is offered for re-signing.
-fn usable_key_id(roots: &[Node]) -> Option<x509::PublicKeyId> {
-    let id = x509::public_key_id_of_private_key(roots)?;
+/// The public-key identity of the plaintext private key in `roots`. Tries the
+/// structural extraction first (cheap, no crypto; also covers SEC1 keys and
+/// PKCS#8 keys that embed their public part); for a key whose public key is not
+/// recoverable from the private key alone — ML-DSA/SLH-DSA, or an EC/Ed25519
+/// key without its optional `publicKey` — it derives the `SubjectPublicKeyInfo`
+/// with OpenSSL and reads the identity from there, which is exactly the
+/// identity the certificate side computes. This is what lets a re-keyed
+/// certificate's new PQ key match it for the key↔certificate link and re-signing.
+fn private_key_public_id(roots: &[Node]) -> Option<x509::PublicKeyId> {
+    if let Some(id) = x509::public_key_id_of_private_key(roots) {
+        return Some(id);
+    }
     let pkcs8 = x509::to_pkcs8_der(roots)?;
-    verify::private_key_usable(&pkcs8).then_some(id)
+    let pkey = openssl::pkey::PKey::private_key_from_pkcs8(&pkcs8).ok()?;
+    let spki = pkey.public_key_to_der().ok()?;
+    public_key_id_from_spki(&spki)
+}
+
+/// The public-key identity of the private key in `roots`, but only if the key
+/// is cryptographically usable. A structurally-valid but corrupted key returns
+/// `None`, so it neither shows a key↔certificate link nor is offered for
+/// re-signing.
+fn usable_key_id(roots: &[Node]) -> Option<x509::PublicKeyId> {
+    let pkcs8 = x509::to_pkcs8_der(roots)?;
+    if !verify::private_key_usable(&pkcs8) {
+        return None;
+    }
+    private_key_public_id(roots)
 }
 
 /// Scan `dir` for plaintext key files, keeping only cryptographically usable
-/// keys — a broken key never gets a key↔certificate link.
+/// keys — a broken key never gets a key↔certificate link. Each key's public
+/// identity is derived with [`private_key_public_id`], so post-quantum keys
+/// (whose public key is not in the private key) are included too.
 fn scan_usable_key_files(dir: &Path) -> Vec<x509::KeyFile> {
-    x509::scan_dir_key_files(dir)
+    x509::scan_dir_private_key_paths(dir)
         .into_iter()
-        .filter(|kf| {
-            read_plaintext_key_pkcs8(&kf.path)
-                .map(|pkcs8| verify::private_key_usable(&pkcs8))
-                .unwrap_or(false)
+        .filter_map(|path| {
+            let raw = std::fs::read(&path).ok()?;
+            let (der, _) = input::load(&raw).ok()?;
+            let roots = ber::parse_forest(&der, 0).ok()?;
+            let pkcs8 = x509::to_pkcs8_der(&roots)?;
+            if !verify::private_key_usable(&pkcs8) {
+                return None;
+            }
+            let key = private_key_public_id(&roots)?;
+            Some(x509::KeyFile { path, key })
         })
         .collect()
 }
@@ -5085,6 +5113,59 @@ mod tests {
             cert_verifies_under(&inter, s.pubkey.as_ref().unwrap()),
             "intermediate verifies under the new ML-DSA root key"
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_rekeyed_pq_key_links_and_can_resign_after_a_filesystem_refresh() {
+        // Reproduces the reported bug: a re-keyed certificate's ML-DSA/SLH-DSA
+        // key (whose public key is not recoverable from the private key alone)
+        // must still associate with the certificate and be usable for signing.
+        let dir = copy_chain("pk-pqlink");
+        let mut app = open_real_file(&dir.join("root_ca.der"));
+        app.select(spki_row(&app));
+        app.edit_selected();
+        let ml_dsa = keygen::KeyAlgorithm::Pq(0); // ML-DSA-44 (fast)
+        if let Mode::EditPubKey(ref mut s) = app.mode {
+            s.alg_idx = keygen::ALL.iter().position(|a| *a == ml_dsa).unwrap();
+            s.filename = "root_pq.key".to_string();
+            s.filename_auto = false;
+        }
+        app.submit_pubkey();
+        app.save(); // persist the certificate's new key on disk
+
+        // The periodic filesystem refresh rescans key files and used to drop
+        // the PQ key (no structurally-recoverable public key), removing the
+        // link and the signing material. It must survive now.
+        app.refresh_filesystem();
+
+        let key_path = dir.join("root_pq.key");
+        let cert_id = x509::public_key_id_of_signable(
+            &x509::parse_signable(&app.roots, &ber::encode_forest(&app.roots)).unwrap(),
+        )
+        .unwrap();
+        let kf = app
+            .key_files
+            .iter()
+            .find(|k| k.path == key_path)
+            .expect("the PQ key file is present in key_files after a refresh");
+        assert_eq!(kf.key, cert_id, "the PQ key's identity must equal the certificate's");
+
+        // Symptom (a): the browser shows the key↔certificate connection line.
+        browser_select_by_name(&mut app, "root_ca.der");
+        app.recompute_browser_relations();
+        assert!(
+            app.browser_relations.key_links.contains(&key_path),
+            "the new PQ key must be linked to the certificate it rekeyed"
+        );
+
+        // Symptom (b): re-signing the issued CRL with this key is available —
+        // a fresh session scans the directory and finds the unencrypted key.
+        let mut crl_app = open_real_file(&dir.join("root_crl.der"));
+        crl_app.start_resign();
+        let Mode::Resign(ref st) = crl_app.mode else { panic!("resign dialog expected") };
+        assert!(st.ready, "re-signing the CRL should find the issuer's ML-DSA key: {}", st.detail);
+
         let _ = std::fs::remove_dir_all(&dir);
     }
 

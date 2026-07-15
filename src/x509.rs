@@ -643,18 +643,22 @@ pub struct KeyFile {
     pub key: PublicKeyId,
 }
 
-/// Recursively scan `root` for files that decode as a *plaintext* private
-/// key (PKCS#8 or SEC1) whose public key can be recovered. Encrypted keys
-/// and PKCS#12 containers are not included here — their key becomes known
-/// only after a password is supplied, handled in `app.rs`. Same traversal
-/// rules as [`scan_dir_signables`] (no symlinks, size/depth caps).
-pub fn scan_dir_key_files(root: &Path) -> Vec<KeyFile> {
+/// Recursively scan `root` for files that structurally decode as a *plaintext*
+/// private key (SEC1 `ECPrivateKey` or PKCS#8 `PrivateKeyInfo`), returning
+/// their paths. Recognition is by *shape* — it does **not** require the public
+/// key to be recoverable from the private key, because ML-DSA/SLH-DSA PKCS#8
+/// keys carry no embedded public key; the caller derives the public-key
+/// identity (with crypto help where the structure alone is not enough).
+/// Encrypted keys and PKCS#12 containers are excluded — their key becomes known
+/// only after a password is supplied, handled in `app.rs`. Same traversal rules
+/// as [`scan_dir_signables`] (no symlinks, size/depth caps).
+pub fn scan_dir_private_key_paths(root: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
-    scan_keys_rec(root, 0, &mut out);
+    scan_key_paths_rec(root, 0, &mut out);
     out
 }
 
-fn scan_keys_rec(dir: &Path, depth: usize, out: &mut Vec<KeyFile>) {
+fn scan_key_paths_rec(dir: &Path, depth: usize, out: &mut Vec<PathBuf>) {
     if depth > MAX_SCAN_DEPTH {
         return;
     }
@@ -663,25 +667,58 @@ fn scan_keys_rec(dir: &Path, depth: usize, out: &mut Vec<KeyFile>) {
         let Ok(file_type) = entry.file_type() else { continue };
         let path = entry.path();
         if file_type.is_dir() {
-            scan_keys_rec(&path, depth + 1, out);
-        } else if file_type.is_file() {
-            if let Some(key) = scan_key_file(&path) {
-                out.push(key);
-            }
+            scan_key_paths_rec(&path, depth + 1, out);
+        } else if file_type.is_file() && is_private_key_file(&path) {
+            out.push(path);
         }
     }
 }
 
-fn scan_key_file(path: &Path) -> Option<KeyFile> {
-    let meta = std::fs::metadata(path).ok()?;
+fn is_private_key_file(path: &Path) -> bool {
+    let Ok(meta) = std::fs::metadata(path) else { return false };
     if meta.len() > MAX_SCAN_FILE_SIZE {
-        return None;
+        return false;
     }
-    let raw = std::fs::read(path).ok()?;
-    let (der, _container) = input::load(&raw).ok()?;
-    let roots = ber::parse_forest(&der, 0).ok()?;
-    let key = public_key_id_of_private_key(&roots)?;
-    Some(KeyFile { path: path.to_path_buf(), key })
+    let Ok(raw) = std::fs::read(path) else { return false };
+    let Ok((der, _container)) = input::load(&raw) else { return false };
+    let Ok(roots) = ber::parse_forest(&der, 0) else { return false };
+    is_plaintext_private_key(&roots)
+}
+
+/// Whether `roots` structurally decodes as a plaintext private key — a SEC1
+/// `ECPrivateKey` (`SEQUENCE { version INTEGER, privateKey OCTET STRING, … }`)
+/// or a PKCS#8 `PrivateKeyInfo` / `OneAsymmetricKey` (`SEQUENCE { version
+/// INTEGER, privateKeyAlgorithm SEQUENCE { OID, … }, privateKey OCTET STRING,
+/// … }`) — *without* requiring the public key to be recoverable. A leading
+/// version INTEGER distinguishes both shapes from a certificate (leading
+/// `tbsCertificate` SEQUENCE) and an `EncryptedPrivateKeyInfo` (leading
+/// `AlgorithmIdentifier` SEQUENCE).
+pub fn is_plaintext_private_key(roots: &[Node]) -> bool {
+    if roots.len() != 1 {
+        return false;
+    }
+    let root = &roots[0];
+    if !root.constructed || !root.is_universal(TAG_SEQUENCE) || root.children.len() < 2 {
+        return false;
+    }
+    let version = &root.children[0];
+    if version.constructed || !version.is_universal(TAG_INTEGER) {
+        return false;
+    }
+    let second = &root.children[1];
+    // SEC1 ECPrivateKey: the second element is the privateKey OCTET STRING.
+    if !second.constructed && second.is_universal(TAG_OCTET_STRING) {
+        return true;
+    }
+    // PKCS#8: privateKeyAlgorithm SEQUENCE { OID, … }, then privateKey OCTET STRING.
+    let alg_is_seq_with_oid = second.constructed
+        && second.is_universal(TAG_SEQUENCE)
+        && second.children.first().is_some_and(|c| !c.constructed && c.is_universal(TAG_OID));
+    alg_is_seq_with_oid
+        && root
+            .children
+            .get(2)
+            .is_some_and(|pk| !pk.constructed && pk.is_universal(TAG_OCTET_STRING))
 }
 
 #[cfg(test)]
@@ -743,11 +780,11 @@ mod tests {
     }
 
     #[test]
-    fn scan_dir_key_files_finds_plaintext_keys_only() {
-        let keys = scan_dir_key_files(Path::new("testdata/keylink"));
-        let names: std::collections::BTreeSet<String> = keys
+    fn scan_dir_private_key_paths_finds_plaintext_keys_only() {
+        let paths = scan_dir_private_key_paths(Path::new("testdata/keylink"));
+        let names: std::collections::BTreeSet<String> = paths
             .iter()
-            .map(|k| k.path.file_name().unwrap().to_string_lossy().into_owned())
+            .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
             .collect();
         assert!(names.contains("key_ec_pkcs8.der"));
         assert!(names.contains("key_ec_sec1.der"));
@@ -757,6 +794,18 @@ mod tests {
         assert!(!names.contains("key_ec_enc.der"));
         assert!(!names.contains("key_ec.p12"));
         assert!(!names.contains("cert_ec.der"));
+    }
+
+    #[test]
+    fn certificate_and_encrypted_key_are_not_plaintext_private_keys() {
+        for f in ["testdata/cert_ec.der", "testdata/cert_rsa.der", "testdata/enc_pkcs8.der", "testdata/pkcs12.der"] {
+            let (_der, roots) = parse_der(Path::new(f));
+            assert!(!is_plaintext_private_key(&roots), "{} misdetected as a private key", f);
+        }
+        for f in ["testdata/private_key_pkcs8.der", "testdata/ec_key.der"] {
+            let (_der, roots) = parse_der(Path::new(f));
+            assert!(is_plaintext_private_key(&roots), "{} not detected as a private key", f);
+        }
     }
 
     #[test]
