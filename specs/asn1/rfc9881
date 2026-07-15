@@ -1,0 +1,95 @@
+-- ASN.1 module from RFC 9881 (October 2025), "Internet X.509 Public Key
+-- Infrastructure — Algorithm Identifiers for the Module-Lattice-Based
+-- Digital Signature Algorithm (ML-DSA)", Appendix A (module
+-- X509-ML-DSA-2025). ML-DSA is FIPS 204.
+-- Source: https://www.rfc-editor.org/rfc/rfc9881.txt
+--
+-- Adapted for this tool's ASN.1 subset parser, which implements neither
+-- information object classes nor the version-bracket / extension-marker
+-- syntax:
+--   * the PUBLIC-KEY / SIGNATURE-ALGORITHM information-object definitions
+--     and object sets (PublicKeys, SignatureAlgorithms, pk-ml-dsa-*,
+--     sa-ml-dsa-*) are dropped — they bind OIDs to key/signature usage
+--     via information object classes this tool does not model, and carry
+--     no DER structure of their own to match;
+--   * the algorithm OID value assignments are kept (parsed and discarded,
+--     as in the bundled RFC 5280 module) for provenance — the same numeric
+--     OIDs are resolved to their short names by the built-in OID repository
+--     (src/oid.rs);
+--   * the ML-DSA private- and public-key TYPE definitions are kept: they do
+--     describe DER structure — an ML-DSA `OneAsymmetricKey` carries its
+--     private key as the `ML-DSA-nn-PrivateKey` CHOICE inside the `privateKey`
+--     OCTET STRING. This tool discards SIZE constraints, so the three
+--     parameter sets' private/public key types are structurally identical
+--     (a match reports whichever is defined first, ML-DSA-44).
+-- The `ML-DSA-87-PublicKey` SIZE is reproduced as it appears in the
+-- Appendix A module (2602); Section 4.3 of the RFC gives the correct
+-- ML-DSA-87 public-key length, 2592. The value is discarded here anyway.
+
+X509-ML-DSA-2025
+  { iso(1) identified-organization(3) dod(6)
+    internet(1) security(5) mechanisms(5) pkix(7) id-mod(0)
+    id-mod-x509-ml-dsa-2025(119) }
+
+DEFINITIONS IMPLICIT TAGS ::=
+
+BEGIN
+
+-- EXPORTS ALL
+
+-- ML-DSA Identifiers
+
+nistAlgorithms OBJECT IDENTIFIER ::= { joint-iso-itu-t(2)
+  country(16) us(840) organization(1) gov(101) csor(3)
+  nistAlgorithms(4) }
+
+sigAlgs OBJECT IDENTIFIER ::= { nistAlgorithms 3 }
+
+id-ml-dsa-44 OBJECT IDENTIFIER ::= { sigAlgs 17 }
+
+id-ml-dsa-65 OBJECT IDENTIFIER ::= { sigAlgs 18 }
+
+id-ml-dsa-87 OBJECT IDENTIFIER ::= { sigAlgs 19 }
+
+-- ML-DSA Private Keys
+--
+-- The private key carried in a OneAsymmetricKey `privateKey` OCTET STRING:
+-- the 32-byte seed, the expanded key, or both.
+
+ML-DSA-44-PrivateKey ::= CHOICE {
+    seed [0] OCTET STRING (SIZE (32)),
+    expandedKey OCTET STRING (SIZE (2560)),
+    both SEQUENCE {
+        seed OCTET STRING (SIZE (32)),
+        expandedKey OCTET STRING (SIZE (2560))
+        }
+    }
+
+ML-DSA-65-PrivateKey ::= CHOICE {
+    seed [0] OCTET STRING (SIZE (32)),
+    expandedKey OCTET STRING (SIZE (4032)),
+    both SEQUENCE {
+        seed OCTET STRING (SIZE (32)),
+        expandedKey OCTET STRING (SIZE (4032))
+        }
+    }
+
+ML-DSA-87-PrivateKey ::= CHOICE {
+    seed [0] OCTET STRING (SIZE (32)),
+    expandedKey OCTET STRING (SIZE (4896)),
+    both SEQUENCE {
+        seed OCTET STRING (SIZE (32)),
+        expandedKey OCTET STRING (SIZE (4896))
+        }
+    }
+
+-- ML-DSA Public Keys (raw, no ASN.1 wrapping; carried in the
+-- subjectPublicKey BIT STRING)
+
+ML-DSA-44-PublicKey ::= OCTET STRING (SIZE (1312))
+
+ML-DSA-65-PublicKey ::= OCTET STRING (SIZE (1952))
+
+ML-DSA-87-PublicKey ::= OCTET STRING (SIZE (2602))
+
+END

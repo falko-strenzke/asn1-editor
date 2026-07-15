@@ -1,0 +1,68 @@
+-- ASN.1 module from RFC 9909 (July 2025), "Internet X.509 Public Key
+-- Infrastructure — Algorithm Identifiers for the Stateless Hash-Based
+-- Digital Signature Algorithm (SLH-DSA)", Appendix A (module
+-- X509-SLH-DSA-Module-2025). SLH-DSA is FIPS 205.
+-- Source: https://www.rfc-editor.org/rfc/rfc9909.txt
+--
+-- Adapted for this tool's ASN.1 subset parser, which implements neither
+-- information object classes nor the version-bracket / extension-marker
+-- syntax:
+--   * the PUBLIC-KEY / SIGNATURE-ALGORITHM / SMIME-CAPS information-object
+--     definitions and object sets (pk-hash-slh-dsa-*, sa-hash-slh-dsa-*,
+--     SignatureAlgorithms, SMimeCaps, PublicKeyAlgorithms) are dropped
+--     — they bind OIDs to key/signature usage via information object
+--     classes this tool does not model, and carry no DER structure;
+--   * only the algorithm OID value assignments are kept (parsed and
+--     discarded, as in the bundled RFC 5280 module) for provenance — the
+--     same numeric OIDs are resolved to their short names by the built-in
+--     OID repository (src/oid.rs).
+-- RFC 9909 defines NO ASN.1 type definitions: an SLH-DSA public key and
+-- signature are raw octets with no ASN.1 wrapping, and the private-key
+-- syntax lives in a separate imported module (SLH-DSA-Module-2024,
+-- RFC 9814). This module therefore contributes no structural types to the
+-- matcher; it documents the HashSLH-DSA identifiers RFC 9909 itself assigns
+-- (the "pre-hash" variants, sigAlgs 35..46). The twelve pure SLH-DSA
+-- identifiers (sigAlgs 20..31) are imported from RFC 9814, not defined here.
+
+X509-SLH-DSA-Module-2025
+  { iso(1) identified-organization(3) dod(6) internet(1) security(5)
+    mechanisms(5) pkix(7) id-mod(0) id-mod-x509-slh-dsa-2025(120) }
+
+DEFINITIONS IMPLICIT TAGS ::=
+
+BEGIN
+
+-- EXPORTS ALL
+
+-- HashSLH-DSA object identifiers from the NIST CSOR arc.
+
+nistAlgorithms OBJECT IDENTIFIER ::= { joint-iso-itu-t(2)
+  country(16) us(840) organization(1) gov(101) csor(3) 4 }
+
+sigAlgs OBJECT IDENTIFIER ::= { nistAlgorithms 3 }
+
+id-hash-slh-dsa-sha2-128s-with-sha256 OBJECT IDENTIFIER ::= { sigAlgs 35 }
+
+id-hash-slh-dsa-sha2-128f-with-sha256 OBJECT IDENTIFIER ::= { sigAlgs 36 }
+
+id-hash-slh-dsa-sha2-192s-with-sha512 OBJECT IDENTIFIER ::= { sigAlgs 37 }
+
+id-hash-slh-dsa-sha2-192f-with-sha512 OBJECT IDENTIFIER ::= { sigAlgs 38 }
+
+id-hash-slh-dsa-sha2-256s-with-sha512 OBJECT IDENTIFIER ::= { sigAlgs 39 }
+
+id-hash-slh-dsa-sha2-256f-with-sha512 OBJECT IDENTIFIER ::= { sigAlgs 40 }
+
+id-hash-slh-dsa-shake-128s-with-shake128 OBJECT IDENTIFIER ::= { sigAlgs 41 }
+
+id-hash-slh-dsa-shake-128f-with-shake128 OBJECT IDENTIFIER ::= { sigAlgs 42 }
+
+id-hash-slh-dsa-shake-192s-with-shake256 OBJECT IDENTIFIER ::= { sigAlgs 43 }
+
+id-hash-slh-dsa-shake-192f-with-shake256 OBJECT IDENTIFIER ::= { sigAlgs 44 }
+
+id-hash-slh-dsa-shake-256s-with-shake256 OBJECT IDENTIFIER ::= { sigAlgs 45 }
+
+id-hash-slh-dsa-shake-256f-with-shake256 OBJECT IDENTIFIER ::= { sigAlgs 46 }
+
+END
