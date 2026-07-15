@@ -37,6 +37,7 @@ use crate::ber::{
     self, Class, Node, TAG_BIT_STRING, TAG_BOOLEAN, TAG_GENERALIZED_TIME, TAG_INTEGER, TAG_NULL,
     TAG_OID, TAG_UTC_TIME,
 };
+use crate::keygen;
 use crate::oid;
 use crate::pathval::PathStatus;
 use crate::verify::{FileRelations, SignatureStatus};
@@ -74,6 +75,11 @@ fn event_loop(terminal: &mut DefaultTerminal, app: &mut App) -> io::Result<()> {
                 match app.mode {
                     Mode::Edit(ref mut edit) => edit.editor.paste(&text),
                     Mode::Password(ref mut p) => p.paste(&text),
+                    Mode::EditPubKey(_) => {
+                        for c in text.chars() {
+                            app.pubkey_insert_char(c);
+                        }
+                    }
                     _ => {}
                 }
                 continue;
@@ -89,6 +95,7 @@ fn event_loop(terminal: &mut DefaultTerminal, app: &mut App) -> io::Result<()> {
             Mode::EditMenu(_) => handle_menu_key(app, key),
             Mode::Password(_) => handle_password_key(app, key),
             Mode::Resign(_) => handle_resign_key(app, key),
+            Mode::EditPubKey(_) => handle_pubkey_key(app, key),
             Mode::Browse => {
                 if key.code != KeyCode::Char('q') {
                     app.quit_confirm = false;
@@ -150,7 +157,7 @@ fn handle_document_key(app: &mut App, key: KeyEvent) {
         KeyCode::Left | KeyCode::Char('h') => app.collapse_or_parent(),
         KeyCode::Right | KeyCode::Char('l') => app.expand_or_child(),
         KeyCode::Enter | KeyCode::Char(' ') => app.toggle_expand(),
-        KeyCode::Char('e') => app.start_edit_type_specific(),
+        KeyCode::Char('e') => app.edit_selected(),
         KeyCode::Char('E') => app.open_edit_menu(),
         KeyCode::Char('i') => app.start_insert(false),
         KeyCode::Char('I') => app.start_insert(true),
@@ -187,6 +194,21 @@ fn handle_resign_key(app: &mut App, key: KeyEvent) {
     match key.code {
         KeyCode::Esc => app.cancel_resign(),
         KeyCode::Enter => app.submit_resign(),
+        _ => {}
+    }
+}
+
+fn handle_pubkey_key(app: &mut App, key: KeyEvent) {
+    match key.code {
+        KeyCode::Esc => app.cancel_pubkey(),
+        KeyCode::Enter => app.submit_pubkey(),
+        KeyCode::Left | KeyCode::BackTab => app.pubkey_move_column(-1),
+        KeyCode::Right | KeyCode::Tab => app.pubkey_move_column(1),
+        KeyCode::Up => app.pubkey_move_row(-1),
+        KeyCode::Down => app.pubkey_move_row(1),
+        KeyCode::Char(' ') => app.pubkey_toggle(),
+        KeyCode::Backspace => app.pubkey_backspace(),
+        KeyCode::Char(c) => app.pubkey_insert_char(c),
         _ => {}
     }
 }
@@ -272,6 +294,113 @@ fn draw(frame: &mut Frame, app: &mut App) {
     }
     if matches!(app.mode, Mode::Resign(_)) {
         draw_resign(frame, app, main);
+    }
+    if matches!(app.mode, Mode::EditPubKey(_)) {
+        draw_edit_pubkey(frame, app, main);
+    }
+}
+
+/// Centered three-column popup for the public-key modification dialog:
+/// algorithm choice | key-generation options | issued certificates to resign.
+fn draw_edit_pubkey(frame: &mut Frame, app: &App, area: Rect) {
+    let Mode::EditPubKey(ref s) = app.mode else { return };
+    let width = 92.min(area.width);
+    let height = 18.min(area.height);
+    let popup = Rect {
+        x: area.x + (area.width.saturating_sub(width)) / 2,
+        y: area.y + (area.height.saturating_sub(height)) / 2,
+        width,
+        height,
+    };
+    frame.render_widget(Clear, popup);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::new().fg(Color::Yellow))
+        .title(" MODIFY PUBLIC KEY — new key pair, resign issued certs ");
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+    let [cols_area, hint_area] =
+        Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(inner);
+    let [alg_col, opt_col, issued_col] = Layout::horizontal([
+        Constraint::Length(26),
+        Constraint::Length(34),
+        Constraint::Min(20),
+    ])
+    .areas(cols_area);
+
+    let header = |text: &str, active: bool| {
+        let style = if active {
+            Style::new().fg(Color::Yellow).underlined().bold()
+        } else {
+            Style::new().underlined()
+        };
+        Line::from(Span::styled(text.to_string(), style))
+    };
+    // A selectable row: reversed when it is the active cell.
+    let row = |text: String, selected: bool, active: bool| {
+        let mut style = Style::new();
+        if selected && active {
+            style = style.add_modifier(Modifier::REVERSED).bold();
+        } else if selected {
+            style = style.bold().fg(Color::Yellow);
+        }
+        Line::from(Span::styled(format!(" {} ", text), style))
+    };
+
+    // Column 0: algorithm list.
+    let mut alg_lines = vec![header("Algorithm", s.column == 0)];
+    for (i, alg) in keygen::ALL.iter().enumerate() {
+        alg_lines.push(row(alg.label().to_string(), i == s.alg_idx, s.column == 0));
+    }
+    frame.render_widget(Paragraph::new(alg_lines), alg_col);
+
+    // Column 1: generate checkbox, file name, password.
+    let check = if s.generate { "[x]" } else { "[ ]" };
+    let mask: String = "•".repeat(s.password.chars().count());
+    let opt_lines = vec![
+        header("New private key", s.column == 1),
+        row(format!("{} generate new private key", check), s.option_field == 0, s.column == 1),
+        Line::default(),
+        Line::from(Span::styled(" file name", Style::new().dim())),
+        row(field_value(&s.filename, s.generate), s.option_field == 1, s.column == 1),
+        Line::default(),
+        Line::from(Span::styled(" password (blank = unencrypted)", Style::new().dim())),
+        row(field_value(&mask, s.generate), s.option_field == 2, s.column == 1),
+    ];
+    frame.render_widget(Paragraph::new(opt_lines), opt_col);
+
+    // Column 2: issued certificates with resign checkboxes.
+    let mut issued_lines = vec![header("Resign issued certs", s.column == 2)];
+    if s.issued.is_empty() {
+        issued_lines.push(Line::from(Span::styled(" (none found)", Style::new().dim())));
+    } else {
+        let visible = (issued_col.height as usize).saturating_sub(1).max(1);
+        let start = s.issued_idx.saturating_sub(visible.saturating_sub(1));
+        for (i, cert) in s.issued.iter().enumerate().skip(start).take(visible) {
+            let box_ = if cert.selected { "[x]" } else { "[ ]" };
+            let label = format!("{} {}  #{}", box_, cert.name, cert.serial);
+            issued_lines.push(row(label, i == s.issued_idx, s.column == 2));
+        }
+    }
+    frame.render_widget(Paragraph::new(issued_lines), issued_col);
+
+    let hint = Line::from(Span::styled(
+        "←→ column  ↑↓ move  Space toggle  type to edit name/password  ⏎ apply  Esc cancel",
+        Style::new().dim(),
+    ));
+    frame.render_widget(Paragraph::new(hint), hint_area);
+}
+
+/// Render a text-field value, dimmed with a placeholder when the field is
+/// inactive because key generation is turned off.
+fn field_value(value: &str, active: bool) -> String {
+    if !active {
+        return "—".to_string();
+    }
+    if value.is_empty() {
+        " ".to_string()
+    } else {
+        value.to_string()
     }
 }
 
@@ -1607,6 +1736,9 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
         Mode::Edit(_) => "Enter apply  Esc cancel",
         Mode::Password(_) => "type password  ⏎ decrypt  Esc cancel",
         Mode::Resign(_) => "⏎ create new signature (if available)  Esc cancel",
+        Mode::EditPubKey(_) => {
+            "←→ column  ↑↓ move  Space toggle  type name/password  ⏎ apply  Esc cancel"
+        }
     };
     let line = Line::from(vec![
         Span::styled(dirty, Style::new().fg(Color::Red).bold()),

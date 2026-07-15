@@ -24,6 +24,7 @@ pub mod ber;
 pub mod browser;
 pub mod dump;
 pub mod input;
+pub mod keygen;
 pub mod oid;
 pub mod pathval;
 pub mod pkcs12;
