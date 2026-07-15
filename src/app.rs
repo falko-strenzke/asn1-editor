@@ -50,8 +50,8 @@ pub enum RowSource {
     Document,
     Decrypted,
     DecryptedPlaceholder,
-    /// A read-only virtual row of the PKCS#12 reveal: the plaintext of the
-    /// `usize`-th decrypted region (see [`Pkcs12Reveal`]).
+    /// A virtual row of the PKCS#12 reveal: the plaintext of the `usize`-th
+    /// decrypted region (see [`Pkcs12Reveal`]).
     Pkcs12Revealed(usize),
 }
 
@@ -702,16 +702,22 @@ impl Drop for Decrypted {
     }
 }
 
-/// A successful, read-only decryption of the currently open PKCS#12 (`PFX`)
-/// container. Unlike the editable single-region `Decrypted`, a PKCS#12 may
-/// hold several encrypted regions, and it can't be re-MAC'd with the
-/// available primitives, so its reveal is view-only: each region's plaintext
-/// is shown as virtual rows below its ciphertext node and never written back.
+/// A successful decryption of the currently open PKCS#12 (`PFX`) container.
+/// Unlike the single-region `Decrypted`, a PKCS#12 may hold several
+/// encrypted regions; each region's plaintext is shown (and edited) as
+/// virtual rows below its ciphertext node. An edit re-encrypts the region
+/// in place and recomputes the container's integrity `MacData` — unless
+/// `editable` carries the reason that is impossible (an unsupported MAC
+/// digest), in which case the reveal stays read-only.
 pub struct Pkcs12Reveal {
-    /// Password retained only so an edit to the outer document can re-derive
-    /// the reveal (`refresh_pkcs12_reveal`). Zeroed on drop.
+    /// Password retained to re-encrypt edited regions and re-derive the
+    /// reveal after outer-document edits (`refresh_pkcs12_reveal`). Zeroed
+    /// on drop.
     password: Vec<u8>,
     pub regions: Vec<RevealedRegion>,
+    /// `Ok` when edited regions can be re-encrypted into a consistent file
+    /// (the `MacData` is absent or recomputable); `Err(reason)` otherwise.
+    pub editable: Result<(), String>,
 }
 
 /// One decrypted region of a [`Pkcs12Reveal`].
@@ -719,8 +725,7 @@ pub struct RevealedRegion {
     /// Path of the ciphertext node (in `self.roots`) this hangs below.
     pub cipher_path: Vec<usize>,
     pub kind: pkcs12::RegionKind,
-    /// Parsed plaintext. Mutable only so fold state can be toggled; value and
-    /// structure edits are refused (the reveal is read-only).
+    /// Parsed, editable plaintext of this region.
     pub roots: Vec<Node>,
     /// Specification match for this region's plaintext tree.
     pub ident: Option<Identification>,
@@ -729,6 +734,16 @@ pub struct RevealedRegion {
 impl Drop for Pkcs12Reveal {
     fn drop(&mut self) {
         self.password.fill(0);
+    }
+}
+
+/// Whether a PKCS#12 reveal may be edited, given the container's `MacData`
+/// state: absent or supported MACs keep the file consistent after
+/// re-encryption, an unsupported one cannot be recomputed.
+fn mac_editable(mac: &pkcs12::Mac) -> Result<(), String> {
+    match mac {
+        pkcs12::Mac::Unsupported(reason) => Err(reason.clone()),
+        pkcs12::Mac::Absent | pkcs12::Mac::Supported(_) => Ok(()),
     }
 }
 
@@ -1213,7 +1228,7 @@ impl App {
             self.submit_pkcs8_password(password);
             return;
         }
-        // PKCS#12 container: read-only multi-region reveal.
+        // PKCS#12 container: editable multi-region reveal.
         if matches!(pkcs12::parse(&self.roots), Ok(Some(_))) {
             self.submit_pkcs12_password(&password);
             return;
@@ -1257,7 +1272,7 @@ impl App {
     }
 
     /// Decrypt every supported region of the open PKCS#12 with `password` and
-    /// expose the plaintexts as read-only virtual subtrees. A single wrong
+    /// expose the plaintexts as editable virtual subtrees. A single wrong
     /// password fails every region's padding, which reads as a wrong-password
     /// error rather than a partial reveal.
     fn submit_pkcs12_password(&mut self, password: &str) {
@@ -1298,7 +1313,11 @@ impl App {
             .filter(|r| r.kind == pkcs12::RegionKind::ShroudedKey)
             .filter_map(|r| x509::public_key_id_of_private_key(&r.roots))
             .collect();
-        self.pkcs12 = Some(Pkcs12Reveal { password: password.as_bytes().to_vec(), regions });
+        self.pkcs12 = Some(Pkcs12Reveal {
+            password: password.as_bytes().to_vec(),
+            regions,
+            editable: mac_editable(&p12.mac),
+        });
         self.rebuild_rows();
         self.cache_unlocked_keys(keys);
         self.retained_passwords.set(self.path.clone(), password.as_bytes().to_vec());
@@ -1563,9 +1582,6 @@ impl App {
                 node_at_mut(&mut self.decrypted.as_mut()?.roots, &row.path)
             }
             RowSource::DecryptedPlaceholder => None,
-            // Mutable access is granted only so fold state (`expanded`) can
-            // be toggled; the editing actions refuse this source, keeping the
-            // reveal read-only.
             RowSource::Pkcs12Revealed(idx) => {
                 node_at_mut(&mut self.pkcs12.as_mut()?.regions.get_mut(idx)?.roots, &row.path)
             }
@@ -1754,20 +1770,28 @@ impl App {
         }
     }
 
-    /// Editing actions bail out with a message on a read-only PKCS#12 reveal
-    /// row. Returns `true` (having set the status) when the current row is
-    /// such a row.
-    fn reject_readonly_reveal(&mut self) -> bool {
-        let readonly =
-            matches!(self.rows.get(self.selected).map(|r| r.source), Some(RowSource::Pkcs12Revealed(_)));
-        if readonly {
-            self.status = "decrypted PKCS#12 content is read-only".to_string();
+    /// Editing actions on a PKCS#12 revealed row bail out with a message
+    /// when the edited region could not be re-encrypted into a consistent
+    /// file (the container's MAC cannot be recomputed). Returns `true`
+    /// (having set the status) when the edit must be refused.
+    fn reject_uneditable_reveal(&mut self) -> bool {
+        if !matches!(
+            self.rows.get(self.selected).map(|r| r.source),
+            Some(RowSource::Pkcs12Revealed(_))
+        ) {
+            return false;
         }
-        readonly
+        match self.pkcs12.as_ref().map(|p| p.editable.clone()) {
+            Some(Err(reason)) => {
+                self.status = format!("decrypted PKCS#12 content is read-only — {}", reason);
+                true
+            }
+            _ => false,
+        }
     }
 
     pub fn start_edit(&mut self) {
-        if self.reject_readonly_reveal() {
+        if self.reject_uneditable_reveal() {
             return;
         }
         let Some(node) = self.selected_node() else { return };
@@ -1778,7 +1802,7 @@ impl App {
 
     /// 'E' opens the edit-mode menu for the selected element.
     pub fn open_edit_menu(&mut self) {
-        if self.reject_readonly_reveal() {
+        if self.reject_uneditable_reveal() {
             return;
         }
         if self.selected_node().is_none() {
@@ -1847,7 +1871,7 @@ impl App {
     /// single natural value; a status message is shown and the mode is
     /// left unchanged (browse or menu).
     pub fn start_edit_type_specific(&mut self) {
-        if self.reject_readonly_reveal() {
+        if self.reject_uneditable_reveal() {
             return;
         }
         let Some(node) = self.selected_node() else { return };
@@ -1935,8 +1959,7 @@ impl App {
                 self.status = "decrypt the content before editing it".to_string();
                 return;
             }
-            if matches!(row.source, RowSource::Pkcs12Revealed(_)) {
-                self.status = "decrypted PKCS#12 content is read-only".to_string();
+            if self.reject_uneditable_reveal() {
                 return;
             }
             let path = row.path;
@@ -1956,6 +1979,11 @@ impl App {
                         "a decrypted PKCS#8 value must remain one top-level SEQUENCE".to_string();
                     return;
                 }
+                if matches!(row.source, RowSource::Pkcs12Revealed(_)) && parent.is_empty() {
+                    self.status =
+                        "a decrypted PKCS#12 region must remain one top-level SEQUENCE".to_string();
+                    return;
+                }
                 (parent.to_vec(), last + 1, row.source)
             }
         };
@@ -1973,10 +2001,10 @@ impl App {
             self.status = "decrypt the content before editing it".to_string();
             return;
         }
-        if matches!(row.source, RowSource::Pkcs12Revealed(_)) {
-            self.status = "decrypted PKCS#12 content is read-only".to_string();
+        if self.reject_uneditable_reveal() {
             return;
         }
+        let Some(row) = self.rows.get(self.selected) else { return };
         let path = row.path.clone();
         let source = row.source;
         let Some(node) = self.selected_node() else { return };
@@ -2079,11 +2107,11 @@ impl App {
         constructed: bool,
         tag: u32,
     ) {
-        if source == RowSource::Decrypted
+        if matches!(source, RowSource::Decrypted | RowSource::Pkcs12Revealed(_))
             && path.len() == 1
             && (class != Class::Universal || tag != ber::TAG_SEQUENCE || !constructed)
         {
-            self.status = "the decrypted PKCS#8 root must remain a SEQUENCE".to_string();
+            self.status = "the decrypted root must remain a SEQUENCE".to_string();
             return;
         }
         let roots = match source {
@@ -2092,7 +2120,15 @@ impl App {
                 let Some(decrypted) = self.decrypted.as_mut() else { return };
                 &mut decrypted.roots
             }
-            RowSource::DecryptedPlaceholder | RowSource::Pkcs12Revealed(_) => return,
+            RowSource::Pkcs12Revealed(idx) => {
+                let Some(region) =
+                    self.pkcs12.as_mut().and_then(|p| p.regions.get_mut(idx))
+                else {
+                    return;
+                };
+                &mut region.roots
+            }
+            RowSource::DecryptedPlaceholder => return,
         };
         let Some(node) = node_at_mut(roots, path) else { return };
         if node.class == class && node.constructed == constructed && node.tag == tag {
@@ -2140,8 +2176,7 @@ impl App {
             self.status = "decrypt the content before editing it".to_string();
             return;
         }
-        if matches!(row.source, RowSource::Pkcs12Revealed(_)) {
-            self.status = "decrypted PKCS#12 content is read-only".to_string();
+        if self.reject_uneditable_reveal() {
             return;
         }
         let (&last, parent) = row.path.split_last().expect("row paths are non-empty");
@@ -2151,7 +2186,15 @@ impl App {
                 let Some(decrypted) = self.decrypted.as_mut() else { return };
                 &mut decrypted.roots
             }
-            RowSource::DecryptedPlaceholder | RowSource::Pkcs12Revealed(_) => unreachable!(),
+            RowSource::Pkcs12Revealed(idx) => {
+                let Some(region) =
+                    self.pkcs12.as_mut().and_then(|p| p.regions.get_mut(idx))
+                else {
+                    return;
+                };
+                &mut region.roots
+            }
+            RowSource::DecryptedPlaceholder => unreachable!(),
         };
         let sibling_count = if parent.is_empty() {
             roots.len()
@@ -2191,12 +2234,13 @@ impl App {
             self.status = "decrypt the content before editing it".to_string();
             return;
         }
-        if matches!(row.source, RowSource::Pkcs12Revealed(_)) {
-            self.status = "decrypted PKCS#12 content is read-only".to_string();
+        if self.reject_uneditable_reveal() {
             return;
         }
-        if row.source == RowSource::Decrypted && row.path.len() == 1 {
-            self.status = "the decrypted PKCS#8 root cannot be deleted".to_string();
+        if matches!(row.source, RowSource::Decrypted | RowSource::Pkcs12Revealed(_))
+            && row.path.len() == 1
+        {
+            self.status = "the decrypted root cannot be deleted".to_string();
             return;
         }
         if !self.delete_confirm {
@@ -2216,7 +2260,15 @@ impl App {
                 let Some(decrypted) = self.decrypted.as_mut() else { return };
                 &mut decrypted.roots
             }
-            RowSource::DecryptedPlaceholder | RowSource::Pkcs12Revealed(_) => unreachable!(),
+            RowSource::Pkcs12Revealed(idx) => {
+                let Some(region) =
+                    self.pkcs12.as_mut().and_then(|p| p.regions.get_mut(idx))
+                else {
+                    return;
+                };
+                &mut region.roots
+            }
+            RowSource::DecryptedPlaceholder => unreachable!(),
         };
         if parent.is_empty() {
             roots.remove(last);
@@ -2326,7 +2378,15 @@ impl App {
                 let Some(decrypted) = self.decrypted.as_mut() else { return };
                 &mut decrypted.roots
             }
-            RowSource::DecryptedPlaceholder | RowSource::Pkcs12Revealed(_) => return,
+            RowSource::Pkcs12Revealed(idx) => {
+                let Some(region) =
+                    self.pkcs12.as_mut().and_then(|p| p.regions.get_mut(idx))
+                else {
+                    return;
+                };
+                &mut region.roots
+            }
+            RowSource::DecryptedPlaceholder => return,
         };
         if parent.is_empty() {
             roots.insert(index, node);
@@ -2361,11 +2421,20 @@ impl App {
             .get(self.selected)
             .map(|r| (r.source, r.path.clone()));
 
-        if selection.as_ref().map(|(source, _)| *source) == Some(RowSource::Decrypted) {
-            if let Err(e) = self.encrypt_decrypted_tree() {
-                self.status = format!("could not update encrypted content: {}", e);
-                return;
+        match selection.as_ref().map(|(source, _)| *source) {
+            Some(RowSource::Decrypted) => {
+                if let Err(e) = self.encrypt_decrypted_tree() {
+                    self.status = format!("could not update encrypted content: {}", e);
+                    return;
+                }
             }
+            Some(RowSource::Pkcs12Revealed(idx)) => {
+                if let Err(e) = self.encrypt_pkcs12_region(idx) {
+                    self.status = format!("could not update encrypted content: {}", e);
+                    return;
+                }
+            }
+            _ => {}
         }
 
         let data = ber::encode_forest(&self.roots);
@@ -2427,6 +2496,50 @@ impl App {
 
         if let Some(ref mut decrypted) = self.decrypted {
             decrypted.plaintext = plaintext;
+        }
+        Ok(())
+    }
+
+    /// Serialize an edited PKCS#12 region, re-encrypt it with the retained
+    /// password and a fresh IV, replace the outer ciphertext and IV, and
+    /// recompute the container's `MacData` digest over the updated
+    /// `AuthenticatedSafe` so the file stays cryptographically consistent.
+    fn encrypt_pkcs12_region(&mut self, idx: usize) -> Result<(), String> {
+        let (password, plaintext) = {
+            let reveal = self.pkcs12.as_ref().ok_or("decryption is not available")?;
+            let region = reveal.regions.get(idx).ok_or("decrypted region is missing")?;
+            (reveal.password.clone(), ber::encode_forest(&region.roots))
+        };
+        let p12 = pkcs12::parse(&self.roots)?
+            .ok_or("document is no longer a PKCS#12 container")?;
+        if let pkcs12::Mac::Unsupported(reason) = &p12.mac {
+            return Err(reason.clone());
+        }
+        let region = p12.regions.get(idx).ok_or("encrypted region is missing")?;
+        let (ciphertext, iv) = region.encrypt(&password, &plaintext)?;
+
+        let cipher_node = node_at_mut(&mut self.roots, &region.cipher_path)
+            .ok_or("ciphertext node is missing")?;
+        cipher_node.value = ciphertext;
+        cipher_node.children.clear();
+        cipher_node.encapsulates = false;
+
+        let iv_node =
+            node_at_mut(&mut self.roots, &region.iv_path).ok_or("cipher IV node is missing")?;
+        iv_node.value = iv;
+        iv_node.children.clear();
+        iv_node.encapsulates = false;
+
+        if let pkcs12::Mac::Supported(mac) = &p12.mac {
+            let auth_safe = node_at(&self.roots, &p12.auth_safe_content_path)
+                .ok_or("AuthenticatedSafe node is missing")?
+                .content_octets();
+            let digest = mac.compute(&password, &auth_safe)?;
+            let digest_node = node_at_mut(&mut self.roots, &mac.digest_path)
+                .ok_or("MAC digest node is missing")?;
+            digest_node.value = digest;
+            digest_node.children.clear();
+            digest_node.encapsulates = false;
         }
         Ok(())
     }
@@ -2499,7 +2612,11 @@ impl App {
             if regions.is_empty() {
                 return Err("PKCS#12 no longer has decryptable content".to_string());
             }
-            Ok::<Pkcs12Reveal, String>(Pkcs12Reveal { password, regions })
+            Ok::<Pkcs12Reveal, String>(Pkcs12Reveal {
+                password,
+                regions,
+                editable: mac_editable(&p12.mac),
+            })
         })();
         match refreshed {
             Ok(reveal) => self.pkcs12 = Some(reveal),
@@ -3188,7 +3305,7 @@ mod tests {
     }
 
     #[test]
-    fn pkcs12_reveal_shows_decrypted_regions_read_only() {
+    fn pkcs12_reveal_shows_decrypted_regions() {
         let mut app = open_real_file(std::path::Path::new("testdata/pkcs12.der"));
         // Before decryption, each encrypted region shows the same closed-lock
         // placeholder as a locked PKCS#8 key, one level below its ciphertext.
@@ -3228,8 +3345,23 @@ mod tests {
             assert_eq!(app.rows[root_row].depth, app.rows[cipher_row].depth + 1);
         }
 
-        // The reveal is read-only: editing actions on a revealed row are
-        // refused and leave the document unchanged.
+        // The MAC of the test container is recomputable, so the reveal is
+        // editable; the decryption itself modifies nothing.
+        assert!(app.pkcs12.as_ref().unwrap().editable.is_ok());
+        assert!(!app.dirty, "decryption never modifies the outer document");
+    }
+
+    #[test]
+    fn editing_a_pkcs12_region_reencrypts_and_recomputes_the_mac() {
+        let mut app = open_real_file(std::path::Path::new("testdata/pkcs12.der"));
+        app.start_decrypt();
+        if let Mode::Password(ref mut p) = app.mode {
+            for c in "asn1editor".chars() {
+                p.insert_char(c);
+            }
+        }
+        app.submit_password();
+
         let key_idx = app
             .pkcs12
             .as_ref()
@@ -3238,14 +3370,75 @@ mod tests {
             .iter()
             .position(|r| r.kind == pkcs12::RegionKind::ShroudedKey)
             .expect("a shrouded key region");
-        app.select(row_of_source(&app, RowSource::Pkcs12Revealed(key_idx), &[0]));
+        let p12 = pkcs12::parse(&app.roots).unwrap().unwrap();
+        let region = &p12.regions[key_idx];
+        let old_ciphertext = app.node_at(&region.cipher_path).unwrap().value.clone();
+        let old_iv = app.node_at(&region.iv_path).unwrap().value.clone();
+        let pkcs12::Mac::Supported(mac) = &p12.mac else { panic!("supported MacData") };
+        let old_digest = app.node_at(&mac.digest_path).unwrap().value.clone();
+
+        // Edit the shrouded key's PrivateKeyInfo version INTEGER (child 0).
+        app.select(row_of_source(&app, RowSource::Pkcs12Revealed(key_idx), &[0, 0]));
+        app.mode = Mode::Edit(EditState::hex(EditKind::Content, &[1]));
+        app.commit_edit();
+
+        assert!(app.dirty);
+        let reveal = app.pkcs12.as_ref().expect("reveal survives the edit");
+        assert_eq!(node_at(&reveal.regions[key_idx].roots, &[0, 0]).unwrap().value, [1]);
+        // Ciphertext, IV and MAC digest were all replaced in the outer tree.
+        assert_ne!(app.node_at(&region.cipher_path).unwrap().value, old_ciphertext);
+        assert_ne!(app.node_at(&region.iv_path).unwrap().value, old_iv);
+        assert_ne!(app.node_at(&mac.digest_path).unwrap().value, old_digest);
+
+        // Decrypting the updated container reproduces the edited plaintext.
+        let reparsed = pkcs12::parse(&app.roots).unwrap().unwrap();
+        let plain = reparsed.regions[key_idx].decrypt(b"asn1editor").unwrap();
+        let roots = ber::parse_forest(&plain, 0).unwrap();
+        assert_eq!(roots[0].children[0].value, [1]);
+
+        // OpenSSL itself accepts the re-encrypted, re-MAC'd container — the
+        // strongest consistency check (parse verifies the MAC).
+        let der = ber::encode_forest(&app.roots);
+        let pfx = openssl::pkcs12::Pkcs12::from_der(&der).unwrap();
+        pfx.parse2("asn1editor").expect("OpenSSL verifies the MAC and decrypts");
+
+        // A wrong password must still fail the OpenSSL MAC check.
+        let pfx = openssl::pkcs12::Pkcs12::from_der(&der).unwrap();
+        assert!(pfx.parse2("wrong").is_err());
+    }
+
+    #[test]
+    fn a_pkcs12_with_an_unsupported_mac_stays_read_only() {
+        // Rewrite the MacData digest algorithm to MD5, which cannot be
+        // recomputed; the reveal must then refuse edits.
+        let raw = std::fs::read("testdata/pkcs12.der").unwrap();
+        let mut roots = ber::parse_forest(&raw, 0).unwrap();
+        let oid = node_at_mut(&mut roots, &[0, 2, 0, 0, 0]).unwrap();
+        oid.value = ber::encode_oid("1.2.840.113549.2.5").unwrap();
+        let dir = tmp_dir("p12mac");
+        let path = dir.join("md5mac.der");
+        std::fs::write(&path, ber::encode_forest(&roots)).unwrap();
+
+        let mut app = open_real_file(&path);
+        app.start_decrypt();
+        if let Mode::Password(ref mut p) = app.mode {
+            for c in "asn1editor".chars() {
+                p.insert_char(c);
+            }
+        }
+        app.submit_password();
+
+        let reveal = app.pkcs12.as_ref().expect("regions still decrypt");
+        assert!(reveal.editable.is_err());
+        app.select(row_of_source(&app, RowSource::Pkcs12Revealed(0), &[0]));
         app.start_edit();
-        assert!(matches!(app.mode, Mode::Browse), "no edit mode for a read-only row");
+        assert!(matches!(app.mode, Mode::Browse), "no edit mode for a read-only reveal");
         assert!(app.status.contains("read-only"));
         app.delete_confirm = true;
         app.delete_selected();
         assert!(app.status.contains("read-only"));
-        assert!(!app.dirty, "decryption never modifies the outer document");
+        assert!(!app.dirty);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

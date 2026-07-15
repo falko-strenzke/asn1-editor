@@ -38,8 +38,9 @@ Goals:
   virtual tree and keep the plaintext and ciphertext representations
   synchronized in both directions (§9a).
 * Decrypt the encrypted regions of a supported PKCS#12 (`PFX`) container
-  into read-only virtual subtrees, revealing the certificates and private
-  keys inside (§9b).
+  into editable virtual subtrees, revealing the certificates and private
+  keys inside; an edit re-encrypts the region and recomputes the
+  container's integrity `MacData` so the saved file stays consistent (§9b).
 * Show, in the file browser, an undirected connection between a private-key
   file and the certificate carrying its public key — including keys that
   become known only after a password is entered (§9 → Key ↔ certificate
@@ -98,12 +99,13 @@ src/
   verify.rs  signature verification and generation (uses aws-lc-rs) + the
              pure key↔cert link matcher + the claimed-issuer lookup
   pathval.rs certification-path validation against user-chosen trust anchors
-             (uses the openssl crate — the one place OpenSSL is used)
+             (uses the openssl crate)
   pkcs8.rs   structural decoding + password decryption/re-encryption of
              EncryptedPrivateKeyInfo (PBES2; uses aws-lc-rs). Exposes a
              reusable Pbes2 (PBKDF2 + AES-CBC) decryptor shared with pkcs12.rs
-  pkcs12.rs  structural decoding + read-only password decryption of PKCS#12
-             (PFX) containers; reuses pkcs8::Pbes2
+  pkcs12.rs  structural decoding + password decryption/re-encryption of
+             PKCS#12 (PFX) containers; reuses pkcs8::Pbes2 for the regions
+             and the openssl crate for the MacData HMAC (RFC 7292 App. B KDF)
   app.rs     application state: tree, flattened rows, selection, edit logic
   tui.rs     ratatui event loop and rendering (no business logic)
 tests/
@@ -134,8 +136,9 @@ shared OID repository; `browser.rs` depends only on the standard library
 (it knows nothing about ASN.1); `x509.rs` depends on `ber.rs` + `input.rs`
 (structural decoding only, no crypto); `verify.rs` depends on `x509.rs` +
 `aws-lc-rs`; `pkcs8.rs` depends on `ber.rs` + `aws-lc-rs` and `pkcs12.rs`
-depends on `ber.rs` + `pkcs8.rs` (the two crypto-using decoders; `pkcs12.rs`
-does no crypto of its own — it reuses `pkcs8::Pbes2`); `pathval.rs` depends
+depends on `ber.rs` + `pkcs8.rs` + the `openssl` crate (region encryption
+reuses `pkcs8::Pbes2`; only the `MacData` KDF/HMAC uses OpenSSL's digest
+primitives); `pathval.rs` depends
 on the `openssl` crate + `ber.rs` (it takes raw DER, not the `Node` tree);
 `app.rs` depends on all of the above; `tui.rs` renders `app.rs` and resolves
 OID display names through `oid.rs`. External dependencies: `ratatui`,
@@ -851,7 +854,7 @@ Thus the two views remain synchronized while the password is available,
 but only the standards-compliant encrypted representation is part of the
 saved document.
 
-## 9b. PKCS#12 read-only decryption (`src/pkcs12.rs`)
+## 9b. PKCS#12 decryption and editing (`src/pkcs12.rs`)
 
 A PKCS#12 (`PFX`, RFC 7292) container nests its content in a
 `ContentInfo`-wrapped `AuthenticatedSafe`, and can hold **several**
@@ -865,24 +868,34 @@ open document matches (the two are structurally disjoint, so
 `start_decrypt`/`submit_password` simply try `pkcs8::parse` then
 `pkcs12::parse`).
 
-The reveal is **read-only**, for a concrete reason: the container's
-integrity `MacData` is keyed with the RFC 7292 Appendix B key-derivation,
-which `aws-lc-rs` does not expose, so an edited PKCS#12 could not be
-re-MAC'd into a file other tools would accept. Rather than offer editing
-that cannot be saved correctly, the decrypted subtrees are shown for
-inspection only; the outer document is never modified by decryption.
+The reveal is **editable**, like the PKCS#8 reveal of §9a, with one extra
+obligation: a PKCS#12 carries an integrity `MacData` — an HMAC over the
+encoded `AuthenticatedSafe` whose key comes from the RFC 7292 Appendix B
+key-derivation (ID 3), a construction distinct from PBES2/PBKDF2. That KDF
+(iterated hashing over the `ID‖salt‖password` blocks, password as a
+UTF-16BE `BMPString`) and the HMAC are computed with the `openssl` crate's
+digest primitives (`MacData::compute`; SHA-1/256/384/512 digests). The
+correctness of the implementation is pinned by a unit test that recomputes
+the MAC of the unmodified test container and compares it byte-for-byte
+with the digest OpenSSL originally wrote. A container whose `MacData` uses
+an unsupported digest (or none of the regions' schemes are editable)
+degrades gracefully: the reveal is shown but mutating actions are refused
+with the reason (`Pkcs12Reveal::editable`); a container without `MacData`
+is simply edited without one. Decryption by itself never modifies the
+outer document.
 
 `pkcs12::parse` walks the `PFX` positionally (`PFX → ContentInfo →
 AuthenticatedSafe → ContentInfo* / SafeBag*`, descending through the
 encapsulated OCTET STRINGs the BER parser already exposes as children) and
-records every decryptable region: its ciphertext-node path in the outer
-forest, its kind, and the PBES2 scheme decoded from the region's
-`AlgorithmIdentifier`. The password-based encryption must be **PBES2**
-(PBKDF2 + AES-128/256-CBC) — the scheme current tools emit by default and
-the one already implemented for §9a; `pkcs12.rs` reuses `pkcs8::Pbes2`
-(the shared PBKDF2/AES-CBC core) verbatim and adds no crypto of its own.
-Legacy `pbeWithSHAAnd*` schemes (RFC 7292 Appendix B KDF) are reported as
-unsupported. `parse`'s three-way return mirrors `pkcs8::parse`: `Ok(None)`
+records every decryptable region: its ciphertext-node path and cipher-IV
+path in the outer forest, its kind, and the PBES2 scheme decoded from the
+region's `AlgorithmIdentifier` — plus the container's `MacData` state
+(absent / supported / unsupported-with-reason). The password-based
+encryption must be **PBES2** (PBKDF2 + AES-128/256-CBC) — the scheme
+current tools emit by default and the one already implemented for §9a;
+`pkcs12.rs` reuses `pkcs8::Pbes2` (the shared PBKDF2/AES-CBC core)
+verbatim for the regions. Legacy `pbeWithSHAAnd*` *encryption* schemes
+(RFC 7292 Appendix B KDF for the cipher key) are reported as unsupported. `parse`'s three-way return mirrors `pkcs8::parse`: `Ok(None)`
 (not a PKCS#12), `Err(msg)` (a PKCS#12 with nothing decryptable — no
 encrypted content, or an unsupported scheme), `Ok(Some)` (at least one
 supported region). `Region::decrypt` decrypts and confirms the plaintext
@@ -899,12 +912,24 @@ same closed-lock **`🔒 decrypted content not available`** placeholder below
 reusing the shared `RowSource::DecryptedPlaceholder`. After decryption it
 splices each region's rows (source `RowSource::Pkcs12Revealed(index)`) below
 its ciphertext node, and the tree labels each region root with a green
-**`🔓 <kind>: `** prefix. These rows
-navigate and fold like any other, but every mutating action refuses the
-source with a "read-only" status (mutable node access is granted only so
-fold state can be toggled). An edit to the *outer* document re-derives the
-reveal with the retained password (`refresh_pkcs12_reveal`, carrying over
-fold state), or discards it if the document no longer decrypts.
+**`🔓 <kind>: `** prefix. These rows navigate, fold and **edit** like any
+other (each region root, like the PKCS#8 one, must remain a single
+SEQUENCE and cannot be deleted). An edit inside a region follows the §9a
+synchronization pattern, extended by the MAC: `rebuild()` routes a
+`Pkcs12Revealed` selection through `encrypt_pkcs12_region`, which
+serializes the region's virtual forest, re-encrypts it with the retained
+password and a **fresh IV** (both spliced into the outer tree at the
+region's recorded paths), and then recomputes the `MacData` digest over
+the updated `AuthenticatedSafe` content octets, overwriting the digest
+node. The result is a container OpenSSL itself accepts — the app-level
+test round-trips an edit through `openssl::pkcs12::Pkcs12::parse2`, which
+verifies the MAC. When the MAC is unsupported, every mutating action
+refuses the row with a "read-only" status instead. An edit to the *outer*
+document re-derives the reveal with the retained password
+(`refresh_pkcs12_reveal`, carrying over fold state), or discards it if the
+document no longer decrypts; an outer edit does *not* auto-update the MAC,
+since direct byte-level edits (including to `MacData` itself) are the
+user's to control in a raw ASN.1 editor.
 
 ## 9c. Re-signing a modified object (`src/verify.rs`, `src/app.rs`)
 
@@ -1069,7 +1094,7 @@ Built with ratatui 0.29 (bundled crossterm backend, `ratatui::init()` /
   closed-lock placeholder or open-lock virtual plaintext subtree described
   in §9a, at the same position and with normal folding/navigation behavior;
   a PKCS#12 container's ciphertext rows likewise own the closed-lock
-  placeholder (before decryption) or the open-lock, read-only reveal
+  placeholder (before decryption) or the open-lock, editable reveal
   subtrees of §9b (green `🔓 <kind>: ` region roots).
 * **Right pane — content.** At the top, the build-up of the tag and the
   length octets is shown graphically: bit-field diagrams with the bit
@@ -1179,9 +1204,13 @@ consistency, and the closed/open lock labels. PKCS#8 tests cover initial
 decryption, wrong passwords, plaintext edits updating ciphertext, and
 ciphertext edits refreshing or invalidating the virtual tree. PKCS#12 tests
 cover locating both encrypted regions of a real container, decrypting them,
-rejecting a wrong password, not misfiring on non-PKCS#12 files, and — at the
-app level — that the reveal appears below each ciphertext node and is
-read-only. Key↔certificate-link tests cover public-key extraction from EC
+rejecting a wrong password, not misfiring on non-PKCS#12 files, recomputing
+the `MacData` digest byte-for-byte against the one OpenSSL wrote,
+re-encrypting a region through its recorded paths, and — at the app level —
+that the reveal appears below each ciphertext node, that editing a revealed
+value re-encrypts the region and re-MACs the container into a file
+`openssl::pkcs12::Pkcs12::parse2` verifies, and that a container with an
+unsupported MAC digest stays read-only. Key↔certificate-link tests cover public-key extraction from EC
 (PKCS#8 and SEC1) and RSA keys and the equal/unequal comparison with a
 certificate, the pure `key_links_for` matcher (both directions, dedup, no
 self-links), the headless gutter routing, and — at the app level — that a
