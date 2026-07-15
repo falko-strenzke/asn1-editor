@@ -31,7 +31,7 @@ use ratatui::{DefaultTerminal, Frame};
 use crate::app::{
     App, DateTimeEditor, EditKind, EditState, Editor, Focus, HexEditor, Mode, PickerTarget,
     RowSource, TextEditor, TextFormat, DATE_FIELDS, EDIT_BYTES_PER_LINE, EDIT_DIGITS_PER_LINE,
-    EDIT_MENU, PICKER_CLASSES, PICKER_UNIVERSAL,
+    PICKER_CLASSES, PICKER_UNIVERSAL,
 };
 use crate::ber::{
     self, Class, Node, TAG_BIT_STRING, TAG_BOOLEAN, TAG_GENERALIZED_TIME, TAG_INTEGER, TAG_NULL,
@@ -233,9 +233,14 @@ fn handle_menu_key(app: &mut App, key: KeyEvent) {
         KeyCode::Enter => app.menu_confirm(),
         KeyCode::Up | KeyCode::Char('k') => app.menu_move(-1),
         KeyCode::Down | KeyCode::Char('j') => app.menu_move(1),
-        KeyCode::Char(c @ '1'..='5') => {
+        KeyCode::Char(c @ '1'..='9') => {
+            let idx = (c as usize) - ('1' as usize);
+            let in_range = matches!(app.mode, Mode::EditMenu(ref m) if idx < m.items.len());
+            if !in_range {
+                return;
+            }
             if let Mode::EditMenu(ref mut m) = app.mode {
-                m.selected = (c as usize) - ('1' as usize);
+                m.selected = idx;
             }
             app.menu_confirm();
         }
@@ -369,7 +374,7 @@ fn draw_edit_pubkey(frame: &mut Frame, app: &App, area: Rect) {
     ];
     frame.render_widget(Paragraph::new(opt_lines), opt_col);
 
-    // Column 2: issued certificates with resign checkboxes.
+    // Column 2: issued certificates and CRLs with resign checkboxes.
     let mut issued_lines = vec![header("Resign issued certs", s.column == 2)];
     if s.issued.is_empty() {
         issued_lines.push(Line::from(Span::styled(" (none found)", Style::new().dim())));
@@ -378,7 +383,7 @@ fn draw_edit_pubkey(frame: &mut Frame, app: &App, area: Rect) {
         let start = s.issued_idx.saturating_sub(visible.saturating_sub(1));
         for (i, cert) in s.issued.iter().enumerate().skip(start).take(visible) {
             let box_ = if cert.selected { "[x]" } else { "[ ]" };
-            let label = format!("{} {}  #{}", box_, cert.name, cert.serial);
+            let label = format!("{} {}  {}", box_, cert.name, cert.detail);
             issued_lines.push(row(label, i == s.issued_idx, s.column == 2));
         }
     }
@@ -1685,11 +1690,12 @@ fn draw_content_edit(frame: &mut Frame, app: &mut App, area: Rect) {
     frame.render_widget(para, area);
 }
 
-/// Centered popup listing the edit modes ('E').
+/// Centered popup listing a menu's entries ('E' edit menu, 'z' cryptographic
+/// adjustment menu).
 fn draw_edit_menu(frame: &mut Frame, app: &App, area: Rect) {
     let Mode::EditMenu(ref m) = app.mode else { return };
-    let width = 66.min(area.width);
-    let height = (EDIT_MENU.len() as u16 + 3).min(area.height);
+    let width = 78.min(area.width);
+    let height = (m.items.len() as u16 + 3).min(area.height);
     let popup = Rect {
         x: area.x + (area.width.saturating_sub(width)) / 2,
         y: area.y + (area.height.saturating_sub(height)) / 2,
@@ -1700,23 +1706,23 @@ fn draw_edit_menu(frame: &mut Frame, app: &App, area: Rect) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::new().fg(Color::Yellow))
-        .title(" EDIT — choose editing mode ");
+        .title(m.title);
     let inner = block.inner(popup);
     frame.render_widget(block, popup);
     let mut lines: Vec<Line> = Vec::new();
-    for (i, (name, desc)) in EDIT_MENU.iter().enumerate() {
+    for (i, item) in m.items.iter().enumerate() {
         let style = if i == m.selected {
             Style::new().add_modifier(Modifier::REVERSED).bold()
         } else {
             Style::new().bold()
         };
         lines.push(Line::from(vec![
-            Span::styled(format!(" {} {:<14}", i + 1, name), style),
-            Span::styled(format!(" {}", desc), Style::new().dim()),
+            Span::styled(format!(" {} {:<16}", i + 1, item.label), style),
+            Span::styled(format!(" {}", item.desc), Style::new().dim()),
         ]));
     }
     lines.push(Line::from(Span::styled(
-        " ↑↓/1-5 select   ⏎ choose   Esc cancel",
+        " ↑↓/1-9 select   ⏎ choose   Esc cancel",
         Style::new().dim(),
     )));
     frame.render_widget(Paragraph::new(lines), inner);

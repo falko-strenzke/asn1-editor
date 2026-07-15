@@ -1035,12 +1035,16 @@ this targets.
 
 ## 9e. Modifying a certificate's public key (`src/keygen.rs`, `src/app.rs`)
 
-Pressing **`e`** on the `subjectPublicKeyInfo` element of an open certificate
-(recognized by `App::open_public_key_editor`, which compares the selection to
-the structurally computed SPKI path — `[0, 0, v+5]`, where `v` accounts for
-the optional `[0] version`) opens the public-key modification dialog instead
-of the ordinary value editor; `e` anywhere else, or on a CRL, keeps its old
-behavior. The dialog (`Mode::EditPubKey`) has three columns:
+The public-key modification dialog is reachable three ways: pressing **`e`**
+on the `subjectPublicKeyInfo` element of an open certificate (recognized by
+`App::selection_is_cert_spki`, which compares the selection to the
+structurally computed SPKI path — `[0, 0, v+5]`, where `v` accounts for the
+optional `[0] version`; `e` elsewhere or on a CRL keeps the ordinary value
+editor), the **Re-key this cert** entry appended to the `E` edit menu when the
+selection is that SPKI, and the **Re-key** entry of the `z`
+cryptographic-adjustment menu (below). All three call `App::start_rekey`,
+which builds the dialog from the open certificate regardless of the current
+selection. The dialog (`Mode::EditPubKey`) has three columns:
 
 1. **Algorithm** — the signature algorithms `keygen`/`verify` support: ECDSA
    P-256 (SHA-256), ECDSA P-384 (SHA-384), Ed25519, RSA-2048 and RSA-4096
@@ -1050,10 +1054,10 @@ behavior. The dialog (`Mode::EditPubKey`) has three columns:
    tracking the algorithm until the user edits it), and an optional password
    (blank ⇒ an unencrypted PKCS#8 key; non-blank ⇒ PBES2/AES-256-CBC, the
    form §9a can later decrypt).
-3. **Resign issued certs** — every certificate the open one issued (resolved
-   with the same `verify::relations_for` used for the browser arrows, keeping
-   only certificate files, each shown with its serial number), each with a
-   default-on checkbox.
+3. **Resign issued certs** — every signed object the open certificate issued
+   (resolved with the same `verify::relations_for` used for the browser
+   arrows): certificates first, each shown with its serial number, then the
+   issued CRLs (`CRL` suffix), each with a default-on checkbox.
 
 Key generation lives in `keygen.rs` and uses the `openssl` crate: OpenSSL
 produces the key pair and encodes its plaintext PKCS#8 (the signing input for
@@ -1073,11 +1077,13 @@ is replaced in the tree (`install_new_public_key`); and — when the certificate
 is **self-signed** under its current key (`sig_status` reports
 `Verified { self_signed: true }`) — both of its `signatureAlgorithm`
 identifiers are switched to the new algorithm and its own signature is
-regenerated with the new key, so it stays valid. Each selected issued
-certificate is then resigned *on disk* (`resign_issued_cert_file`): its two
-`signatureAlgorithm` identifiers are rewritten, its re-encoded
-`tbsCertificate` is signed with the new key, the new signature is installed,
-and the file is written back in its original container. The generated key is
+regenerated with the new key, so it stays valid. Each selected issued object
+— certificate or CRL — is then resigned *on disk* (`resign_issued_file`, whose
+`resignable_paths` locates the inner `signature` AlgorithmIdentifier at its
+kind-dependent position): its two `signatureAlgorithm` identifiers are
+rewritten, its re-encoded `tbsCertificate`/`tbsCertList` is signed with the new
+key, the new signature is installed, and the file is written back in its
+original container. The generated key is
 registered for the session (plaintext keys join `key_files`, an encrypted key
 joins `unlocked_keys` with its password retained), so its key↔certificate link
 shows and a later re-sign can reuse it; its identity is read from the SPKI, not
@@ -1087,7 +1093,21 @@ the editor's model — while the sibling key and issued-cert files, which are
 not the open document, are written immediately. This whole flow is verified
 end to end against the OpenSSL CLI: after rekeying a self-signed root, `openssl
 verify` accepts the root's new self-signature, the resigned intermediate under
-the new root, and the full leaf→intermediate→root chain.
+the new root, the full leaf→intermediate→root chain, and (`openssl crl
+-verify`) the resigned CRL under the new root key.
+
+### The `z` cryptographic-adjustment menu
+
+Pressing **`z`** on a signed object no longer opens the re-sign dialog
+directly. After `start_decrypt` rules out the encrypted-container cases
+(§9a/§9b), it calls `start_crypto_menu`, which opens a small titled menu
+(**Cryptographic adjustment**, reusing the generic `Mode::EditMenu`): a
+**Re-sign** entry (→ §9c) for any certificate or CRL, plus a **Re-key** entry
+(→ this section) for a certificate. Both the `E` edit menu and this menu are
+now data-driven: `MenuState` carries a title and a `Vec<MenuItem>`, and each
+`MenuItem` names a `MenuAction` that `menu_confirm` dispatches — so the same
+menu machinery renders the five base edit modes, the optional trailing
+**Re-key this cert**, and the two cryptographic adjustments.
 
 ## 10. Input containers
 
@@ -1208,7 +1228,8 @@ Built with ratatui 0.29 (bundled crossterm backend, `ratatui::init()` /
   count, or the validation error in red). `Enter` applies (§7), `Esc`
   cancels. The pane border turns yellow as a mode cue.
 * **Dialog popups**: several actions open a centered popup over the panes —
-  the type picker (`Mode::TypePicker`), the edit menu (`Mode::EditMenu`), the
+  the type picker (`Mode::TypePicker`), the edit / cryptographic-adjustment
+  menus (`Mode::EditMenu`, a generic titled list), the
   decrypt password prompt (`Mode::Password`), the re-sign dialog
   (`Mode::Resign`, §9c), and the public-key modification dialog
   (`Mode::EditPubKey`, §9e — a three-column form: algorithm list, key-generation
@@ -1239,7 +1260,7 @@ document pane.
 | `→`/`l` | expand node/directory, or enter first child (browser: also live-previews) |
 | `Enter`/`Space` | toggle fold (tree); switch to the previewed file / toggle fold (browser) |
 | `e` | edit selected element's value (type-specific editor); on a certificate's `subjectPublicKeyInfo`, open the public-key modification dialog (§9e) |
-| `E` | edit menu: tag type / hex / base64 / raw binary / type specific |
+| `E` | edit menu: tag type / hex / base64 / raw binary / type specific; on a certificate's `subjectPublicKeyInfo`, also *Re-key this cert* (§9e) |
 | `i` | insert new element after the selection (type-picker dialog, then value) |
 | `I` | insert new element as first child of a constructed element |
 | `←→`/`Tab`, `↑↓`, `0-9`, `Enter`, `Esc` | (type picker) column / selection / tag number / confirm / cancel |
@@ -1247,7 +1268,7 @@ document pane.
 | `J` / `K` | move selected element down / up among its siblings |
 | `Enter` / `Esc` | (edit mode) apply / cancel |
 | `s` | save (re-encode + re-wrap container) |
-| `z` | context action: decrypt an `EncryptedPrivateKeyInfo` (§9a) or PKCS#12 (§9b, prompts for a password), or re-sign a modified certificate/CRL (§9c) |
+| `z` | context action: decrypt an `EncryptedPrivateKeyInfo` (§9a) or PKCS#12 (§9b, prompts for a password), or — on a certificate/CRL — open the *Cryptographic adjustment* menu (re-sign §9c / re-key §9e) |
 | `t` | (browser) mark/unmark the selected certificate as a path-validation trust anchor (§9d) |
 | `[` / `]` | scroll content pane |
 | `q` | quit (`q q` to discard unsaved changes) |
@@ -1308,11 +1329,15 @@ Public-key-modification tests cover `keygen` (each algorithm generates a key
 that signs and verifies under its own SPKI; a password yields an encrypted
 PKCS#8 our `pkcs8` module decrypts; the signature-algorithm identifier shapes)
 and, at the app level over `testdata/chain`, that `e` opens the dialog only on
-the SPKI (with the issued-cert list populated), that rekeying a self-signed CA
-resigns it and its issued certificate under the new key, that a password writes
-an encrypted key that still signs, that an existing key file is never
-overwritten, and that turning off "generate" still rekeys without writing a
-file.
+the SPKI (with the issued list showing the certificate first and the CRL last),
+that rekeying a self-signed CA resigns it and its issued certificate under the
+new key, that a selected issued *CRL* is likewise resigned and verifies under
+the new key, that a password writes an encrypted key that still signs, that an
+existing key file is never overwritten, and that turning off "generate" still
+rekeys without writing a file. Menu-routing tests check that `z` on a
+certificate opens the cryptographic-adjustment menu (re-sign + re-key) and on a
+CRL offers only re-sign, and that the `E` menu gains a trailing *Re-key this
+cert* entry on the SPKI that opens the dialog.
 
 Beyond the automated triples check, the `--dump` output format itself
 (column widths derived from file size, `offset length:` prefix,

@@ -591,16 +591,41 @@ fn decode_utf32be(v: &[u8]) -> String {
         .collect()
 }
 
-/// Entries of the edit-mode menu opened with 'E'.
-pub const EDIT_MENU: [(&str, &str); 5] = [
-    ("Tag type", "change class / form / tag number of the element"),
-    ("Hex", "edit the content octets as hex digits"),
-    ("Base64", "edit the content octets as base64 text"),
-    ("Raw binary", "characters become bytes verbatim (paste-friendly)"),
-    ("Type specific", "number, OID, text, TRUE/FALSE, date/time fields …"),
+/// What confirming a popup-menu entry does. Shared by the 'E' edit menu and
+/// the 'z' cryptographic-adjustment menu.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum MenuAction {
+    Retag,
+    EditHex,
+    EditBase64,
+    EditRaw,
+    EditTypeSpecific,
+    /// Open the public-key modification dialog (§9e).
+    Rekey,
+    /// Open the re-sign dialog (§9c).
+    Resign,
+}
+
+/// One entry of a popup menu.
+pub struct MenuItem {
+    pub action: MenuAction,
+    pub label: &'static str,
+    pub desc: &'static str,
+}
+
+/// The five base editing modes offered by the 'E' menu, in order.
+const EDIT_MENU: [(MenuAction, &str, &str); 5] = [
+    (MenuAction::Retag, "Tag type", "change class / form / tag number of the element"),
+    (MenuAction::EditHex, "Hex", "edit the content octets as hex digits"),
+    (MenuAction::EditBase64, "Base64", "edit the content octets as base64 text"),
+    (MenuAction::EditRaw, "Raw binary", "characters become bytes verbatim (paste-friendly)"),
+    (MenuAction::EditTypeSpecific, "Type specific", "number, OID, text, TRUE/FALSE, date/time fields …"),
 ];
 
+/// A generic popup menu: a title and a list of actionable entries.
 pub struct MenuState {
+    pub title: &'static str,
+    pub items: Vec<MenuItem>,
     pub selected: usize,
 }
 
@@ -621,14 +646,15 @@ pub enum Mode {
     EditPubKey(PubKeyState),
 }
 
-/// One certificate issued by the certificate being rekeyed, offered in the
-/// dialog's third column for re-signing with the new key.
-pub struct IssuedCert {
+/// One signed object (certificate or CRL) issued by the certificate being
+/// rekeyed, offered in the dialog's third column for re-signing with the new
+/// key. Certificates are listed first, then CRLs.
+pub struct IssuedObject {
     pub path: PathBuf,
     pub name: String,
-    /// Serial number as a hex string, for display.
-    pub serial: String,
-    /// Whether this certificate will be resigned (checkbox; default true).
+    /// Short display suffix: `#<serial>` for a certificate, `CRL` for a CRL.
+    pub detail: String,
+    /// Whether this object will be resigned (checkbox; default true).
     pub selected: bool,
 }
 
@@ -648,8 +674,9 @@ pub struct PubKeyState {
     pub filename_auto: bool,
     /// Optional password; empty means an unencrypted PKCS#8 key.
     pub password: String,
-    /// Certificates issued by this one, each with a re-sign checkbox.
-    pub issued: Vec<IssuedCert>,
+    /// Signed objects issued by this certificate (certs then CRLs), each with
+    /// a re-sign checkbox.
+    pub issued: Vec<IssuedObject>,
     /// Active column: 0 = algorithm, 1 = key options, 2 = issued certs.
     pub column: usize,
     /// Active field within the key-options column: 0 = generate checkbox,
@@ -1175,9 +1202,9 @@ impl App {
                 return;
             }
         }
-        // Not an encrypted container — offer to re-sign, if this is a
-        // certificate or CRL.
-        self.start_resign();
+        // Not an encrypted container — offer the cryptographic-adjustment
+        // menu (re-sign / re-key), if this is a certificate or CRL.
+        self.start_crypto_menu();
     }
 
     /// 'z' on a certificate or CRL: open the re-sign dialog, reporting
@@ -1346,19 +1373,32 @@ impl App {
     /// Open the public-key modification dialog when the current selection is a
     /// certificate's `subjectPublicKeyInfo`. Returns whether it was opened.
     fn open_public_key_editor(&mut self) -> bool {
-        if !self.file_open {
+        if !self.file_open || !self.selection_is_cert_spki() {
             return false;
         }
+        self.start_rekey();
+        true
+    }
+
+    /// Whether the current tree selection is the `subjectPublicKeyInfo` of the
+    /// open certificate.
+    fn selection_is_cert_spki(&self) -> bool {
         let Some(paths) = cert_paths(&self.roots) else { return false };
-        let selected_is_spki = self
-            .rows
+        self.rows
             .get(self.selected)
-            .is_some_and(|r| r.source == RowSource::Document && r.path == paths.spki);
-        if !selected_is_spki {
-            return false;
+            .is_some_and(|r| r.source == RowSource::Document && r.path == paths.spki)
+    }
+
+    /// Open the public-key modification dialog for the open certificate,
+    /// regardless of the current selection (reached from the SPKI via 'e', from
+    /// the 'E' edit menu, or from the 'z' cryptographic-adjustment menu).
+    pub fn start_rekey(&mut self) {
+        if cert_paths(&self.roots).is_none() {
+            self.status = "re-keying is only available for a certificate".to_string();
+            return;
         }
         let alg = keygen::ALL[0];
-        let issued = self.issued_certs();
+        let issued = self.issued_objects();
         let state = PubKeyState {
             alg_idx: 0,
             generate: true,
@@ -1372,8 +1412,7 @@ impl App {
         };
         self.mode = Mode::EditPubKey(state);
         self.status =
-            "choose an algorithm, generate a key, and resign the issued certificates".to_string();
-        true
+            "choose an algorithm, generate a key, and resign the issued objects".to_string();
     }
 
     /// The open certificate's file-name stem (without extension), used to
@@ -1385,34 +1424,44 @@ impl App {
             .unwrap_or_else(|| "key".to_string())
     }
 
-    /// The certificates in the scanned tree that the open certificate issued,
-    /// each with its serial number, for the dialog's third column. Uses the
-    /// same issuer resolution as the relation graph, then keeps only
-    /// certificate files (not CRLs) and reads each one's serial number.
-    fn issued_certs(&self) -> Vec<IssuedCert> {
+    /// The signed objects in the scanned tree that the open certificate issued,
+    /// for the dialog's third column: certificates first (each with its serial
+    /// number), then CRLs. Uses the same issuer resolution as the relation
+    /// graph.
+    fn issued_objects(&self) -> Vec<IssuedObject> {
         let relations = verify::relations_for(&self.signables, &self.path);
-        let mut issued = Vec::new();
+        let mut certs = Vec::new();
+        let mut crls = Vec::new();
         for edge in &relations.signs {
-            let is_cert = self
+            let Some(kind) = self
                 .signables
                 .iter()
-                .any(|f| f.path == edge.other && f.signable.kind == Kind::Certificate);
-            if !is_cert {
-                continue; // CRLs are signed too, but cannot be "issued" certs
-            }
-            let serial = read_cert_der(&edge.other)
-                .and_then(|der| ber::parse_forest(&der, 0).ok())
-                .and_then(|roots| cert_serial_hex(&roots))
-                .unwrap_or_else(|| "?".to_string());
-            issued.push(IssuedCert {
+                .find(|f| f.path == edge.other)
+                .map(|f| f.signable.kind)
+            else {
+                continue;
+            };
+            let (detail, bucket) = match kind {
+                Kind::Certificate => {
+                    let serial = read_cert_der(&edge.other)
+                        .and_then(|der| ber::parse_forest(&der, 0).ok())
+                        .and_then(|roots| cert_serial_hex(&roots))
+                        .unwrap_or_else(|| "?".to_string());
+                    (format!("#{}", serial), &mut certs)
+                }
+                Kind::Crl => ("CRL".to_string(), &mut crls),
+            };
+            bucket.push(IssuedObject {
                 path: edge.other.clone(),
                 name: file_name_string(&edge.other),
-                serial,
+                detail,
                 selected: true,
             });
         }
-        issued.sort_by(|a, b| a.name.cmp(&b.name));
-        issued
+        certs.sort_by(|a, b| a.name.cmp(&b.name));
+        crls.sort_by(|a, b| a.name.cmp(&b.name));
+        certs.extend(crls); // certificates first, then CRLs
+        certs
     }
 
     pub fn cancel_pubkey(&mut self) {
@@ -1521,7 +1570,7 @@ impl App {
         let mut resigned = 0usize;
         let mut failures = Vec::new();
         for path in &selected_issued {
-            match resign_issued_cert_file(path, alg, &key.pkcs8) {
+            match resign_issued_file(path, alg, &key.pkcs8) {
                 Ok(()) => resigned += 1,
                 Err(e) => failures.push(format!("{}: {}", file_name_string(path), e)),
             }
@@ -1624,7 +1673,8 @@ impl App {
         } else {
             "certificate's public key replaced"
         };
-        let mut summary = format!("{}; {}; resigned {} issued cert(s)", key_part, cert_part, resigned);
+        let mut summary =
+            format!("{}; {}; resigned {} issued object(s)", key_part, cert_part, resigned);
         if !failures.is_empty() {
             summary.push_str(&format!(" ({} failed: {})", failures.len(), failures.join("; ")));
         }
@@ -2229,8 +2279,46 @@ impl App {
         if self.selected_node().is_none() {
             return;
         }
-        self.mode = Mode::EditMenu(MenuState { selected: 0 });
+        let mut items: Vec<MenuItem> = EDIT_MENU
+            .iter()
+            .map(|&(action, label, desc)| MenuItem { action, label, desc })
+            .collect();
+        // On a certificate's subjectPublicKeyInfo, offer to re-key the cert.
+        if self.selection_is_cert_spki() {
+            items.push(MenuItem {
+                action: MenuAction::Rekey,
+                label: "Re-key this cert",
+                desc: "new key pair; resign the objects this certificate issued",
+            });
+        }
+        self.mode =
+            Mode::EditMenu(MenuState { title: " EDIT — choose editing mode ", items, selected: 0 });
         self.status = "choose how to edit the selected element".to_string();
+    }
+
+    /// 'z' on a certificate or CRL: offer the cryptographic adjustments —
+    /// re-signing and (for a certificate) re-keying — as a small menu.
+    fn start_crypto_menu(&mut self) {
+        let der = ber::encode_forest(&self.roots);
+        let Some(signable) = x509::parse_signable(&self.roots, &der) else {
+            self.status = "not an encrypted key, PKCS#12, certificate or CRL".to_string();
+            return;
+        };
+        let mut items = vec![MenuItem {
+            action: MenuAction::Resign,
+            label: "Re-sign",
+            desc: "regenerate the signature with the issuer's key",
+        }];
+        if signable.kind == Kind::Certificate {
+            items.push(MenuItem {
+                action: MenuAction::Rekey,
+                label: "Re-key",
+                desc: "new key pair; resign the objects this certificate issued",
+            });
+        }
+        self.mode =
+            Mode::EditMenu(MenuState { title: " CRYPTOGRAPHIC ADJUSTMENT ", items, selected: 0 });
+        self.status = "choose a cryptographic adjustment".to_string();
     }
 
     pub fn cancel_menu(&mut self) {
@@ -2240,19 +2328,22 @@ impl App {
 
     pub fn menu_move(&mut self, delta: isize) {
         if let Mode::EditMenu(ref mut m) = self.mode {
-            m.selected = (m.selected as isize + delta)
-                .rem_euclid(EDIT_MENU.len() as isize) as usize;
+            let n = m.items.len().max(1) as isize;
+            m.selected = (m.selected as isize + delta).rem_euclid(n) as usize;
         }
     }
 
     pub fn menu_confirm(&mut self) {
         let Mode::EditMenu(ref m) = self.mode else { return };
-        match m.selected {
-            0 => self.start_retag(),
-            1 => self.start_edit(),
-            2 => self.start_edit_base64(),
-            3 => self.start_edit_raw(),
-            _ => self.start_edit_type_specific(),
+        let Some(action) = m.items.get(m.selected).map(|i| i.action) else { return };
+        match action {
+            MenuAction::Retag => self.start_retag(),
+            MenuAction::EditHex => self.start_edit(),
+            MenuAction::EditBase64 => self.start_edit_base64(),
+            MenuAction::EditRaw => self.start_edit_raw(),
+            MenuAction::EditTypeSpecific => self.start_edit_type_specific(),
+            MenuAction::Rekey => self.start_rekey(),
+            MenuAction::Resign => self.start_resign(),
         }
     }
 
@@ -3091,35 +3182,33 @@ fn file_name_string(path: &Path) -> String {
     path.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default()
 }
 
-/// Resign the certificate file at `path` with `key_pkcs8` under algorithm
-/// `alg`: first rewrite both `signatureAlgorithm` identifiers to `alg`, then
-/// sign the re-encoded `tbsCertificate` and install the new signature. The
-/// file's original container (DER/PEM/…) is preserved. Errors — a bad file, a
-/// key/algorithm mismatch — leave the file untouched.
-fn resign_issued_cert_file(
-    path: &Path,
-    alg: keygen::KeyAlgorithm,
-    key_pkcs8: &[u8],
-) -> Result<(), String> {
+/// Resign the signed-object file at `path` (a Certificate or a CRL) with
+/// `key_pkcs8` under algorithm `alg`: first rewrite both `signatureAlgorithm`
+/// identifiers to `alg`, then sign the re-encoded `tbsCertificate`/`tbsCertList`
+/// and install the new signature. The file's original container (DER/PEM/…) is
+/// preserved. Errors — a bad file, a key/algorithm mismatch — leave the file
+/// untouched.
+fn resign_issued_file(path: &Path, alg: keygen::KeyAlgorithm, key_pkcs8: &[u8]) -> Result<(), String> {
     let raw = std::fs::read(path).map_err(|e| e.to_string())?;
     let (der, container) = input::load(&raw).map_err(|e| e.to_string())?;
     let mut roots = ber::parse_forest(&der, 0).map_err(|e| e.to_string())?;
-    let paths = cert_paths(&roots).ok_or("not a certificate")?;
+    let (tbs_sig_alg, outer_sig_alg, outer_sig) =
+        resignable_paths(&roots).ok_or("not a certificate or CRL")?;
 
     let alg_id = ber::parse_forest(&alg.sig_alg_identifier_der(), 0)
         .map_err(|e| e.to_string())?
         .into_iter()
         .next()
         .ok_or("empty algorithm identifier")?;
-    *node_at_mut(&mut roots, &paths.tbs_sig_alg).ok_or("tbs sigAlg missing")? = alg_id.clone();
-    *node_at_mut(&mut roots, &paths.outer_sig_alg).ok_or("outer sigAlg missing")? = alg_id;
+    *node_at_mut(&mut roots, &tbs_sig_alg).ok_or("tbs sigAlg missing")? = alg_id.clone();
+    *node_at_mut(&mut roots, &outer_sig_alg).ok_or("outer sigAlg missing")? = alg_id;
 
     // Re-encode and re-parse so the tbs bytes are canonical, then sign them.
     let updated = ber::encode_forest(&roots);
     let mut roots = ber::parse_forest(&updated, 0).map_err(|e| e.to_string())?;
-    let signable = x509::parse_signable(&roots, &updated).ok_or("not a certificate after edit")?;
+    let signable = x509::parse_signable(&roots, &updated).ok_or("not a signed object after edit")?;
     let sig = verify::sign(alg.sig_alg_oid(), key_pkcs8, &signable.tbs)?;
-    let sig_node = node_at_mut(&mut roots, &paths.outer_sig).ok_or("signature node missing")?;
+    let sig_node = node_at_mut(&mut roots, &outer_sig).ok_or("signature node missing")?;
     sig_node.value = std::iter::once(0u8).chain(sig).collect();
     sig_node.children.clear();
     sig_node.encapsulates = false;
@@ -3206,6 +3295,34 @@ fn cert_paths(roots: &[Node]) -> Option<CertPaths> {
         outer_sig_alg: vec![0, 1],
         outer_sig: vec![0, 2],
     })
+}
+
+/// Tree paths of the signature-algorithm and signature nodes of a signed
+/// object (Certificate *or* CRL) — the fields re-signing rewrites. The inner
+/// `signature` AlgorithmIdentifier sits at a different position in a
+/// `tbsCertificate` (after the `serialNumber`) than in a `tbsCertList`.
+fn resignable_paths(roots: &[Node]) -> Option<(Vec<usize>, Vec<usize>, Vec<usize>)> {
+    let der = ber::encode_forest(roots);
+    let signable = x509::parse_signable(roots, &der)?;
+    let tbs = &roots.first()?.children.first()?.children;
+    let tbs_sig_alg = match signable.kind {
+        Kind::Certificate => {
+            // tbsCertificate: [ [0] version?, serialNumber, signature, … ]
+            let v = usize::from(
+                tbs.first()
+                    .is_some_and(|c| c.class == Class::ContextSpecific && c.tag == 0 && c.constructed),
+            );
+            vec![0, 0, v + 1]
+        }
+        Kind::Crl => {
+            // tbsCertList: [ version? INTEGER, signature, issuer, … ]
+            let v = usize::from(
+                tbs.first().is_some_and(|c| !c.constructed && c.is_universal(ber::TAG_INTEGER)),
+            );
+            vec![0, 0, v]
+        }
+    };
+    Some((tbs_sig_alg, vec![0, 1], vec![0, 2]))
 }
 
 /// The [`x509::PublicKeyId`] of a `SubjectPublicKeyInfo` DER (`SEQUENCE {
@@ -3984,12 +4101,32 @@ mod tests {
     }
 
     #[test]
-    fn z_on_a_certificate_opens_the_resign_dialog_and_does_not_decrypt() {
+    fn z_on_a_certificate_opens_the_crypto_menu_and_does_not_decrypt() {
         let mut app = open_real_file(std::path::Path::new("testdata/cert_ec.der"));
         app.start_decrypt();
-        assert!(matches!(app.mode, Mode::Resign(_)), "a certificate offers re-signing");
+        // 'z' on a certificate opens the cryptographic-adjustment menu with
+        // both re-sign and re-key options — not a decryption.
+        let Mode::EditMenu(ref m) = app.mode else { panic!("crypto menu expected") };
+        assert!(m.title.contains("CRYPTOGRAPHIC"));
+        let actions: Vec<MenuAction> = m.items.iter().map(|i| i.action).collect();
+        assert_eq!(actions, [MenuAction::Resign, MenuAction::Rekey]);
         assert!(app.pkcs12.is_none());
         assert!(app.decrypted.is_none());
+
+        // Choosing "Re-sign" opens the re-sign dialog.
+        app.menu_confirm();
+        assert!(matches!(app.mode, Mode::Resign(_)));
+    }
+
+    #[test]
+    fn z_on_a_crl_offers_only_resigning() {
+        let dir = copy_chain("z-crl");
+        let mut app = open_real_file(&dir.join("root_crl.der"));
+        app.start_decrypt();
+        let Mode::EditMenu(ref m) = app.mode else { panic!("crypto menu expected") };
+        let actions: Vec<MenuAction> = m.items.iter().map(|i| i.action).collect();
+        assert_eq!(actions, [MenuAction::Resign], "a CRL has no public key to re-key");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     // ---- key ↔ certificate links -----------------------------------------
@@ -4709,13 +4846,78 @@ mod tests {
         app.select(spki_row(&app));
         app.edit_selected();
         let Mode::EditPubKey(ref s) = app.mode else { panic!("public-key dialog expected") };
-        // The self-signed root issued the intermediate (a cert), which is the
-        // sole entry in the resign list; the root CRL (a CRL) is excluded.
-        let names: Vec<&str> = s.issued.iter().map(|c| c.name.as_str()).collect();
-        assert_eq!(names, ["intermediate_ca.der"]);
-        assert!(s.issued[0].selected, "issued certs are checked by default");
+        // The self-signed root issued the intermediate (a cert) and the root
+        // CRL: certificates come first, CRLs at the end, each with a suffix.
+        let entries: Vec<(&str, &str)> =
+            s.issued.iter().map(|c| (c.name.as_str(), c.detail.as_str())).collect();
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].0, "intermediate_ca.der");
+        assert!(entries[0].1.starts_with('#'), "a certificate shows its serial");
+        assert_eq!(entries[1], ("root_crl.der", "CRL"));
+        assert!(s.issued.iter().all(|c| c.selected), "issued objects are checked by default");
         assert!(s.generate, "generate is on by default");
         assert!(s.filename.contains("p256")); // first algorithm's short name
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn the_edit_menu_on_the_spki_offers_rekeying() {
+        let dir = copy_chain("pk-emenu");
+        let mut app = open_real_file(&dir.join("root_ca.der"));
+        // 'E' on an ordinary element: no re-key entry.
+        app.select(row_of(&app, &cert_paths(&app.roots).unwrap().serial));
+        app.open_edit_menu();
+        let Mode::EditMenu(ref m) = app.mode else { panic!("edit menu") };
+        assert!(!m.items.iter().any(|i| i.action == MenuAction::Rekey));
+        app.cancel_menu();
+        // 'E' on the subjectPublicKeyInfo: a trailing "Re-key this cert" entry
+        // that opens the public-key dialog.
+        app.select(spki_row(&app));
+        app.open_edit_menu();
+        let last = if let Mode::EditMenu(ref mut m) = app.mode {
+            assert_eq!(m.items.last().unwrap().action, MenuAction::Rekey);
+            let last = m.items.len() - 1;
+            m.selected = last;
+            last
+        } else {
+            panic!("edit menu");
+        };
+        assert_eq!(last, EDIT_MENU.len(), "re-key is the trailing entry after the base modes");
+        app.menu_confirm();
+        assert!(matches!(app.mode, Mode::EditPubKey(_)));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rekeying_also_resigns_a_selected_issued_crl() {
+        let dir = copy_chain("pk-crl");
+        let mut app = open_real_file(&dir.join("root_ca.der"));
+        app.start_rekey();
+        if let Mode::EditPubKey(ref mut s) = app.mode {
+            s.alg_idx = keygen::ALL.iter().position(|a| *a == keygen::KeyAlgorithm::Ed25519).unwrap();
+            s.filename = "root_crlkey.key".to_string();
+            s.filename_auto = false;
+            // Everything (the cert and the CRL) stays checked by default.
+            assert!(s.issued.iter().any(|c| c.name == "root_crl.der"));
+        }
+        app.submit_pubkey();
+        // The root CRL was resigned under the new key with the new algorithm,
+        // and verifies against the certificate's new public key.
+        let der = ber::encode_forest(&app.roots);
+        let s = x509::parse_signable(&app.roots, &der).unwrap();
+        let root_pubkey = s.pubkey.clone().unwrap();
+        let crl = dir.join("root_crl.der");
+        let (crl_der, _) = input::load(&std::fs::read(&crl).unwrap()).unwrap();
+        let crl_roots = ber::parse_forest(&crl_der, 0).unwrap();
+        let crl_signable = x509::parse_signable(&crl_roots, &crl_der).unwrap();
+        assert_eq!(crl_signable.kind, Kind::Crl);
+        assert_eq!(crl_signable.sig_alg, keygen::KeyAlgorithm::Ed25519.sig_alg_oid());
+        assert!(verify::verify_signature(
+            &crl_signable.sig_alg,
+            &root_pubkey,
+            &crl_signable.tbs,
+            &crl_signable.signature
+        ));
         let _ = std::fs::remove_dir_all(&dir);
     }
 
