@@ -1053,7 +1053,15 @@ impl App {
         roots: Vec<Node>,
         total_len: usize,
     ) -> Self {
-        let dir = path.parent().map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
+        // Normalize the input path so a bare "cert.der" behaves exactly like an
+        // explicit "./cert.der" / ".\cert.der": a bare name has an *empty*
+        // parent (`Path::parent` → `Some("")`), and `read_dir("")` fails on both
+        // Unix and Windows, which would leave the browser, signature relations
+        // and key links empty. Fall back to the current directory, and rebuild
+        // `path` as `<dir>/<file>` so it matches the entries `read_dir(dir)`
+        // produces (`./cert.der`) — the form the browser highlight and the
+        // relation/link comparisons key off.
+        let (dir, path) = normalize_file_path(&path);
         let mut browser = FileBrowser::new(dir.clone());
         browser.reveal(&path);
         let signables = x509::scan_dir_signables(&dir);
@@ -3413,6 +3421,29 @@ fn file_name_string(path: &Path) -> String {
     path.file_name().map(|s| s.to_string_lossy().into_owned()).unwrap_or_default()
 }
 
+/// Split a file `path` into `(directory, normalized_path)`. When the path has
+/// no directory component — a bare file name like `cert.der`, whose
+/// `Path::parent()` is `Some("")` — the current directory (`.`) is used, since
+/// `read_dir("")` fails on every platform. The normalized path is rebuilt as
+/// `directory.join(file_name)`, so it equals the paths a `read_dir(directory)`
+/// scan produces (`./cert.der` / `.\cert.der`); the browser highlight, the
+/// signature-relation graph and the key↔certificate links all compare the open
+/// document's path against those scanned paths, so the two must be in the same
+/// form. A path with no file component (e.g. a filesystem root) is returned
+/// unchanged, paired with `.`.
+fn normalize_file_path(path: &Path) -> (PathBuf, PathBuf) {
+    let dir = path
+        .parent()
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
+    let normalized = match path.file_name() {
+        Some(name) => dir.join(name),
+        None => path.to_path_buf(),
+    };
+    (dir, normalized)
+}
+
 /// Resign the signed-object file at `path` (a Certificate or a CRL) with
 /// `key_pkcs8` under algorithm `alg`: first rewrite both `signatureAlgorithm`
 /// identifiers to `alg`, then sign the re-encoded `tbsCertificate`/`tbsCertList`
@@ -4856,6 +4887,28 @@ mod tests {
         app.dismiss_notice();
         assert!(matches!(app.mode, Mode::Browse));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_bare_file_name_normalizes_like_its_dot_form() {
+        // Regression (Windows report): a bare "cert.der" and an explicit
+        // "./cert.der" / ".\cert.der" must resolve to the same directory and
+        // path. A bare name has an empty parent, and read_dir("") fails on every
+        // platform, which would otherwise leave the browser and the
+        // signature/link scans empty.
+        let (bare_dir, bare_path) = normalize_file_path(Path::new("cert.der"));
+        let (dot_dir, dot_path) = normalize_file_path(Path::new("./cert.der"));
+        assert!(!bare_dir.as_os_str().is_empty(), "the directory must be readable");
+        assert_eq!(bare_dir, PathBuf::from("."));
+        assert_eq!(bare_dir, dot_dir);
+        assert_eq!(bare_path, dot_path, "both forms must yield the same path");
+        // The normalized path is the form a `read_dir(dir)` scan produces, so the
+        // browser highlight and relation/link comparisons match.
+        assert_eq!(bare_path, PathBuf::from(".").join("cert.der"));
+        // Paths that already carry a directory component are left unchanged.
+        let (sub_dir, sub_path) = normalize_file_path(Path::new("sub/cert.der"));
+        assert_eq!(sub_dir, PathBuf::from("sub"));
+        assert_eq!(sub_path, PathBuf::from("sub").join("cert.der"));
     }
 
     #[test]
