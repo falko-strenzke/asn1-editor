@@ -5000,6 +5000,41 @@ mod tests {
     }
 
     #[test]
+    fn rekeying_to_ml_dsa_resigns_the_cert_and_its_issued_cert() {
+        let dir = copy_chain("pk-mldsa");
+        let mut app = open_real_file(&dir.join("root_ca.der"));
+        app.select(spki_row(&app));
+        app.edit_selected();
+        // ML-DSA-44 (Pq(0)) — a post-quantum algorithm; generation and signing
+        // are quick.
+        let ml_dsa = keygen::KeyAlgorithm::Pq(0);
+        if let Mode::EditPubKey(ref mut s) = app.mode {
+            s.alg_idx = keygen::ALL.iter().position(|a| *a == ml_dsa).unwrap();
+            s.filename = "root_mldsa.key".to_string();
+            s.filename_auto = false;
+        }
+        app.submit_pubkey();
+        assert!(matches!(app.mode, Mode::Browse));
+
+        // The rekeyed self-signed root uses the ML-DSA signature algorithm and
+        // verifies under its own new key.
+        let der = ber::encode_forest(&app.roots);
+        let s = x509::parse_signable(&app.roots, &der).unwrap();
+        assert_eq!(s.sig_alg, ml_dsa.sig_alg_oid());
+        assert!(verify::verify_signature(&s.sig_alg, s.pubkey.as_ref().unwrap(), &s.tbs, &s.signature));
+
+        // The issued intermediate was resigned on disk under the new PQ key.
+        let inter = dir.join("intermediate_ca.der");
+        let (inter_alg, _) = cert_pubkey(&inter);
+        assert_eq!(inter_alg, ml_dsa.sig_alg_oid());
+        assert!(
+            cert_verifies_under(&inter, s.pubkey.as_ref().unwrap()),
+            "intermediate verifies under the new ML-DSA root key"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn a_password_writes_an_encrypted_key_that_still_signs() {
         let dir = copy_chain("pk-enc");
         let mut app = open_real_file(&dir.join("root_ca.der"));

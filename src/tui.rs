@@ -321,7 +321,7 @@ fn draw(frame: &mut Frame, app: &mut App) {
 fn draw_edit_pubkey(frame: &mut Frame, app: &App, area: Rect) {
     let Mode::EditPubKey(ref s) = app.mode else { return };
     let width = 92.min(area.width);
-    let height = 18.min(area.height);
+    let height = 22.min(area.height);
     let popup = Rect {
         x: area.x + (area.width.saturating_sub(width)) / 2,
         y: area.y + (area.height.saturating_sub(height)) / 2,
@@ -332,7 +332,7 @@ fn draw_edit_pubkey(frame: &mut Frame, app: &App, area: Rect) {
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::new().fg(Color::Yellow))
-        .title(" MODIFY PUBLIC KEY — new key pair, resign issued certs ");
+        .title(" MODIFY PUBLIC KEY — new key pair, resign issued objects ");
     let inner = block.inner(popup);
     frame.render_widget(block, popup);
     let [cols_area, hint_area] =
@@ -363,9 +363,14 @@ fn draw_edit_pubkey(frame: &mut Frame, app: &App, area: Rect) {
         Line::from(Span::styled(format!(" {} ", text), style))
     };
 
-    // Column 0: algorithm list.
+    // Column 0: algorithm list, scrolled so the selection stays visible
+    // (there are more algorithms than the popup is tall).
     let mut alg_lines = vec![header("Algorithm", s.column == 0)];
-    for (i, alg) in keygen::ALL.iter().enumerate() {
+    let visible = (alg_col.height as usize).saturating_sub(1).max(1);
+    let start = s.alg_idx.saturating_sub(visible.saturating_sub(1)).min(
+        keygen::ALL.len().saturating_sub(visible),
+    );
+    for (i, alg) in keygen::ALL.iter().enumerate().skip(start).take(visible) {
         alg_lines.push(row(alg.label().to_string(), i == s.alg_idx, s.column == 0));
     }
     frame.render_widget(Paragraph::new(alg_lines), alg_col);
@@ -386,7 +391,7 @@ fn draw_edit_pubkey(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(Paragraph::new(opt_lines), opt_col);
 
     // Column 2: issued certificates and CRLs with resign checkboxes.
-    let mut issued_lines = vec![header("Resign issued certs", s.column == 2)];
+    let mut issued_lines = vec![header("Resign issued objects", s.column == 2)];
     if s.issued.is_empty() {
         issued_lines.push(Line::from(Span::styled(" (none found)", Style::new().dim())));
     } else {

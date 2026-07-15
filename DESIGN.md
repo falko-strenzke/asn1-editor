@@ -56,6 +56,10 @@ Goals:
   generate a new key pair for a chosen signature algorithm, optionally save
   the private key (encrypted or not), and resign the certificates this one
   issued so they remain valid under the new key (§9e).
+* Verify and generate signatures with the post-quantum FIPS 204 (ML-DSA) and
+  FIPS 205 (SLH-DSA) algorithms, alongside the classical RSA/ECDSA/Ed25519
+  set — so PQ-signed certificates and CRLs verify, and objects can be
+  re-signed or re-keyed with any of them (§9c/§9e).
 
 Non-goals (see §14):
 
@@ -101,12 +105,13 @@ src/
              recursive directory scan for candidate CA certs; also extracts
              the public-key identity of a private key or certificate for the
              key↔certificate links, and normalizes a key to PKCS#8 for signing
-  verify.rs  signature verification and generation (uses aws-lc-rs) + the
-             pure key↔cert link matcher + the claimed-issuer lookup
+  verify.rs  signature verification and generation: classical via aws-lc-rs,
+             post-quantum ML-DSA/SLH-DSA via openssl + the key↔cert link matcher
   pathval.rs certification-path validation against user-chosen trust anchors
              (uses the openssl crate)
   keygen.rs  private-key generation for the public-key modification flow
-             (uses the openssl crate): plaintext/encrypted PKCS#8 + the SPKI
+             (uses openssl, incl. openssl-sys FFI for ML-DSA/SLH-DSA by name):
+             plaintext/encrypted PKCS#8 + the SPKI
   pkcs8.rs   structural decoding + password decryption/re-encryption of
              EncryptedPrivateKeyInfo (PBES2; uses aws-lc-rs). Exposes a
              reusable Pbes2 (PBKDF2 + AES-CBC) decryptor shared with pkcs12.rs
@@ -142,19 +147,21 @@ Dependency rule: `ber.rs` and `oid.rs` depend on nothing; `input.rs` and
 shared OID repository; `browser.rs` depends only on the standard library
 (it knows nothing about ASN.1); `x509.rs` depends on `ber.rs` + `input.rs`
 (structural decoding only, no crypto); `verify.rs` depends on `x509.rs` +
-`aws-lc-rs`; `pkcs8.rs` depends on `ber.rs` + `aws-lc-rs` and `pkcs12.rs`
-depends on `ber.rs` + `pkcs8.rs` + the `openssl` crate (region encryption
-reuses `pkcs8::Pbes2`; only the `MacData` KDF/HMAC uses OpenSSL's digest
-primitives); `pathval.rs` depends
+`ber.rs` + `aws-lc-rs` + `openssl` (classical algorithms use `aws-lc-rs`; the
+post-quantum ML-DSA/SLH-DSA pair uses OpenSSL, which covers both — `aws-lc-rs`
+has ML-DSA but not SLH-DSA); `pkcs8.rs` depends on `ber.rs` + `aws-lc-rs` and
+`pkcs12.rs` depends on `ber.rs` + `pkcs8.rs` + the `openssl` crate (region
+encryption reuses `pkcs8::Pbes2`; only the `MacData` KDF/HMAC uses OpenSSL's
+digest primitives); `pathval.rs` depends
 on the `openssl` crate + `ber.rs` (it takes raw DER, not the `Node` tree);
-`keygen.rs` depends on the `openssl` crate + `ber.rs` (OpenSSL generates the
-key and encodes PKCS#8/SPKI; `verify::sign`, via `aws-lc-rs`, does the actual
-signing with it);
+`keygen.rs` depends on `openssl` + `openssl-sys`/`foreign-types` (raw FFI for
+by-name PQ key generation) + `ber.rs` (`verify::sign` does the actual signing);
 `app.rs` depends on all of the above; `tui.rs` renders `app.rs` and resolves
 OID display names through `oid.rs` and formats file change-times through
 `libc` (`localtime_r`). External dependencies: `ratatui`, `aws-lc-rs`,
-`openssl` (the last requires a system OpenSSL to link against), and `libc`
-(local-time conversion for the browser's change timestamps).
+`openssl` (requires a system OpenSSL — 3.5+ for the post-quantum algorithms —
+to link against), `openssl-sys` + `foreign-types` (raw OpenSSL key generation),
+and `libc` (local-time conversion for the browser's change timestamps).
 
 ## 4. Data model
 
@@ -619,20 +626,27 @@ knowledge of its own:
   correct for DER input, but a real (if rare) risk of silently altering
   the exact bytes a signature is defined over.
 
-`src/verify.rs` is one of the two modules that talk to the crypto library
-(`aws-lc-rs`, chosen for its `ring`-compatible API and — unlike `ring` —
-active investment in post-quantum algorithms, positioning it best for
-adding ML-DSA/SLH-DSA verification later; `pkcs8.rs`, §9a, is the other —
-`pkcs12.rs`, §9b, decrypts too but only through `pkcs8::Pbes2`, so it does
-not touch `aws-lc-rs` directly). It maps the signature
-algorithm OID to an `aws-lc-rs` `VerificationAlgorithm` (RSA PKCS#1 v1.5
-with SHA-1/256/384/512, ECDSA P-256/P-384 with SHA-256/384, Ed25519 — RSA-
-PSS and post-quantum algorithms are not implemented), picks a candidate
-issuer from the scanned index (an `authorityKeyIdentifier` /
-`subjectKeyIdentifier` match is preferred over issuer/subject DN
-byte-equality when available), and verifies. `verify_against` takes a
-generic `(tbs bytes, sig alg OID, signature bytes, candidate issuers)`
-shape, so a future CMS `SignerInfo` decoder can reuse it unchanged.
+`src/verify.rs` uses two crypto backends. **Classical** algorithms go through
+`aws-lc-rs` (chosen for its `ring`-compatible API): the signature-algorithm
+OID maps to a `VerificationAlgorithm` (RSA PKCS#1 v1.5 with SHA-1/256/384/512,
+ECDSA P-256/P-384 with SHA-256/384, Ed25519). **Post-quantum** ML-DSA
+(FIPS 204: 44/65/87) and SLH-DSA (FIPS 205: all twelve parameter sets) go
+through the `openssl` crate (OpenSSL 3.5+), which covers *both* families —
+`aws-lc-rs` has ML-DSA but not SLH-DSA, so OpenSSL is used uniformly for the
+pair. `is_pq` routes the pure PQ OIDs (`2.16.840.1.101.3.4.3.{17..=31}`) to
+that path; these signatures are "pure" (the message is signed directly, no
+external digest, matching the LAMPS X.509 profiles), so OpenSSL's one-shot
+`Signer`/`Verifier` *without* a digest are used. `verify_signature` is the
+single choke point both `verify_against` and `is_self_signed` call: given the
+raw `subjectPublicKey` bytes it either hands them to `aws-lc-rs` (classical) or
+rebuilds a `SubjectPublicKeyInfo` around them (`spki_der`) and loads it with
+`PKey::public_key_from_der` (PQ). `verify_against` picks a candidate issuer
+from the scanned index (an `authorityKeyIdentifier` / `subjectKeyIdentifier`
+match is preferred over issuer/subject DN byte-equality when available) and
+verifies. It takes a generic `(tbs bytes, sig alg OID, signature bytes,
+candidate issuers)` shape, so a future CMS `SignerInfo` decoder can reuse it
+unchanged. (RSA-PSS and the pre-hash `HashML-DSA`/`HashSLH-DSA` variants are
+still not implemented.)
 
 Display: a `Signature` line in the content pane header, directly below
 `Spec` — shown once per document regardless of which node is selected,
@@ -954,8 +968,9 @@ offers to generate a fresh signature.
 
 Availability (`App::resign_state`) requires three things: the signature
 algorithm is one `verify::sign` supports (RSA PKCS#1 v1.5 SHA-256/384/512,
-ECDSA P-256/P-384, Ed25519 — a subset of what can be *verified*, since
-`aws-lc-rs` will not sign with legacy SHA-1); the claimed issuer certificate
+ECDSA P-256/P-384, Ed25519, and the post-quantum ML-DSA/SLH-DSA sets — a
+subset of what can be *verified*, since `aws-lc-rs` will not sign with legacy
+SHA-1); the claimed issuer certificate
 is present in the scanned tree (`verify::claimed_issuers` matches by
 `authorityKeyIdentifier`/`subjectKeyIdentifier` or issuer/subject DN —
 *without* checking the current, now-broken signature); and a **usable**
@@ -1049,9 +1064,11 @@ cryptographic-adjustment menu (below). All three call `App::start_rekey`,
 which builds the dialog from the open certificate regardless of the current
 selection. The dialog (`Mode::EditPubKey`) has three columns:
 
-1. **Algorithm** — the signature algorithms `keygen`/`verify` support: ECDSA
-   P-256 (SHA-256), ECDSA P-384 (SHA-384), Ed25519, RSA-2048 and RSA-4096
-   (both SHA-256).
+1. **Algorithm** — the signature algorithms `keygen`/`verify` support: the
+   classical ECDSA P-256 (SHA-256), ECDSA P-384 (SHA-384), Ed25519, RSA-2048
+   and RSA-4096 (both SHA-256), followed by the post-quantum ML-DSA-44/65/87
+   and the twelve SLH-DSA parameter sets. The list is longer than the popup,
+   so this column scrolls to keep the selection visible.
 2. **New private key** — a *generate new private key* checkbox (default on),
    an editable file-name field (defaulting to `<cert-stem>_<alg>_key.der` and
    tracking the algorithm until the user edits it), and an optional password
@@ -1064,8 +1081,13 @@ selection. The dialog (`Mode::EditPubKey`) has three columns:
 
 Key generation lives in `keygen.rs` and uses the `openssl` crate: OpenSSL
 produces the key pair and encodes its plaintext PKCS#8 (the signing input for
-`verify::sign`, which loads it with `aws-lc-rs`), its `SubjectPublicKeyInfo`
-(spliced into the certificate), and — for a password — the encrypted PKCS#8.
+`verify::sign`), its `SubjectPublicKeyInfo` (spliced into the certificate),
+and — for a password — the encrypted PKCS#8. Classical keys use OpenSSL's typed
+generators; the post-quantum keys are generated **by algorithm name** through
+raw `openssl-sys` FFI (`EVP_PKEY_CTX_new_from_name` → `keygen`, wrapped back
+into a safe `PKey`), since the safe crate's by-name generation does not cover
+SLH-DSA. Everything downstream — PKCS#8 encoding/encryption, SPKI extraction,
+signing — is algorithm-agnostic, so the PQ keys flow through the same code.
 A key pair is always generated in memory (it is what rekeys the certificate
 and resigns the issued certs); the checkbox controls only whether the private
 key is *written to a file*. `keygen` and `pkcs8`/`verify` interoperate cleanly:
@@ -1346,16 +1368,23 @@ intermediate directly) validates the leaf, that no trust anchor or a missing
 intermediate is invalid, and that a broken signature does not validate; app
 tests check that `t` toggles a certificate's trust, re-validates the open
 certificate, refuses a CRL, and leaves a non-certificate with no path status.
-Public-key-modification tests cover `keygen` (each algorithm generates a key
-that signs and verifies under its own SPKI; a password yields an encrypted
-PKCS#8 our `pkcs8` module decrypts; the signature-algorithm identifier shapes)
-and, at the app level over `testdata/chain`, that `e` opens the dialog only on
-the SPKI (with the issued list showing the certificate first and the CRL last),
-that rekeying a self-signed CA resigns it and its issued certificate under the
-new key, that a selected issued *CRL* is likewise resigned and verifies under
-the new key, that a password writes an encrypted key that still signs, that an
-existing key file is never overwritten, and that turning off "generate" still
-rekeys without writing a file. Menu-routing tests check that `z` on a
+Post-quantum tests confirm the OpenSSL backend end to end: `verify` generates a
+self-signed ML-DSA and a fast SLH-DSA certificate with the `openssl` CLI and
+checks our parser + `verify_against` accept the signature and reject a tampered
+one, and `keygen` round-trips signing/verification for the classical, ML-DSA
+and fast SLH-DSA algorithms (the slow SLH-DSA "small" sets are exercised for
+key generation only), plus an encrypted ML-DSA key that `pkcs8` reads back.
+Public-key-modification tests cover `keygen` (each algorithm generates a key,
+and every post-quantum SPKI carries its signature OID; a password yields an
+encrypted PKCS#8 our `pkcs8` module decrypts; the signature-algorithm identifier
+shapes) and, at the app level over `testdata/chain`, that `e` opens the dialog
+only on the SPKI (with the issued list showing the certificate first and the CRL
+last), that rekeying a self-signed CA resigns it and its issued certificate
+under the new key — classically and to **ML-DSA** — that a selected issued
+*CRL* is likewise resigned and verifies under the new key, that a password
+writes an encrypted key that still signs, that an existing key file is never
+overwritten, and that turning off "generate" still rekeys without writing a
+file. Menu-routing tests check that `z` on a
 certificate opens the cryptographic-adjustment menu (re-sign + re-key) and on a
 CRL offers only re-sign, and that the `E` menu gains a trailing *Re-key this
 cert* entry on the SPKI that opens the dialog. Browser-refresh tests check

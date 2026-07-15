@@ -77,6 +77,33 @@ pub struct Node {
     pub expanded: bool,
 }
 
+/// Construct a synthetic universal-class [`Node`] (offset/length fields are
+/// placeholders, recomputed on the next encode/parse round-trip). Used to
+/// build small DER structures — AlgorithmIdentifiers, SubjectPublicKeyInfos —
+/// programmatically.
+pub fn univ(tag: u32, constructed: bool, value: Vec<u8>) -> Node {
+    Node {
+        class: Class::Universal,
+        tag,
+        constructed,
+        indefinite: false,
+        offset: 0,
+        header_len: 0,
+        content_len: 0,
+        value,
+        children: Vec::new(),
+        encapsulates: false,
+        expanded: false,
+    }
+}
+
+/// A synthetic universal SEQUENCE [`Node`] with the given children.
+pub fn univ_seq(children: Vec<Node>) -> Node {
+    let mut node = univ(TAG_SEQUENCE, true, Vec::new());
+    node.children = children;
+    node
+}
+
 /// Type label using dumpasn1's naming, for any class/tag combination.
 pub fn type_name_of(class: Class, tag: u32) -> String {
     match class {

@@ -12,22 +12,25 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-//! Cryptographic signature verification, layered on top of the purely
-//! structural `x509.rs`. This is the only module that knows about
-//! `aws-lc-rs`; a future CMS `SignerInfo` decoder could call
-//! `verify_against` with the same `(tbs bytes, sig alg OID, signature
-//! bytes)` shape it already takes from `x509::Signable`.
+//! Cryptographic signature verification and generation, layered on top of the
+//! purely structural `x509.rs`. A future CMS `SignerInfo` decoder could call
+//! `verify_against` with the same `(tbs bytes, sig alg OID, signature bytes)`
+//! shape it already takes from `x509::Signable`.
 //!
-//! Algorithm coverage: RSA PKCS#1 v1.5 (SHA-1/256/384/512), ECDSA
-//! (P-256/SHA-256, P-384/SHA-384), Ed25519. RSA-PSS and post-quantum
-//! algorithms (ML-DSA/SLH-DSA) are not implemented yet; `aws-lc-rs` was
-//! chosen over `ring` specifically because it is the more likely of the
-//! two to gain PQ verification support later.
+//! Two backends: classical algorithms use `aws-lc-rs` — RSA PKCS#1 v1.5
+//! (SHA-1/256/384/512), ECDSA (P-256/SHA-256, P-384/SHA-384), Ed25519 — while
+//! the post-quantum FIPS 204 (ML-DSA) and FIPS 205 (SLH-DSA) algorithms use the
+//! `openssl` crate (OpenSSL 3.5+), which covers both families; `aws-lc-rs` has
+//! ML-DSA but not SLH-DSA, so OpenSSL is used uniformly for the pair. The PQ
+//! signatures are "pure" (the message is signed directly, no external digest),
+//! matching the LAMPS X.509 profiles: OpenSSL's one-shot `Signer`/`Verifier`
+//! without a digest.
 
 use std::path::{Path, PathBuf};
 
 use aws_lc_rs::signature;
 
+use crate::ber;
 use crate::x509::{self, CaCandidate, PublicKeyId, Signable, SignableFile};
 
 const SHA1_WITH_RSA: &[u64] = &[1, 2, 840, 113549, 1, 1, 5];
@@ -37,6 +40,17 @@ const SHA512_WITH_RSA: &[u64] = &[1, 2, 840, 113549, 1, 1, 13];
 const ECDSA_WITH_SHA256: &[u64] = &[1, 2, 840, 10045, 4, 3, 2];
 const ECDSA_WITH_SHA384: &[u64] = &[1, 2, 840, 10045, 4, 3, 3];
 const ED25519_OID: &[u64] = &[1, 3, 101, 112];
+
+/// The pure ML-DSA (FIPS 204) and SLH-DSA (FIPS 205) signature-algorithm OIDs,
+/// all under the NIST arc `2.16.840.1.101.3.4.3.{17..=31}`: ML-DSA-44/65/87
+/// (17–19) and the twelve SLH-DSA parameter sets (20–31).
+const PQ_SIG_ARCS: &[u64] = &[17, 18, 19, 20, 21, 22, 23, 24, 25, 26, 27, 28, 29, 30, 31];
+
+/// Whether `sig_alg` is one of the pure ML-DSA/SLH-DSA OIDs, which are handled
+/// by the OpenSSL backend rather than `aws-lc-rs`.
+fn is_pq(sig_alg: &[u64]) -> bool {
+    matches!(sig_alg, [2, 16, 840, 1, 101, 3, 4, 3, arc] if PQ_SIG_ARCS.contains(arc))
+}
 
 pub enum SignatureStatus {
     Verified { issuer_path: PathBuf, issuer_summary: String, self_signed: bool },
@@ -85,6 +99,23 @@ pub fn private_key_usable(pkcs8_key: &[u8]) -> bool {
         .is_ok()
         || signature::RsaKeyPair::from_pkcs8(pkcs8_key).is_ok()
         || signature::Ed25519KeyPair::from_pkcs8(pkcs8_key).is_ok()
+        // A post-quantum key (ML-DSA/SLH-DSA) loads via OpenSSL, not aws-lc-rs.
+        || (pkcs8_is_pq(pkcs8_key)
+            && openssl::pkey::PKey::private_key_from_pkcs8(pkcs8_key).is_ok())
+}
+
+/// Whether a PKCS#8 `PrivateKeyInfo`'s `privateKeyAlgorithm` is a pure
+/// ML-DSA/SLH-DSA OID. Used to gate the OpenSSL usability check so classical
+/// keys keep their stricter `aws-lc-rs` validation (which also catches a
+/// corrupted EC scalar).
+fn pkcs8_is_pq(pkcs8_key: &[u8]) -> bool {
+    let Ok(roots) = ber::parse_forest(pkcs8_key, 0) else { return false };
+    let alg = roots
+        .first()
+        .and_then(|r| r.children.get(1)) // privateKeyAlgorithm
+        .and_then(|a| a.children.first()) // algorithm OID
+        .and_then(|o| ber::oid_arcs(&o.value));
+    alg.as_deref().is_some_and(is_pq)
 }
 
 /// Whether `signature` is a valid `sig_alg` signature over `tbs` under the
@@ -92,25 +123,66 @@ pub fn private_key_usable(pkcs8_key: &[u8]) -> bool {
 /// Used by re-signing to confirm a freshly generated signature actually
 /// matches the issuer certificate before committing to it.
 pub fn verify_signature(sig_alg: &[u64], pubkey: &[u8], tbs: &[u8], signature: &[u8]) -> bool {
+    if is_pq(sig_alg) {
+        return pq_verify(sig_alg, pubkey, tbs, signature);
+    }
     match algorithm_for(sig_alg) {
         Some(alg) => signature::UnparsedPublicKey::new(alg, pubkey).verify(tbs, signature).is_ok(),
         None => false,
     }
 }
 
+/// Verify a pure ML-DSA/SLH-DSA signature with OpenSSL. `pubkey` is the raw
+/// `subjectPublicKey` bytes, so the `SubjectPublicKeyInfo` is rebuilt around
+/// them before loading — OpenSSL parses a whole SPKI, not the bare key.
+fn pq_verify(sig_alg: &[u64], pubkey: &[u8], tbs: &[u8], signature: &[u8]) -> bool {
+    let Some(spki) = spki_der(sig_alg, pubkey) else { return false };
+    let Ok(key) = openssl::pkey::PKey::public_key_from_der(&spki) else { return false };
+    let Ok(mut verifier) = openssl::sign::Verifier::new_without_digest(&key) else {
+        return false;
+    };
+    verifier.verify_oneshot(signature, tbs).unwrap_or(false)
+}
+
+/// Sign `tbs` with a pure ML-DSA/SLH-DSA private key (PKCS#8) via OpenSSL's
+/// one-shot signer (no external digest). The algorithm is determined by the
+/// key itself; `sig_alg` only selects this backend.
+fn pq_sign(pkcs8_key: &[u8], tbs: &[u8]) -> Result<Vec<u8>, String> {
+    let key = openssl::pkey::PKey::private_key_from_pkcs8(pkcs8_key)
+        .map_err(|_| "the signing key is not a usable ML-DSA/SLH-DSA key".to_string())?;
+    let mut signer = openssl::sign::Signer::new_without_digest(&key)
+        .map_err(|e| format!("post-quantum signer init failed: {}", e))?;
+    signer.sign_oneshot_to_vec(tbs).map_err(|e| format!("post-quantum signing failed: {}", e))
+}
+
+/// Build a `SubjectPublicKeyInfo` DER — `SEQUENCE { SEQUENCE { OID },
+/// subjectPublicKey BIT STRING }` — for a pure ML-DSA/SLH-DSA algorithm
+/// (parameters absent) and raw public-key bytes.
+fn spki_der(sig_alg: &[u64], pubkey: &[u8]) -> Option<Vec<u8>> {
+    let dotted = sig_alg.iter().map(|a| a.to_string()).collect::<Vec<_>>().join(".");
+    let oid = ber::univ(ber::TAG_OID, false, ber::encode_oid(&dotted).ok()?);
+    let alg_id = ber::univ_seq(vec![oid]);
+    let mut bit_value = Vec::with_capacity(pubkey.len() + 1);
+    bit_value.push(0); // unused-bits octet
+    bit_value.extend_from_slice(pubkey);
+    let bit_string = ber::univ(ber::TAG_BIT_STRING, false, bit_value);
+    Some(ber::encode_node(&ber::univ_seq(vec![alg_id, bit_string])))
+}
+
 /// Whether `sign` can generate a signature for this signature-algorithm OID.
 /// (A subset of what `algorithm_for` can *verify* — `aws-lc-rs` does not sign
 /// with the legacy SHA-1 RSA algorithm.)
 pub fn signing_supported(sig_alg: &[u64]) -> bool {
-    [
-        SHA256_WITH_RSA,
-        SHA384_WITH_RSA,
-        SHA512_WITH_RSA,
-        ECDSA_WITH_SHA256,
-        ECDSA_WITH_SHA384,
-        ED25519_OID,
-    ]
-    .contains(&sig_alg)
+    is_pq(sig_alg)
+        || [
+            SHA256_WITH_RSA,
+            SHA384_WITH_RSA,
+            SHA512_WITH_RSA,
+            ECDSA_WITH_SHA256,
+            ECDSA_WITH_SHA384,
+            ED25519_OID,
+        ]
+        .contains(&sig_alg)
 }
 
 /// Generate a signature over `tbs` (the DER of a `tbsCertificate` /
@@ -120,6 +192,9 @@ pub fn signing_supported(sig_alg: &[u64]) -> bool {
 /// unused-bits octet). Errors if the key and algorithm disagree (e.g. an RSA
 /// key for an ECDSA algorithm) or the algorithm is unsupported for signing.
 pub fn sign(sig_alg: &[u64], pkcs8_key: &[u8], tbs: &[u8]) -> Result<Vec<u8>, String> {
+    if is_pq(sig_alg) {
+        return pq_sign(pkcs8_key, tbs);
+    }
     let rng = aws_lc_rs::rand::SystemRandom::new();
 
     let rsa_padding: Option<&'static dyn signature::RsaEncoding> = if sig_alg == SHA256_WITH_RSA {
@@ -195,12 +270,12 @@ pub fn verify_against(index: &[CaCandidate], signable: &Signable) -> SignatureSt
     let Some(first) = candidates.first() else {
         return SignatureStatus::IssuerNotFound;
     };
-    let Some(alg) = algorithm_for(&signable.sig_alg) else {
+    if !is_pq(&signable.sig_alg) && algorithm_for(&signable.sig_alg).is_none() {
         return SignatureStatus::UnsupportedAlgorithm(oid_string(&signable.sig_alg));
-    };
+    }
     for candidate in &candidates {
-        let public_key = signature::UnparsedPublicKey::new(alg, &candidate.pubkey);
-        if public_key.verify(&signable.tbs, &signable.signature).is_ok() {
+        if verify_signature(&signable.sig_alg, &candidate.pubkey, &signable.tbs, &signable.signature)
+        {
             return SignatureStatus::Verified {
                 issuer_path: candidate.path.clone(),
                 issuer_summary: candidate.subject_summary.clone(),
@@ -300,10 +375,7 @@ fn is_self_signed(s: &Signable) -> bool {
     if *subject != s.issuer {
         return false;
     }
-    let Some(alg) = algorithm_for(&s.sig_alg) else { return false };
-    signature::UnparsedPublicKey::new(alg, pubkey)
-        .verify(&s.tbs, &s.signature)
-        .is_ok()
+    verify_signature(&s.sig_alg, pubkey, &s.tbs, &s.signature)
 }
 
 /// Compute the signer/signed relations of `selected` against every other
@@ -478,6 +550,55 @@ mod tests {
     fn run_openssl(args: &[&str]) {
         let status = std::process::Command::new("openssl").args(args).status().unwrap();
         assert!(status.success(), "openssl {:?} failed", args);
+    }
+
+    /// Build a self-signed certificate for the OpenSSL `algorithm` and confirm
+    /// our parser + verifier accept its signature — the real end-to-end path
+    /// for a post-quantum signature we did not generate ourselves.
+    fn assert_self_signed_pq_verifies(algorithm: &str, tag: &str) {
+        if !openssl_available() {
+            eprintln!("skipping: openssl not installed");
+            return;
+        }
+        let dir = tmp_dir(tag);
+        let key = dir.join("ca.key");
+        let cert = dir.join("ca.der");
+        run_openssl(&["genpkey", "-algorithm", algorithm, "-out", key.to_str().unwrap()]);
+        run_openssl(&[
+            "req", "-x509", "-new", "-key", key.to_str().unwrap(),
+            "-out", cert.to_str().unwrap(), "-outform", "DER",
+            "-days", "365", "-subj", "/CN=PQ Root",
+        ]);
+        match scan_and_verify(&dir, "ca.der") {
+            SignatureStatus::Verified { self_signed, .. } => assert!(self_signed),
+            other => panic!("{}: expected Verified, got {}", algorithm, debug_kind(&other)),
+        }
+        // Flipping a signature byte must break verification.
+        let mut bytes = std::fs::read(&cert).unwrap();
+        let last = bytes.len() - 1;
+        bytes[last] ^= 0xFF;
+        std::fs::write(&cert, &bytes).unwrap();
+        let roots = ber::parse_forest(&bytes, 0).unwrap();
+        if let Some(s) = x509::parse_signable(&roots, &bytes) {
+            let index = x509::scan_dir(&dir);
+            assert!(
+                matches!(verify_against(&index, &s), SignatureStatus::Invalid { .. }),
+                "{}: tampered signature must not verify",
+                algorithm
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn ml_dsa_self_signed_certificate_verifies() {
+        assert_self_signed_pq_verifies("ML-DSA-44", "mldsa-cert");
+    }
+
+    #[test]
+    fn slh_dsa_self_signed_certificate_verifies() {
+        // A fast (`f`) SLH-DSA set keeps signing time reasonable.
+        assert_self_signed_pq_verifies("SLH-DSA-SHA2-128f", "slhdsa-cert");
     }
 
     #[test]

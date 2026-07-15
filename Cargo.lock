@@ -13,8 +13,10 @@ name = "asn1-editor"
 version = "0.1.0"
 dependencies = [
  "aws-lc-rs",
+ "foreign-types",
  "libc",
  "openssl",
+ "openssl-sys",
  "ratatui",
 ]
 
