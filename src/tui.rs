@@ -107,6 +107,7 @@ fn event_loop(terminal: &mut DefaultTerminal, app: &mut App) -> io::Result<()> {
             Mode::Password(_) => handle_password_key(app, key),
             Mode::Resign(_) => handle_resign_key(app, key),
             Mode::EditPubKey(_) => handle_pubkey_key(app, key),
+            Mode::Notice(_) => app.dismiss_notice(), // any key dismisses
             Mode::Browse => {
                 if key.code != KeyCode::Char('q') {
                     app.quit_confirm = false;
@@ -314,6 +315,86 @@ fn draw(frame: &mut Frame, app: &mut App) {
     if matches!(app.mode, Mode::EditPubKey(_)) {
         draw_edit_pubkey(frame, app, main);
     }
+    if matches!(app.mode, Mode::Notice(_)) {
+        draw_notice(frame, app, main);
+    }
+}
+
+/// Centered popup for a dismissible informational notice (used at start-up to
+/// report specification-load warnings).
+fn draw_notice(frame: &mut Frame, app: &App, area: Rect) {
+    let Mode::Notice(ref n) = app.mode else { return };
+    // Wrap each message line to the available width so long parser errors stay
+    // readable; size the popup to the content within the terminal.
+    let max_w = 96.min(area.width.saturating_sub(4).max(20)) as usize;
+    let inner_w = max_w.saturating_sub(2);
+    let mut body: Vec<Line> = Vec::new();
+    for msg in &n.lines {
+        for (i, chunk) in wrap_text(msg, inner_w).into_iter().enumerate() {
+            let bullet = if i == 0 { "• " } else { "  " };
+            body.push(Line::from(vec![
+                Span::styled(bullet, Style::new().fg(Color::Red)),
+                Span::raw(chunk),
+            ]));
+        }
+    }
+    body.push(Line::default());
+    body.push(Line::from(Span::styled("press any key to dismiss", Style::new().dim())));
+
+    let width = (max_w as u16).min(area.width);
+    let height = (body.len() as u16 + 2).min(area.height);
+    let popup = Rect {
+        x: area.x + (area.width.saturating_sub(width)) / 2,
+        y: area.y + (area.height.saturating_sub(height)) / 2,
+        width,
+        height,
+    };
+    frame.render_widget(Clear, popup);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::new().fg(Color::Yellow))
+        .title(n.title.clone());
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+    frame.render_widget(Paragraph::new(body), inner);
+}
+
+/// Break `text` into lines no wider than `width` display columns, splitting on
+/// spaces where possible (falling back to a hard cut for over-long tokens).
+fn wrap_text(text: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let mut lines = Vec::new();
+    let mut cur = String::new();
+    for word in text.split_whitespace() {
+        if word.chars().count() > width {
+            if !cur.is_empty() {
+                lines.push(std::mem::take(&mut cur));
+            }
+            let mut chunk = String::new();
+            for c in word.chars() {
+                if chunk.chars().count() == width {
+                    lines.push(std::mem::take(&mut chunk));
+                }
+                chunk.push(c);
+            }
+            cur = chunk;
+        } else if cur.is_empty() {
+            cur = word.to_string();
+        } else if cur.chars().count() + 1 + word.chars().count() <= width {
+            cur.push(' ');
+            cur.push_str(word);
+        } else {
+            lines.push(std::mem::take(&mut cur));
+            cur = word.to_string();
+        }
+    }
+    if !cur.is_empty() {
+        lines.push(cur);
+    }
+    if lines.is_empty() {
+        lines.push(String::new());
+    }
+    lines
 }
 
 /// Centered three-column popup for the public-key modification dialog:
@@ -1830,6 +1911,7 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
         Mode::EditPubKey(_) => {
             "←→ column  ↑↓ move  Space toggle  type name/password  ⏎ apply  Esc cancel"
         }
+        Mode::Notice(_) => "press any key to dismiss",
     };
     let line = Line::from(vec![
         Span::styled(dirty, Style::new().fg(Color::Red).bold()),

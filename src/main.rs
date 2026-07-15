@@ -71,15 +71,7 @@ fn main() -> ExitCode {
             return usage_error("--out requires a file, not a directory");
         }
         let mut app = App::new_dir(path);
-        if let Some(dir) = spec::default_spec_dir() {
-            let (db, errors) = spec::load_dir(&dir);
-            for e in &errors {
-                eprintln!("warning: spec parse error: {}", e);
-            }
-            if !db.is_empty() {
-                app.set_spec_db(db);
-            }
-        }
+        load_specs_into(&mut app);
         return match tui::run(app) {
             Ok(()) => ExitCode::SUCCESS,
             Err(e) => fail(&format!("terminal error: {}", e)),
@@ -106,19 +98,23 @@ fn main() -> ExitCode {
 
     let out_path = out_path.unwrap_or_else(|| path.clone());
     let mut app = App::new(path, out_path, container, roots, der.len());
-    if let Some(dir) = spec::default_spec_dir() {
-        let (db, errors) = spec::load_dir(&dir);
-        for e in &errors {
-            eprintln!("warning: spec parse error: {}", e);
-        }
-        if !db.is_empty() {
-            app.set_spec_db(db);
-        }
-    }
+    load_specs_into(&mut app);
     match tui::run(app) {
         Ok(()) => ExitCode::SUCCESS,
         Err(e) => fail(&format!("terminal error: {}", e)),
     }
+}
+
+/// Load the bundled ASN.1 specifications into `app`. Any per-file parse errors
+/// are surfaced as a dismissible start-up popup rather than printed to stderr,
+/// which the TUI would immediately overwrite.
+fn load_specs_into(app: &mut App) {
+    let Some(dir) = spec::default_spec_dir() else { return };
+    let (db, errors) = spec::load_dir(&dir);
+    if !db.is_empty() {
+        app.set_spec_db(db);
+    }
+    app.report_spec_errors(errors);
 }
 
 fn usage_error(msg: &str) -> ExitCode {

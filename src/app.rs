@@ -644,6 +644,15 @@ pub enum Mode {
     /// `subjectPublicKeyInfo`): choose an algorithm, optionally generate and
     /// save a new private key, and resign the certificates this one issued.
     EditPubKey(PubKeyState),
+    /// A dismissible informational popup shown over the panes — used at
+    /// start-up to surface specification-load warnings.
+    Notice(NoticeState),
+}
+
+/// Content of a [`Mode::Notice`] popup: a title and the message lines.
+pub struct NoticeState {
+    pub title: String,
+    pub lines: Vec<String>,
 }
 
 /// One signed object (certificate or CRL) issued by the certificate being
@@ -2006,6 +2015,28 @@ impl App {
                 "{} — identified as {} ({})",
                 self.status, ident.type_name, ident.source
             );
+        }
+    }
+
+    /// Surface specification-load `errors` as a dismissible start-up popup —
+    /// stderr is hidden once the TUI owns the terminal, so a failed spec file
+    /// would otherwise vanish silently. A no-op when there are no errors.
+    pub fn report_spec_errors(&mut self, errors: Vec<String>) {
+        if errors.is_empty() {
+            return;
+        }
+        let title = format!(
+            " SPECIFICATION LOAD — {} file{} skipped ",
+            errors.len(),
+            if errors.len() == 1 { "" } else { "s" }
+        );
+        self.mode = Mode::Notice(NoticeState { title, lines: errors });
+    }
+
+    /// Dismiss the start-up notice popup, returning to normal browsing.
+    pub fn dismiss_notice(&mut self) {
+        if matches!(self.mode, Mode::Notice(_)) {
+            self.mode = Mode::Browse;
         }
     }
 
@@ -4498,6 +4529,29 @@ mod tests {
         assert!(app.selected_node().is_none());
         assert_eq!(app.focus, Focus::Browser);
         assert!(!app.browser.rows.is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn spec_load_errors_open_a_dismissible_notice() {
+        let dir = tmp_dir("notice");
+        std::fs::write(dir.join("a.der"), [0x05, 0x00]).unwrap();
+        let mut app = App::new_dir(dir.clone());
+        assert!(matches!(app.mode, Mode::Browse));
+        // No errors: nothing pops up.
+        app.report_spec_errors(vec![]);
+        assert!(matches!(app.mode, Mode::Browse));
+        // Errors: a Notice popup carrying every message.
+        app.report_spec_errors(vec![
+            "rfc9999: expected DEFINITIONS".to_string(),
+            "broken: boom".to_string(),
+        ]);
+        let Mode::Notice(ref n) = app.mode else { panic!("notice popup expected") };
+        assert_eq!(n.lines.len(), 2);
+        assert!(n.title.contains("2 files"), "title was {:?}", n.title);
+        // Any key dismisses it (dismiss_notice), returning to Browse.
+        app.dismiss_notice();
+        assert!(matches!(app.mode, Mode::Browse));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

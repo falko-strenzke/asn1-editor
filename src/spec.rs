@@ -898,6 +898,62 @@ mod tests {
         db
     }
 
+    /// The `specs/` directory shipped with the crate (resolved at compile
+    /// time, so the test is independent of the working directory).
+    fn specs_root() -> std::path::PathBuf {
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("specs")
+    }
+
+    #[test]
+    fn bundled_specs_parse_without_errors() {
+        // Every spec file shipped under specs/ must parse cleanly. A file that
+        // fails is silently skipped at start-up (its types never match), so
+        // guard against it here across every spec sub-directory.
+        let mut dirs_checked = 0usize;
+        for entry in std::fs::read_dir(specs_root()).expect("specs/ directory exists") {
+            let dir = entry.unwrap().path();
+            if !dir.is_dir() {
+                continue;
+            }
+            let (db, errors) = load_dir(&dir);
+            assert!(errors.is_empty(), "spec parse errors in {}: {:?}", dir.display(), errors);
+            assert!(!db.is_empty(), "no types loaded from {}", dir.display());
+            dirs_checked += 1;
+        }
+        assert!(dirs_checked > 0, "no spec directories found under specs/");
+    }
+
+    #[test]
+    fn each_bundled_spec_file_parses_individually() {
+        // Load every file on its own so a failure names the offending file
+        // (load_dir would only report it among the collected errors).
+        let asn1 = specs_root().join("asn1");
+        let mut files = 0usize;
+        for entry in std::fs::read_dir(&asn1).unwrap() {
+            let path = entry.unwrap().path();
+            if !path.is_file() {
+                continue;
+            }
+            let name = path.file_name().unwrap().to_string_lossy().to_string();
+            let text = std::fs::read_to_string(&path).unwrap();
+            parse_spec(&name, &text).unwrap_or_else(|e| panic!("{} failed to parse: {}", name, e));
+            files += 1;
+        }
+        assert!(files >= 7, "expected the bundled RFC modules, found only {}", files);
+    }
+
+    #[test]
+    fn post_quantum_modules_are_loaded() {
+        // The RFC 9881 ML-DSA and RFC 9909 SLH-DSA modules must load; the
+        // ML-DSA private-key types are what label a decrypted ML-DSA key.
+        let (db, errors) = load_dir(&specs_root().join("asn1"));
+        assert!(errors.is_empty(), "{:?}", errors);
+        for name in ["ML-DSA-44-PrivateKey", "ML-DSA-65-PrivateKey", "ML-DSA-87-PrivateKey"] {
+            let def = db.resolve(name).unwrap_or_else(|| panic!("type {} missing", name));
+            assert_eq!(def.source, "rfc9881");
+        }
+    }
+
     #[test]
     fn parses_mini_module() {
         let db = mini_db();
