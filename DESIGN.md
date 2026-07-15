@@ -95,7 +95,8 @@ src/
   oid.rs     curated offline PKI/cryptography OID repository
   spec.rs    ASN.1 specification parser + structural matcher/labeler
   browser.rs far-left file browser: folding directory tree, independent
-             of whatever document (if any) is open
+             of whatever document (if any) is open; refreshed against the
+             filesystem, tagging new/modified/deleted files vs a startup snapshot
   x509.rs    structural decoding of Certificate/CertificateList + a
              recursive directory scan for candidate CA certs; also extracts
              the public-key identity of a private key or certificate for the
@@ -150,8 +151,10 @@ on the `openssl` crate + `ber.rs` (it takes raw DER, not the `Node` tree);
 key and encodes PKCS#8/SPKI; `verify::sign`, via `aws-lc-rs`, does the actual
 signing with it);
 `app.rs` depends on all of the above; `tui.rs` renders `app.rs` and resolves
-OID display names through `oid.rs`. External dependencies: `ratatui`,
-`aws-lc-rs`, `openssl` (the last requires a system OpenSSL to link against).
+OID display names through `oid.rs` and formats file change-times through
+`libc` (`localtime_r`). External dependencies: `ratatui`, `aws-lc-rs`,
+`openssl` (the last requires a system OpenSSL to link against), and `libc`
+(local-time conversion for the browser's change timestamps).
 
 ## 4. Data model
 
@@ -1143,6 +1146,24 @@ Built with ratatui 0.29 (bundled crossterm backend, `ratatui::init()` /
   `Tab` switches keyboard focus between this pane and the document panes;
   the focused pane gets a highlighted border.
 
+  The pane tracks the filesystem live. The event loop calls
+  `App::refresh_filesystem` on a timer (`FS_POLL_INTERVAL`, 750 ms — the
+  input poll already wakes at least every 250 ms); it re-reads the loaded
+  parts of the tree and, when anything changed, also rebuilds the
+  certificate/key indexes so relation arrows and path validation stay
+  consistent with disk. Each entry is classified against a snapshot of
+  modification times taken at startup (`FileBrowser::baseline`, a bounded
+  recursive walk): a **new** file (absent from the baseline) shows a green
+  change-time in a leftmost column, a **modified** file (newer mtime) a
+  yellow one, a **deleted** file is kept visible in gray and struck through
+  (no timestamp), and an unchanged file carries no timestamp. Statuses are
+  sticky for the session — always relative to the startup baseline, not the
+  previous refresh — and a deleted file's row stays (so a key file the
+  program wrote appears the moment it is created, and the selection is
+  preserved by path across a refresh). The change-time column and the legend
+  entries appear only once some visible file carries a status; times are
+  local (`libc::localtime_r`).
+
   Moving the browser selection with any navigation key (`↑↓`/`←→`/
   `PgUp`/`PgDn`/`Home`/`End`) **live-previews the highlighted file** into
   the tree/content panes (`App::preview_browser_selection`), without
@@ -1337,7 +1358,12 @@ existing key file is never overwritten, and that turning off "generate" still
 rekeys without writing a file. Menu-routing tests check that `z` on a
 certificate opens the cryptographic-adjustment menu (re-sign + re-key) and on a
 CRL offers only re-sign, and that the `E` menu gains a trailing *Re-key this
-cert* entry on the SPKI that opens the dialog.
+cert* entry on the SPKI that opens the dialog. Browser-refresh tests check
+that a newly created file appears tagged `New` with a timestamp, a modified
+file (older baseline) `Modified`, a deleted file stays visible as `Deleted`
+with the selection preserved, and an unchanged directory reports no change;
+an app-level test confirms a key file the re-key flow just wrote surfaces as a
+new browser row.
 
 Beyond the automated triples check, the `--dump` output format itself
 (column widths derived from file size, `offset length:` prefix,

@@ -1095,6 +1095,27 @@ impl App {
         self.browser_relations = relations;
     }
 
+    /// Poll the filesystem and update the browser tree (driven on a timer by
+    /// the event loop). When files were added, changed, or removed, also
+    /// rebuild the certificate/key indexes the browser's relation arrows and
+    /// path validation depend on, so the view stays consistent with disk —
+    /// e.g. a key file this program just wrote appears immediately, with its
+    /// key↔certificate link. Returns whether anything changed.
+    pub fn refresh_filesystem(&mut self) -> bool {
+        let changed = self.browser.refresh();
+        if changed {
+            let dir = self.browser.root.clone();
+            self.signables = x509::scan_dir_signables(&dir);
+            self.ca_index = x509::cert_candidates(&self.signables);
+            self.key_files = scan_usable_key_files(&dir);
+            // Re-inserts the open document's live (possibly unsaved) content
+            // over its on-disk copy, and recomputes sig/path status + the
+            // browser relation arrows.
+            self.recompute_sig_status();
+        }
+        changed
+    }
+
     /// Undirected key↔certificate links touching `selected`: the private-key
     /// files (plaintext scans, plus any encrypted key or PKCS#12 whose
     /// password has been supplied this session) matched to the certificate
@@ -4964,6 +4985,17 @@ mod tests {
 
         // The new key registered for links matches the certificate's new key.
         assert!(app.key_files.iter().any(|k| k.path == key_path && k.key == new_pubkey));
+
+        // A filesystem refresh surfaces the freshly written key in the browser,
+        // flagged as a new file.
+        assert!(app.refresh_filesystem(), "the written key is a filesystem change");
+        let key_row = app.browser.rows.iter().find_map(|r| {
+            let e = app.browser.entry_at(&r.path).unwrap();
+            (e.name == "root_new.key").then_some(e)
+        });
+        let key_entry = key_row.expect("the new key file is now a browser row");
+        assert_eq!(key_entry.status, crate::browser::FileStatus::New);
+        assert!(key_entry.changed_at.is_some());
         let _ = std::fs::remove_dir_all(&dir);
     }
 

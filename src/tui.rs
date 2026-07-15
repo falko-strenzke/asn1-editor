@@ -16,7 +16,7 @@
 //! status bar at the bottom.
 
 use std::io;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use ratatui::crossterm::event::{
     self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind,
@@ -33,6 +33,7 @@ use crate::app::{
     RowSource, TextEditor, TextFormat, DATE_FIELDS, EDIT_BYTES_PER_LINE, EDIT_DIGITS_PER_LINE,
     PICKER_CLASSES, PICKER_UNIVERSAL,
 };
+use crate::browser::FileStatus;
 use crate::ber::{
     self, Class, Node, TAG_BIT_STRING, TAG_BOOLEAN, TAG_GENERALIZED_TIME, TAG_INTEGER, TAG_NULL,
     TAG_OID, TAG_UTC_TIME,
@@ -63,9 +64,19 @@ pub fn run(mut app: App) -> io::Result<()> {
     result
 }
 
+/// How often the browser pane is reconciled with the filesystem.
+const FS_POLL_INTERVAL: Duration = Duration::from_millis(750);
+
 fn event_loop(terminal: &mut DefaultTerminal, app: &mut App) -> io::Result<()> {
+    let mut last_fs_poll = Instant::now();
     loop {
         terminal.draw(|f| draw(f, app))?;
+        // Reconcile the browser with the filesystem on a timer (the poll below
+        // wakes at least every 250 ms even when the user is idle).
+        if last_fs_poll.elapsed() >= FS_POLL_INTERVAL {
+            app.refresh_filesystem();
+            last_fs_poll = Instant::now();
+        }
         if !event::poll(Duration::from_millis(250))? {
             continue;
         }
@@ -675,6 +686,34 @@ fn styled_with_marker(
     spans
 }
 
+/// Width of the browser's leftmost change-time column: `HH:MM:SS` + a space.
+const TIMESTAMP_W: usize = 9;
+
+/// A prepared browser row: its display text and style, the open/dirty marker
+/// position, and the optional change-time cell.
+struct BrowserRow {
+    text: String,
+    style: Style,
+    marker_offset: usize,
+    marker_style: Option<Style>,
+    timestamp: Option<(String, Color)>,
+}
+
+/// Format a modification time as local `HH:MM:SS` via `libc::localtime_r`
+/// (std alone cannot resolve the local timezone).
+fn format_hms(t: std::time::SystemTime) -> String {
+    let secs = t
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0) as libc::time_t;
+    // SAFETY: `localtime_r` fills a caller-provided `tm`; both are valid here.
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    unsafe {
+        libc::localtime_r(&secs, &mut tm);
+    }
+    format!("{:02}:{:02}:{:02}", tm.tm_hour, tm.tm_min, tm.tm_sec)
+}
+
 fn draw_browser(frame: &mut Frame, app: &mut App, area: Rect) {
     let active = app.focus == Focus::Browser;
     let open_path = app.file_open.then_some(app.path.as_path());
@@ -683,7 +722,7 @@ fn draw_browser(frame: &mut Frame, app: &mut App, area: Rect) {
     // aligned one column past the longest visible name. `marker_style`,
     // when set, recolors just the single open-marker glyph at
     // `marker_offset` (see `styled_with_marker`).
-    let texts: Vec<(String, Style, usize, Option<Style>)> = app
+    let texts: Vec<BrowserRow> = app
         .browser
         .rows
         .iter()
@@ -696,12 +735,16 @@ fn draw_browser(frame: &mut Frame, app: &mut App, area: Rect) {
             };
             let is_open = open_path == Some(entry.path.as_path());
             let dirty_open = is_open && app.dirty;
-            let mut style = if entry.is_dir {
+            let deleted = entry.status == FileStatus::Deleted;
+            let mut style = if deleted {
+                // A vanished file: gray and struck through, whatever it was.
+                Style::new().fg(Color::DarkGray).add_modifier(Modifier::CROSSED_OUT)
+            } else if entry.is_dir {
                 Style::new().fg(Color::Green).bold()
             } else {
                 Style::new()
             };
-            if is_open {
+            if is_open && !deleted {
                 style = style.fg(Color::LightGreen).bold();
             }
             let prefix = if dirty_open {
@@ -727,10 +770,20 @@ fn draw_browser(frame: &mut Frame, app: &mut App, area: Rect) {
             );
             let marker_offset = row.depth * 2 + fold_marker.chars().count();
             let marker_style = dirty_open.then(|| Style::new().fg(DIRTY_MARKER).bold());
-            (text, style, marker_offset, marker_style)
+            // Leftmost change-time column: green for a new file, yellow for a
+            // modified one; absent (unchanged / deleted) leaves it blank.
+            let timestamp = match (entry.status, entry.changed_at) {
+                (FileStatus::New, Some(t)) => Some((format_hms(t), Color::Green)),
+                (FileStatus::Modified, Some(t)) => Some((format_hms(t), Color::Yellow)),
+                _ => None,
+            };
+            BrowserRow { text, style, marker_offset, marker_style, timestamp }
         })
         .collect();
-    let name_width = texts.iter().map(|(t, ..)| t.chars().count()).max().unwrap_or(0);
+    let name_width = texts.iter().map(|r| r.text.chars().count()).max().unwrap_or(0);
+    // The change-time column is shown only when some visible row carries one.
+    let has_timestamp = texts.iter().any(|r| r.timestamp.is_some());
+    let ts_w = if has_timestamp { TIMESTAMP_W } else { 0 };
 
     let row_paths: Vec<&std::path::Path> = app
         .browser
@@ -756,14 +809,24 @@ fn draw_browser(frame: &mut Frame, app: &mut App, area: Rect) {
     let left_w = usize::from(has_keylink) * ARROW_GUTTER_W + usize::from(has_left) * ARROW_GUTTER_W;
     let inner_w = area.width.saturating_sub(2) as usize; // pane borders
     let name_col_w = name_width
-        .min(inner_w.saturating_sub(left_w + ARROW_GUTTER_W))
+        .min(inner_w.saturating_sub(left_w + ts_w + ARROW_GUTTER_W))
         .max(1);
 
     let items: Vec<ListItem> = texts
         .into_iter()
         .enumerate()
-        .map(|(i, (text, style, marker_offset, marker_style))| {
+        .map(|(i, r)| {
+            let BrowserRow { text, style, marker_offset, marker_style, timestamp } = r;
             let mut spans = Vec::new();
+            // Leftmost column: the file's change time, or blank padding.
+            if has_timestamp {
+                match timestamp {
+                    Some((ts, color)) => {
+                        spans.push(Span::styled(format!("{:<w$}", ts, w = TIMESTAMP_W), Style::new().fg(color)));
+                    }
+                    None => spans.push(Span::raw(" ".repeat(TIMESTAMP_W))),
+                }
+            }
             let gutter_span = |cell: &Option<(String, Color)>| match cell {
                 Some((text, color)) => Span::styled(text.clone(), Style::new().fg(*color).bold()),
                 None => Span::raw(" ".repeat(ARROW_GUTTER_W)),
@@ -795,13 +858,30 @@ fn draw_browser(frame: &mut Frame, app: &mut App, area: Rect) {
         })
         .collect();
     let title = format!(" Files — {} ", app.browser.root.display());
-    let legend = Line::from(vec![
+    let mut legend_spans = vec![
         Span::styled(format!(" {} unsaved ", DIRTY_GLYPH), Style::new().fg(DIRTY_MARKER)),
         Span::styled("─► signer ", Style::new().fg(REL_SIGNER)),
         Span::styled("─► signs ", Style::new().fg(REL_SIGNS)),
         Span::styled("─► bad ", Style::new().fg(REL_BROKEN)),
         Span::styled("── key ", Style::new().fg(REL_KEY)),
-    ]);
+    ];
+    // Only advertise the change indicators once something has changed on disk.
+    let any_new = app.browser.entries_have_status(FileStatus::New);
+    let any_mod = app.browser.entries_have_status(FileStatus::Modified);
+    let any_del = app.browser.entries_have_status(FileStatus::Deleted);
+    if any_new {
+        legend_spans.push(Span::styled("new ", Style::new().fg(Color::Green)));
+    }
+    if any_mod {
+        legend_spans.push(Span::styled("modified ", Style::new().fg(Color::Yellow)));
+    }
+    if any_del {
+        legend_spans.push(Span::styled(
+            "deleted ",
+            Style::new().fg(Color::DarkGray).add_modifier(Modifier::CROSSED_OUT),
+        ));
+    }
+    let legend = Line::from(legend_spans);
     let list = List::new(items)
         .block(
             Block::default()
