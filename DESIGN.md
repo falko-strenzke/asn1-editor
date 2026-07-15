@@ -1069,11 +1069,20 @@ selection. The dialog (`Mode::EditPubKey`) has three columns:
    and RSA-4096 (both SHA-256), followed by the post-quantum ML-DSA-44/65/87
    and the twelve SLH-DSA parameter sets. The list is longer than the popup,
    so this column scrolls to keep the selection visible.
-2. **New private key** — a *generate new private key* checkbox (default on),
-   an editable file-name field (defaulting to `<cert-stem>_<alg>_key.der` and
-   tracking the algorithm until the user edits it), and an optional password
-   (blank ⇒ an unencrypted PKCS#8 key; non-blank ⇒ PBES2/AES-256-CBC, the
-   form §9a can later decrypt).
+2. **New private key** — a radio choosing the key *source*:
+   * **generate new private key** (default): an editable file-name field
+     (defaulting to `<cert-stem>_<alg>_key.der` and tracking the algorithm
+     until the user edits it) and an optional password (blank ⇒ an unencrypted
+     PKCS#8 key; non-blank ⇒ PBES2/AES-256-CBC, the form §9a can later decrypt).
+   * **use existing key**: a list of the private keys available this session —
+     plaintext key files plus any encrypted key or PKCS#12 unlocked with a
+     password — filtered to those *fitting the chosen algorithm*. A key fits
+     when the signature algorithm it produces (derived from its OpenSSL
+     `SubjectPublicKeyInfo`: EC by curve, RSA, Ed25519, or the PQ OID) equals
+     the chosen algorithm's `sig_alg_oid`. A **PKCS#12**-sourced key is offered
+     only when the certificate inside the container shares the *issuer and
+     subject* of the certificate being rekeyed — its key belongs to that
+     certificate (`App::gather_existing_keys`, `certificate_from_safecontents`).
 3. **Resign issued certs** — every signed object the open certificate issued
    (resolved with the same `verify::relations_for` used for the browser
    arrows): certificates first, each shown with its serial number, then the
@@ -1088,17 +1097,16 @@ raw `openssl-sys` FFI (`EVP_PKEY_CTX_new_from_name` → `keygen`, wrapped back
 into a safe `PKey`), since the safe crate's by-name generation does not cover
 SLH-DSA. Everything downstream — PKCS#8 encoding/encryption, SPKI extraction,
 signing — is algorithm-agnostic, so the PQ keys flow through the same code.
-A key pair is always generated in memory (it is what rekeys the certificate
-and resigns the issued certs); the checkbox controls only whether the private
-key is *written to a file*. `keygen` and `pkcs8`/`verify` interoperate cleanly:
-a unit test signs with each generated key and verifies under its own generated
-SPKI, and confirms an encrypted generated key round-trips back through
-`pkcs8::parse`.
+`keygen` and `pkcs8`/`verify` interoperate cleanly: a unit test signs with each
+generated key and verifies under its own generated SPKI, and confirms an
+encrypted generated key round-trips back through `pkcs8::parse`.
 
-On confirm (`App::submit_pubkey`): the target key file is validated (an
-existing file is never overwritten — the dialog stays open); the key is
-generated and, if requested, written; the certificate's `subjectPublicKeyInfo`
-is replaced in the tree (`install_new_public_key`); and — when the certificate
+On confirm (`App::submit_pubkey`): the key material — PKCS#8 + SPKI — is
+obtained either by **generating** a new key (validating the file name, which
+never overwrites an existing file, then writing it) or by loading the chosen
+**existing** key (`signing_materials_for` gives its PKCS#8, OpenSSL derives the
+SPKI); the certificate's `subjectPublicKeyInfo` is replaced in the tree
+(`install_new_public_key`); and — when the certificate
 is **self-signed** under its current key (`sig_status` reports
 `Verified { self_signed: true }`) — both of its `signatureAlgorithm`
 identifiers are switched to the new algorithm and its own signature is
@@ -1108,14 +1116,17 @@ regenerated with the new key, so it stays valid. Each selected issued object
 kind-dependent position): its two `signatureAlgorithm` identifiers are
 rewritten, its re-encoded `tbsCertificate`/`tbsCertList` is signed with the new
 key, the new signature is installed, and the file is written back in its
-original container. The generated key is
-registered for the session (plaintext keys join `key_files`, an encrypted key
-joins `unlocked_keys` with its password retained), so its key↔certificate link
-shows and a later re-sign can reuse it; its identity is read from the SPKI, not
-the private key, since an Ed25519/EC private key may omit its public part. The
-rekeyed certificate itself is left **dirty** for an explicit `s`ave — matching
-the editor's model — while the sibling key and issued-cert files, which are
-not the open document, are written immediately. This whole flow is verified
+original container. A *newly generated* key is registered for the session
+(plaintext keys join `key_files`, an encrypted key joins `unlocked_keys` with
+its password retained), so its key↔certificate link shows and a later re-sign
+can reuse it; its identity is read from the SPKI, not the private key, since an
+Ed25519/EC/PQ private key may omit its public part. An existing key is already
+known, so nothing is written or registered. Finally the rekeyed certificate
+itself is **auto-saved** in place (`write_current`), so that — together with the
+sibling key and issued-object files, written immediately during the operation —
+the whole set is left consistent on disk without a separate `s` (the status
+line reports the save, or a `SAVE FAILED` note if the write did not succeed, in
+which case the document stays dirty for a manual retry). This whole flow is verified
 end to end against the OpenSSL CLI: after rekeying a self-signed root, `openssl
 verify` accepts the root's new self-signature, the resigned intermediate under
 the new root, the full leaf→intermediate→root chain, and (`openssl crl
@@ -1275,10 +1286,11 @@ Built with ratatui 0.29 (bundled crossterm backend, `ratatui::init()` /
   menus (`Mode::EditMenu`, a generic titled list), the
   decrypt password prompt (`Mode::Password`), the re-sign dialog
   (`Mode::Resign`, §9c), and the public-key modification dialog
-  (`Mode::EditPubKey`, §9e — a three-column form: algorithm list, key-generation
-  options, and issued-cert checkboxes, navigated with `←→` between columns,
-  `↑↓` within one, `Space` to toggle a checkbox, and typing to edit the file
-  name / password).
+  (`Mode::EditPubKey`, §9e — a three-column form: algorithm list, key source
+  (generate/use-existing radio with either the file-name/password fields or the
+  list of compatible existing keys), and issued-object checkboxes, navigated
+  with `←→` between columns, `↑↓` within one, `Space` to toggle the radio or a
+  checkbox, and typing to edit the file name / password).
 * **Status bar**: `[modified]` flag, last action / error message, key help.
 
 ### Key bindings
@@ -1383,8 +1395,10 @@ last), that rekeying a self-signed CA resigns it and its issued certificate
 under the new key — classically and to **ML-DSA** — that a selected issued
 *CRL* is likewise resigned and verifies under the new key, that a password
 writes an encrypted key that still signs, that an existing key file is never
-overwritten, and that turning off "generate" still rekeys without writing a
-file. Menu-routing tests check that `z` on a
+overwritten, that **using an existing key** rekeys the certificate to that
+key's public key without writing a new file, and that a PKCS#12-sourced key is
+offered only for the certificate whose issuer/subject match the container's own
+certificate. Menu-routing tests check that `z` on a
 certificate opens the cryptographic-adjustment menu (re-sign + re-key) and on a
 CRL offers only re-sign, and that the `E` menu gains a trailing *Re-key this
 cert* entry on the SPKI that opens the dialog. Browser-refresh tests check

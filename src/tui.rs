@@ -456,19 +456,39 @@ fn draw_edit_pubkey(frame: &mut Frame, app: &App, area: Rect) {
     }
     frame.render_widget(Paragraph::new(alg_lines), alg_col);
 
-    // Column 1: generate checkbox, file name, password.
-    let check = if s.generate { "[x]" } else { "[ ]" };
-    let mask: String = "•".repeat(s.password.chars().count());
-    let opt_lines = vec![
-        header("New private key", s.column == 1),
-        row(format!("{} generate new private key", check), s.option_field == 0, s.column == 1),
+    // Column 1: key-source radio, then either the generate fields (file name,
+    // password) or the list of existing keys fitting the chosen algorithm.
+    let active1 = s.column == 1;
+    let radio_active = active1 && s.option_field == 0;
+    let gen_mark = if s.use_existing { "( )" } else { "(•)" };
+    let use_mark = if s.use_existing { "(•)" } else { "( )" };
+    let mut opt_lines = vec![
+        header("New private key", active1),
+        row(format!("{} generate new private key", gen_mark), !s.use_existing, radio_active),
+        row(format!("{} use existing key", use_mark), s.use_existing, radio_active),
         Line::default(),
-        Line::from(Span::styled(" file name", Style::new().dim())),
-        row(field_value(&s.filename, s.generate), s.option_field == 1, s.column == 1),
-        Line::default(),
-        Line::from(Span::styled(" password (blank = unencrypted)", Style::new().dim())),
-        row(field_value(&mask, s.generate), s.option_field == 2, s.column == 1),
     ];
+    if !s.use_existing {
+        let mask: String = "•".repeat(s.password.chars().count());
+        opt_lines.push(Line::from(Span::styled(" file name", Style::new().dim())));
+        opt_lines.push(row(field_value(&s.filename), s.option_field == 1, active1));
+        opt_lines.push(Line::default());
+        opt_lines.push(Line::from(Span::styled(" password (blank = unencrypted)", Style::new().dim())));
+        opt_lines.push(row(field_value(&mask), s.option_field == 2, active1));
+    } else {
+        let fitting = s.fitting_keys();
+        if fitting.is_empty() {
+            opt_lines.push(Line::from(Span::styled(" (no matching key available)", Style::new().dim())));
+        } else {
+            // Scroll so the selected key stays visible (4 header/radio rows above).
+            let visible = (opt_col.height as usize).saturating_sub(5).max(1);
+            let sel = s.option_field.saturating_sub(1);
+            let start = sel.saturating_sub(visible.saturating_sub(1)).min(fitting.len().saturating_sub(visible));
+            for (i, k) in fitting.iter().enumerate().skip(start).take(visible) {
+                opt_lines.push(row(k.label.clone(), s.option_field == i + 1, active1));
+            }
+        }
+    }
     frame.render_widget(Paragraph::new(opt_lines), opt_col);
 
     // Column 2: issued certificates and CRLs with resign checkboxes.
@@ -493,12 +513,9 @@ fn draw_edit_pubkey(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(Paragraph::new(hint), hint_area);
 }
 
-/// Render a text-field value, dimmed with a placeholder when the field is
-/// inactive because key generation is turned off.
-fn field_value(value: &str, active: bool) -> String {
-    if !active {
-        return "—".to_string();
-    }
+/// Render a text-field value, showing a single-space placeholder when empty so
+/// the highlighted row still has width.
+fn field_value(value: &str) -> String {
     if value.is_empty() {
         " ".to_string()
     } else {

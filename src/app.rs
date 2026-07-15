@@ -667,31 +667,50 @@ pub struct IssuedObject {
     pub selected: bool,
 }
 
-/// State of the public-key modification dialog. A new key pair is always
-/// generated in memory (it is what rekeys the certificate and resigns the
-/// issued certificates); `generate` controls only whether that private key is
-/// also written to a file.
+/// One existing private key offered by the dialog's "use existing key" option:
+/// a plaintext key file, or an encrypted key / PKCS#12 unlocked this session.
+pub struct ExistingKeyChoice {
+    /// Source file (plaintext key, encrypted key, or PKCS#12).
+    pub path: PathBuf,
+    /// Display label (file name plus a source note).
+    pub label: String,
+    /// The X.509 signature-algorithm OID this key signs with — used to filter
+    /// the list to keys fitting the chosen algorithm.
+    pub sig_alg: Vec<u64>,
+    /// Public-key identity, used to fetch the key's PKCS#8 on confirm.
+    pub id: x509::PublicKeyId,
+}
+
+/// State of the public-key modification dialog. The certificate is rekeyed
+/// either with a freshly generated key pair (optionally written to a file) or
+/// with an existing key the user selects (a plaintext or session-unlocked key
+/// fitting the chosen signature algorithm).
 pub struct PubKeyState {
     /// Index into [`keygen::ALL`] of the chosen signature algorithm.
     pub alg_idx: usize,
-    /// Whether to write the generated private key to `filename` (default true).
-    pub generate: bool,
-    /// Target key-file name (in the certificate's directory).
+    /// Key source: `false` = generate a new key (default), `true` = use an
+    /// existing key from [`Self::existing`].
+    pub use_existing: bool,
+    /// Target key-file name for a generated key (in the certificate's directory).
     pub filename: String,
     /// True while `filename` still tracks the algorithm-derived default; set
     /// false once the user edits it, so an algorithm change stops overwriting.
     pub filename_auto: bool,
-    /// Optional password; empty means an unencrypted PKCS#8 key.
+    /// Optional password for a generated key; empty means an unencrypted PKCS#8.
     pub password: String,
+    /// Every available existing key (across all algorithms); filtered to the
+    /// chosen algorithm for display via [`Self::fitting_keys`].
+    pub existing: Vec<ExistingKeyChoice>,
     /// Signed objects issued by this certificate (certs then CRLs), each with
     /// a re-sign checkbox.
     pub issued: Vec<IssuedObject>,
-    /// Active column: 0 = algorithm, 1 = key options, 2 = issued certs.
+    /// Active column: 0 = algorithm, 1 = key options, 2 = issued objects.
     pub column: usize,
-    /// Active field within the key-options column: 0 = generate checkbox,
-    /// 1 = file name, 2 = password.
+    /// Active field within the key-options column: 0 = the generate/use-existing
+    /// radio; in *generate* mode 1 = file name, 2 = password; in *use-existing*
+    /// mode 1 + i = the i-th fitting key.
     pub option_field: usize,
-    /// Selection within the issued-certs column.
+    /// Selection within the issued-objects column.
     pub issued_idx: usize,
 }
 
@@ -700,14 +719,42 @@ impl PubKeyState {
         keygen::ALL[self.alg_idx]
     }
 
+    /// The existing keys fitting the chosen signature algorithm, in list order.
+    pub fn fitting_keys(&self) -> Vec<&ExistingKeyChoice> {
+        let want = self.alg().sig_alg_oid();
+        self.existing.iter().filter(|k| k.sig_alg == want).collect()
+    }
+
+    /// The existing key currently selected (use-existing mode only).
+    fn selected_existing(&self) -> Option<&ExistingKeyChoice> {
+        if !self.use_existing {
+            return None;
+        }
+        let fitting = self.fitting_keys();
+        fitting.get(self.option_field.saturating_sub(1)).copied()
+    }
+
     /// The default key file name for the current algorithm, derived from the
     /// certificate's file stem: `<stem>_<alg>_key.der`.
     fn default_filename(cert_stem: &str, alg: keygen::KeyAlgorithm) -> String {
         format!("{}_{}_key.der", cert_stem, alg.short_name())
     }
 
+    /// The greatest valid `option_field` for the current mode: generate mode
+    /// has the radio (0), file name (1) and password (2); use-existing mode has
+    /// the radio (0) and one row per fitting key (1..=n).
+    fn max_option_field(&self) -> usize {
+        if self.use_existing {
+            self.fitting_keys().len()
+        } else {
+            2
+        }
+    }
+
     fn move_column(&mut self, delta: isize) {
         self.column = (self.column as isize + delta).clamp(0, 2) as usize;
+        // Keep the key-options focus valid for the (possibly different) column.
+        self.option_field = self.option_field.min(self.max_option_field());
     }
 
     fn move_row(&mut self, delta: isize, cert_stem: &str) {
@@ -718,8 +765,13 @@ impl PubKeyState {
                 if self.filename_auto {
                     self.filename = Self::default_filename(cert_stem, self.alg());
                 }
+                // The fitting-key list depends on the algorithm; keep focus valid.
+                self.option_field = self.option_field.min(self.max_option_field());
             }
-            1 => self.option_field = (self.option_field as isize + delta).clamp(0, 2) as usize,
+            1 => {
+                let max = self.max_option_field() as isize;
+                self.option_field = (self.option_field as isize + delta).clamp(0, max) as usize;
+            }
             _ => {
                 if !self.issued.is_empty() {
                     let n = self.issued.len() as isize;
@@ -729,11 +781,13 @@ impl PubKeyState {
         }
     }
 
-    /// Space toggles the generate checkbox (column 1, field 0) or an issued
-    /// certificate's re-sign checkbox (column 2).
+    /// Space toggles the key-source radio (column 1, field 0) or an issued
+    /// object's re-sign checkbox (column 2).
     fn toggle(&mut self) {
         if self.column == 1 && self.option_field == 0 {
-            self.generate = !self.generate;
+            self.use_existing = !self.use_existing;
+            // Land on the first fitting key when switching to use-existing.
+            self.option_field = usize::from(self.use_existing && !self.fitting_keys().is_empty());
         } else if self.column == 2 {
             if let Some(cert) = self.issued.get_mut(self.issued_idx) {
                 cert.selected = !cert.selected;
@@ -742,7 +796,7 @@ impl PubKeyState {
     }
 
     fn insert_char(&mut self, c: char) {
-        if c.is_control() || self.column != 1 {
+        if c.is_control() || self.column != 1 || self.use_existing {
             return;
         }
         match self.option_field {
@@ -756,7 +810,7 @@ impl PubKeyState {
     }
 
     fn backspace(&mut self) {
-        if self.column != 1 {
+        if self.column != 1 || self.use_existing {
             return;
         }
         match self.option_field {
@@ -1429,12 +1483,14 @@ impl App {
         }
         let alg = keygen::ALL[0];
         let issued = self.issued_objects();
+        let existing = self.gather_existing_keys();
         let state = PubKeyState {
             alg_idx: 0,
-            generate: true,
+            use_existing: false,
             filename: PubKeyState::default_filename(&self.cert_file_stem(), alg),
             filename_auto: true,
             password: String::new(),
+            existing,
             issued,
             column: 0,
             option_field: 0,
@@ -1442,7 +1498,102 @@ impl App {
         };
         self.mode = Mode::EditPubKey(state);
         self.status =
-            "choose an algorithm, generate a key, and resign the issued objects".to_string();
+            "choose an algorithm and key source, then resign the issued objects".to_string();
+    }
+
+    /// Collect the private keys available this session for the "use existing
+    /// key" option: every plaintext key file, plus every encrypted key /
+    /// PKCS#12 unlocked with a password. Each is tagged with the signature
+    /// algorithm it signs with (so the dialog can filter by the chosen
+    /// algorithm). A PKCS#12-sourced key is offered only when the certificate
+    /// inside the container shares the issuer and subject of the certificate
+    /// being rekeyed — its key belongs to *that* certificate.
+    fn gather_existing_keys(&self) -> Vec<ExistingKeyChoice> {
+        let der = ber::encode_forest(&self.roots);
+        let target = x509::parse_signable(&self.roots, &der);
+        let target_dn = target.as_ref().map(|s| (s.issuer.clone(), s.subject.clone()));
+
+        let mut out: Vec<ExistingKeyChoice> = Vec::new();
+        let mut seen: Vec<PathBuf> = Vec::new();
+        let push = |path: &Path, id: &x509::PublicKeyId, pkcs8: &[u8], note: &str, out: &mut Vec<ExistingKeyChoice>, seen: &mut Vec<PathBuf>| {
+            if seen.iter().any(|p| p == path) {
+                return;
+            }
+            let Some(sig_alg) = spki_signature_alg_of_pkcs8(pkcs8) else { return };
+            let label = if note.is_empty() {
+                file_name_string(path)
+            } else {
+                format!("{} ({})", file_name_string(path), note)
+            };
+            seen.push(path.to_path_buf());
+            out.push(ExistingKeyChoice { path: path.to_path_buf(), label, sig_alg, id: id.clone() });
+        };
+
+        // Plaintext key files.
+        for kf in &self.key_files {
+            if let Some(pkcs8) = read_plaintext_key_pkcs8(&kf.path) {
+                push(&kf.path, &kf.key, &pkcs8, "", &mut out, &mut seen);
+            }
+        }
+        // Session-unlocked encrypted keys / PKCS#12 containers.
+        for (path, id) in &self.unlocked_keys {
+            let note = match self.unlocked_source_kind(path) {
+                UnlockedKind::Pkcs12 => {
+                    // Only offer it when the PKCS#12's certificate matches the
+                    // certificate being rekeyed (same issuer and subject).
+                    match (&target_dn, self.pkcs12_cert_dn(path)) {
+                        (Some((ti, ts)), Some((ci, cs)))
+                            if *ti == ci && ts.as_deref() == Some(cs.as_slice()) =>
+                        {
+                            "PKCS#12"
+                        }
+                        _ => continue,
+                    }
+                }
+                UnlockedKind::EncryptedKey => "encrypted",
+                UnlockedKind::Unknown => continue,
+            };
+            if let Some(pkcs8) = self.decrypt_key_pkcs8(path, id) {
+                push(path, id, &pkcs8, note, &mut out, &mut seen);
+            }
+        }
+        out
+    }
+
+    /// Classify a session-unlocked key file by its container type.
+    fn unlocked_source_kind(&self, path: &Path) -> UnlockedKind {
+        let Ok(raw) = std::fs::read(path) else { return UnlockedKind::Unknown };
+        let Ok((der, _)) = input::load(&raw) else { return UnlockedKind::Unknown };
+        let Ok(roots) = ber::parse_forest(&der, 0) else { return UnlockedKind::Unknown };
+        if matches!(pkcs12::parse(&roots), Ok(Some(_))) {
+            UnlockedKind::Pkcs12
+        } else if matches!(pkcs8::parse(&roots), Ok(Some(_))) {
+            UnlockedKind::EncryptedKey
+        } else {
+            UnlockedKind::Unknown
+        }
+    }
+
+    /// The `(issuer, subject)` DER of the first certificate inside a
+    /// session-unlocked PKCS#12 container, or `None`.
+    fn pkcs12_cert_dn(&self, path: &Path) -> Option<(Vec<u8>, Vec<u8>)> {
+        let password = self.retained_passwords.get(path)?;
+        let raw = std::fs::read(path).ok()?;
+        let (der, _) = input::load(&raw).ok()?;
+        let roots = ber::parse_forest(&der, 0).ok()?;
+        let p12 = pkcs12::parse(&roots).ok().flatten()?;
+        for region in &p12.regions {
+            if region.kind != pkcs12::RegionKind::EncryptedContent {
+                continue;
+            }
+            let Ok(plain) = region.decrypt(password) else { continue };
+            if let Some(cert_der) = certificate_from_safecontents(&plain) {
+                let croots = ber::parse_forest(&cert_der, 0).ok()?;
+                let signable = x509::parse_signable(&croots, &cert_der)?;
+                return Some((signable.issuer, signable.subject?));
+            }
+        }
+        None
     }
 
     /// The open certificate's file-name stem (without extension), used to
@@ -1538,98 +1689,122 @@ impl App {
     pub fn submit_pubkey(&mut self) {
         let Mode::EditPubKey(ref state) = self.mode else { return };
         let alg = state.alg();
-        let generate = state.generate;
+        let use_existing = state.use_existing;
         let filename = state.filename.clone();
         let password = state.password.clone();
+        let chosen = state
+            .selected_existing()
+            .map(|c| (c.path.clone(), c.id.clone(), c.label.clone()));
         let selected_issued: Vec<PathBuf> =
             state.issued.iter().filter(|c| c.selected).map(|c| c.path.clone()).collect();
 
-        // Validate the target key file before generating anything.
         let dir = self.path.parent().map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
         let key_path = dir.join(&filename);
-        if generate {
-            if filename.trim().is_empty() {
-                self.status = "enter a file name for the new private key".to_string();
-                return; // stay in the dialog
-            }
-            if key_path.exists() {
-                self.status = format!("{} already exists — choose another name", filename);
-                return; // stay in the dialog
-            }
-        }
 
-        let key = match keygen::generate(alg) {
-            Ok(k) => k,
-            Err(e) => {
-                self.mode = Mode::Browse;
-                self.status = e;
-                return;
-            }
-        };
+        // Obtain the key material (PKCS#8 + SPKI), a description for the status
+        // line, and — only for a freshly generated key — the file to register.
+        let (pkcs8, spki, key_part, written): (Vec<u8>, Vec<u8>, String, Option<PathBuf>) =
+            if use_existing {
+                let Some((path, id, label)) = chosen else {
+                    self.status = "select an existing key that fits the chosen algorithm".to_string();
+                    return; // stay in the dialog
+                };
+                let Some(pkcs8) = self.signing_materials_for(&id).into_iter().next() else {
+                    self.status = format!("could not load key {}", file_name_string(&path));
+                    return;
+                };
+                let Some(spki) = spki_der_from_pkcs8(&pkcs8) else {
+                    self.status = "could not derive the public key from the selected key".to_string();
+                    return;
+                };
+                (pkcs8, spki, format!("re-keyed to existing key {}", label), None)
+            } else {
+                if filename.trim().is_empty() {
+                    self.status = "enter a file name for the new private key".to_string();
+                    return; // stay in the dialog
+                }
+                if key_path.exists() {
+                    self.status = format!("{} already exists — choose another name", filename);
+                    return; // stay in the dialog
+                }
+                let key = match keygen::generate(alg) {
+                    Ok(k) => k,
+                    Err(e) => {
+                        self.mode = Mode::Browse;
+                        self.status = e;
+                        return;
+                    }
+                };
+                let der = match key.key_file_der(password.as_bytes()) {
+                    Ok(der) => der,
+                    Err(e) => {
+                        self.mode = Mode::Browse;
+                        self.status = e;
+                        return;
+                    }
+                };
+                if let Err(e) = std::fs::write(&key_path, &der) {
+                    self.mode = Mode::Browse;
+                    self.status = format!("could not write {}: {}", filename, e);
+                    return;
+                }
+                let part = format!("wrote {} key {}", alg.short_name(), filename);
+                (key.pkcs8, key.spki, part, Some(key_path.clone()))
+            };
 
         // Whether the certificate is self-signed under its *current* key, so
         // its own signature must be regenerated with the new key too.
         let self_signed =
             matches!(self.sig_status, Some(SignatureStatus::Verified { self_signed: true, .. }));
 
-        // Write the private-key file, if requested.
-        if generate {
-            let der = match key.key_file_der(password.as_bytes()) {
-                Ok(der) => der,
-                Err(e) => {
-                    self.mode = Mode::Browse;
-                    self.status = e;
-                    return;
-                }
-            };
-            if let Err(e) = std::fs::write(&key_path, &der) {
-                self.mode = Mode::Browse;
-                self.status = format!("could not write {}: {}", filename, e);
-                return;
-            }
-        }
-
         // Replace the certificate's subjectPublicKeyInfo with the new key.
-        if let Err(e) = self.install_new_public_key(&key, alg, self_signed) {
+        if let Err(e) = self.install_new_public_key(&spki, &pkcs8, alg, self_signed) {
             self.mode = Mode::Browse;
             self.status = format!("could not modify the public key: {}", e);
             return;
         }
 
-        // Resign each selected issued certificate with the new key.
+        // Resign each selected issued object with the key.
         let mut resigned = 0usize;
         let mut failures = Vec::new();
         for path in &selected_issued {
-            match resign_issued_file(path, alg, &key.pkcs8) {
+            match resign_issued_file(path, alg, &pkcs8) {
                 Ok(()) => resigned += 1,
                 Err(e) => failures.push(format!("{}: {}", file_name_string(path), e)),
             }
         }
 
-        // Register the new key so its key↔certificate link and any later
-        // re-signing can find it this session.
-        if generate {
-            self.register_generated_key(&key_path, &key.spki, password.as_bytes());
+        // Register a freshly written key so its key↔certificate link and any
+        // later re-signing can find it this session. (An existing key is
+        // already known.)
+        if let Some(ref path) = written {
+            self.register_generated_key(path, &spki, password.as_bytes());
         }
         self.recompute_browser_relations();
 
+        // Auto-save the rekeyed certificate: the issued objects were already
+        // written in place, so persisting this one leaves the whole set
+        // consistent on disk without a separate 's'.
+        let saved = self.write_current();
+
         self.mode = Mode::Browse;
-        self.status = self.pubkey_summary(alg, generate, &filename, resigned, &failures, self_signed);
+        self.status = self.pubkey_summary(&key_part, resigned, &failures, self_signed, &saved);
     }
 
-    /// Splice the generated `SubjectPublicKeyInfo` into the open certificate,
-    /// re-signing the certificate itself when it is self-signed (so it stays
-    /// valid under the new key). Leaves the document dirty for `save`.
+    /// Splice the `SubjectPublicKeyInfo` `spki` into the open certificate,
+    /// re-signing the certificate itself with `pkcs8` when it is self-signed (so
+    /// it stays valid under the new key). Leaves the document dirty for `save`.
     fn install_new_public_key(
         &mut self,
-        key: &keygen::GeneratedKey,
+        spki: &[u8],
+        pkcs8: &[u8],
         alg: keygen::KeyAlgorithm,
         self_signed: bool,
     ) -> Result<(), String> {
         let paths = cert_paths(&self.roots).ok_or("the open document is not a certificate")?;
         let spki_nodes =
-            ber::parse_forest(&key.spki, 0).map_err(|e| format!("bad generated SPKI: {}", e))?;
-        let spki_node = spki_nodes.into_iter().next().ok_or("empty generated SPKI")?;
+            ber::parse_forest(spki, 0).map_err(|e| format!("bad SPKI: {}", e))?;
+        let spki_node = spki_nodes.into_iter().next().ok_or("empty SPKI")?;
         *node_at_mut(&mut self.roots, &paths.spki).ok_or("SPKI node missing")? = spki_node;
 
         if self_signed {
@@ -1652,7 +1827,7 @@ impl App {
             let der = ber::encode_forest(&self.roots);
             let signable =
                 x509::parse_signable(&self.roots, &der).ok_or("re-encoded document is not a certificate")?;
-            let sig = verify::sign(alg.sig_alg_oid(), &key.pkcs8, &signable.tbs)?;
+            let sig = verify::sign(alg.sig_alg_oid(), pkcs8, &signable.tbs)?;
             let sig_node = node_at_mut(&mut self.roots, &paths.outer_sig).ok_or("signature node missing")?;
             sig_node.value = std::iter::once(0u8).chain(sig).collect();
             sig_node.children.clear();
@@ -1683,21 +1858,16 @@ impl App {
         }
     }
 
-    /// Compose the status line summarizing what the confirmation did.
+    /// Compose the status line summarizing what the confirmation did, including
+    /// the auto-save outcome.
     fn pubkey_summary(
         &self,
-        alg: keygen::KeyAlgorithm,
-        generate: bool,
-        filename: &str,
+        key_part: &str,
         resigned: usize,
         failures: &[String],
         self_signed: bool,
+        saved: &Result<usize, String>,
     ) -> String {
-        let key_part = if generate {
-            format!("wrote {} key {}", alg.short_name(), filename)
-        } else {
-            format!("generated a {} key (not saved)", alg.short_name())
-        };
         let cert_part = if self_signed {
             "certificate re-signed with the new key"
         } else {
@@ -1708,7 +1878,10 @@ impl App {
         if !failures.is_empty() {
             summary.push_str(&format!(" ({} failed: {})", failures.len(), failures.join("; ")));
         }
-        summary.push_str(" — 's' saves this certificate");
+        match saved {
+            Ok(_) => summary.push_str(&format!(" — saved {}", file_name_string(&self.out_path))),
+            Err(e) => summary.push_str(&format!(" — SAVE FAILED ({}); 's' retries", e)),
+        }
         summary
     }
 
@@ -3197,19 +3370,21 @@ impl App {
             self.status = "no file open — select one in the browser first".to_string();
             return;
         }
+        match self.write_current() {
+            Ok(n) => self.status = format!("wrote {} bytes to {}", n, self.out_path.display()),
+            Err(e) => self.status = e,
+        }
+    }
+
+    /// Write the current document to `out_path` and clear the dirty flag,
+    /// returning the byte count. Does not touch `status` — the caller composes
+    /// the message. `file_open` is assumed (the caller checks).
+    fn write_current(&mut self) -> Result<usize, String> {
         let der = ber::encode_forest(&self.roots);
         let out = input::wrap(&der, &self.container);
-        match std::fs::write(&self.out_path, &out) {
-            Ok(()) => {
-                self.dirty = false;
-                self.status = format!(
-                    "wrote {} bytes to {}",
-                    out.len(),
-                    self.out_path.display()
-                );
-            }
-            Err(e) => self.status = format!("write failed: {}", e),
-        }
+        std::fs::write(&self.out_path, &out).map_err(|e| format!("write failed: {}", e))?;
+        self.dirty = false;
+        Ok(out.len())
     }
 }
 
@@ -3427,6 +3602,93 @@ fn cert_serial_hex(roots: &[Node]) -> Option<String> {
     let paths = cert_paths(roots)?;
     let node = node_at(roots, &paths.serial)?;
     Some(ber::hex_pairs(&node.value))
+}
+
+/// The container type of a session-unlocked key file.
+enum UnlockedKind {
+    Pkcs12,
+    EncryptedKey,
+    Unknown,
+}
+
+// Public-key and signature-algorithm OIDs used to map a key to the X.509
+// signature algorithm it produces.
+const OID_EC_PUBLIC_KEY: &[u64] = &[1, 2, 840, 10045, 2, 1];
+const OID_CURVE_P256: &[u64] = &[1, 2, 840, 10045, 3, 1, 7];
+const OID_CURVE_P384: &[u64] = &[1, 3, 132, 0, 34];
+const OID_RSA_ENCRYPTION: &[u64] = &[1, 2, 840, 113549, 1, 1, 1];
+const OID_ED25519: &[u64] = &[1, 3, 101, 112];
+const OID_ECDSA_SHA256: &[u64] = &[1, 2, 840, 10045, 4, 3, 2];
+const OID_ECDSA_SHA384: &[u64] = &[1, 2, 840, 10045, 4, 3, 3];
+const OID_SHA256_RSA: &[u64] = &[1, 2, 840, 113549, 1, 1, 11];
+
+/// Derive the `SubjectPublicKeyInfo` DER of a private key given as PKCS#8,
+/// using OpenSSL (works for every supported algorithm, including keys whose
+/// public part is not embedded in the private key).
+fn spki_der_from_pkcs8(pkcs8: &[u8]) -> Option<Vec<u8>> {
+    openssl::pkey::PKey::private_key_from_pkcs8(pkcs8).ok()?.public_key_to_der().ok()
+}
+
+/// The X.509 `signatureAlgorithm` OID a private key produces, by deriving its
+/// `SubjectPublicKeyInfo` with OpenSSL and mapping the public-key algorithm
+/// (and, for EC, the named curve) to a signature algorithm — the value the
+/// dialog matches against the chosen algorithm's `sig_alg_oid`.
+fn spki_signature_alg_of_pkcs8(pkcs8: &[u8]) -> Option<Vec<u64>> {
+    let pkey = openssl::pkey::PKey::private_key_from_pkcs8(pkcs8).ok()?;
+    let spki = pkey.public_key_to_der().ok()?;
+    let roots = ber::parse_forest(&spki, 0).ok()?;
+    let alg = roots.first()?.children.first()?;
+    let oid = alg.children.first().and_then(|o| ber::oid_arcs(&o.value))?;
+    match oid.as_slice() {
+        OID_EC_PUBLIC_KEY => {
+            let curve = alg.children.get(1).and_then(|c| ber::oid_arcs(&c.value))?;
+            match curve.as_slice() {
+                OID_CURVE_P256 => Some(OID_ECDSA_SHA256.to_vec()),
+                OID_CURVE_P384 => Some(OID_ECDSA_SHA384.to_vec()),
+                _ => None,
+            }
+        }
+        OID_RSA_ENCRYPTION => Some(OID_SHA256_RSA.to_vec()),
+        OID_ED25519 => Some(OID_ED25519.to_vec()),
+        // Pure ML-DSA/SLH-DSA: the signature algorithm is the key OID itself.
+        [2, 16, 840, 1, 101, 3, 4, 3, arc] if (17..=31).contains(arc) => Some(oid.clone()),
+        _ => None,
+    }
+}
+
+/// Extract the DER of the first X.509 certificate held in a PKCS#12
+/// `SafeContents` (`SEQUENCE OF SafeBag`), decoding the `certBag` → `CertBag`
+/// → `certValue` OCTET STRING. `None` if there is no certificate bag.
+fn certificate_from_safecontents(safe_contents_der: &[u8]) -> Option<Vec<u8>> {
+    const OID_CERT_BAG: &[u64] = &[1, 2, 840, 113549, 1, 12, 10, 1, 3];
+    let explicit_0 = |node: &Node| -> Option<Node> {
+        (node.class == Class::ContextSpecific && node.tag == 0 && node.constructed)
+            .then(|| node.children.first().cloned())
+            .flatten()
+    };
+    let oid_of = |node: &Node| -> Option<Vec<u64>> {
+        (!node.constructed && node.is_universal(ber::TAG_OID)).then(|| ber::oid_arcs(&node.value)).flatten()
+    };
+    let roots = ber::parse_forest(safe_contents_der, 0).ok()?;
+    let safe_contents = roots.first()?;
+    if !safe_contents.is_universal(ber::TAG_SEQUENCE) {
+        return None;
+    }
+    for bag in &safe_contents.children {
+        // SafeBag ::= SEQUENCE { bagId OID, bagValue [0] EXPLICIT ANY, ... }
+        let Some(bag_id) = bag.children.first().and_then(&oid_of) else { continue };
+        if bag_id != OID_CERT_BAG {
+            continue;
+        }
+        // bagValue [0] holds CertBag ::= SEQUENCE { certId OID, certValue [0]
+        // EXPLICIT OCTET STRING }.
+        let Some(cert_bag) = bag.children.get(1).and_then(&explicit_0) else { continue };
+        let Some(cert_value) = cert_bag.children.get(1).and_then(&explicit_0) else { continue };
+        if !cert_value.constructed && cert_value.is_universal(ber::TAG_OCTET_STRING) || cert_value.encapsulates {
+            return Some(cert_value.content_octets());
+        }
+    }
+    None
 }
 
 pub fn node_at<'a>(roots: &'a [Node], path: &[usize]) -> Option<&'a Node> {
@@ -4958,7 +5220,7 @@ mod tests {
         assert!(entries[0].1.starts_with('#'), "a certificate shows its serial");
         assert_eq!(entries[1], ("root_crl.der", "CRL"));
         assert!(s.issued.iter().all(|c| c.selected), "issued objects are checked by default");
-        assert!(s.generate, "generate is on by default");
+        assert!(!s.use_existing, "generate is the default key source");
         assert!(s.filename.contains("p256")); // first algorithm's short name
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -5038,7 +5300,9 @@ mod tests {
         }
         app.submit_pubkey();
         assert!(matches!(app.mode, Mode::Browse));
-        assert!(app.dirty, "the rekeyed certificate is left unsaved");
+        // The rekeyed certificate is auto-saved (no separate 's').
+        assert!(!app.dirty, "the rekeyed certificate should be saved automatically");
+        assert!(app.status.contains("saved"), "status: {}", app.status);
 
         // The key file was written and is a usable plaintext PKCS#8.
         let key_path = dir.join("root_new.key");
@@ -5046,7 +5310,7 @@ mod tests {
         assert!(read_plaintext_key_pkcs8(&key_path).is_some());
 
         // The open certificate now carries the new key and, being self-signed,
-        // verifies under it. Save it so the on-disk copy matches.
+        // verifies under it; the on-disk copy already matches (auto-saved).
         let new_pubkey = x509::public_key_id_of_signable(
             &x509::parse_signable(&app.roots, &ber::encode_forest(&app.roots)).unwrap(),
         )
@@ -5055,7 +5319,9 @@ mod tests {
         let s = x509::parse_signable(&app.roots, &der).unwrap();
         assert_eq!(s.sig_alg, keygen::KeyAlgorithm::Ed25519.sig_alg_oid());
         assert!(verify::verify_signature(&s.sig_alg, s.pubkey.as_ref().unwrap(), &s.tbs, &s.signature));
-        app.save();
+        // The on-disk root_ca.der reflects the new key too.
+        let on_disk = cert_pubkey(&dir.join("root_ca.der")).1;
+        assert_eq!(on_disk, s.pubkey.clone().unwrap(), "auto-saved cert matches the new key");
 
         // The issued intermediate was resigned on disk under the new key, with
         // the new signature algorithm.
@@ -5224,26 +5490,96 @@ mod tests {
     }
 
     #[test]
-    fn not_generating_still_rekeys_but_writes_no_key_file() {
-        let dir = copy_chain("pk-nogen");
+    fn rekeying_with_an_existing_key() {
+        let dir = copy_chain("pk-existing");
+        // A spare plaintext Ed25519 key already in the directory.
+        let spare = keygen::generate(keygen::KeyAlgorithm::Ed25519).unwrap();
+        std::fs::write(dir.join("spare_ed25519.der"), &spare.pkcs8).unwrap();
+        let spare_id = public_key_id_from_spki(&spare.spki).unwrap();
+
         let mut app = open_real_file(&dir.join("root_ca.der"));
         app.select(spki_row(&app));
         app.edit_selected();
-        let filename = if let Mode::EditPubKey(ref mut s) = app.mode {
+        if let Mode::EditPubKey(ref mut s) = app.mode {
             s.alg_idx = keygen::ALL.iter().position(|a| *a == keygen::KeyAlgorithm::Ed25519).unwrap();
-            s.generate = false;
-            s.filename.clone()
-        } else {
-            panic!("dialog");
-        };
+            s.use_existing = true;
+            // The spare key fits the Ed25519 algorithm and is offered.
+            let labels: Vec<&str> = s.fitting_keys().iter().map(|k| k.label.as_str()).collect();
+            assert!(
+                labels.iter().any(|l| l.contains("spare_ed25519.der")),
+                "spare key not offered: {:?}",
+                labels
+            );
+            s.option_field = 1; // select the first fitting key
+        }
         app.submit_pubkey();
-        // No key file was written, but the certificate was rekeyed (dirty) and
-        // its self-signature still verifies under the discarded key.
-        assert!(!dir.join(&filename).exists());
-        assert!(app.dirty);
+        assert!(matches!(app.mode, Mode::Browse), "status: {}", app.status);
+
+        // The certificate now carries the spare key's public key and, being
+        // self-signed, verifies under it — with the Ed25519 signature algorithm.
         let der = ber::encode_forest(&app.roots);
         let s = x509::parse_signable(&app.roots, &der).unwrap();
+        assert_eq!(s.sig_alg, keygen::KeyAlgorithm::Ed25519.sig_alg_oid());
         assert!(verify::verify_signature(&s.sig_alg, s.pubkey.as_ref().unwrap(), &s.tbs, &s.signature));
+        assert_eq!(x509::public_key_id_of_signable(&s).unwrap(), spare_id);
+        // No new key file was created; the spare key is reused in place.
+        assert!(dir.join("spare_ed25519.der").exists());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn a_pkcs12_key_is_offered_only_when_its_certificate_matches() {
+        let dir = tmp_dir("pk-p12match");
+        std::fs::copy("testdata/pkcs12.der", dir.join("bundle.p12")).unwrap();
+        // Extract the certificate the PKCS#12 holds and save it as one target.
+        let (p12der, _) = input::load(&std::fs::read("testdata/pkcs12.der").unwrap()).unwrap();
+        let p12roots = ber::parse_forest(&p12der, 0).unwrap();
+        let p12 = pkcs12::parse(&p12roots).unwrap().unwrap();
+        let cert_der = p12
+            .regions
+            .iter()
+            .filter(|r| r.kind == pkcs12::RegionKind::EncryptedContent)
+            .find_map(|r| certificate_from_safecontents(&r.decrypt(b"asn1editor").ok()?))
+            .expect("a certificate inside the PKCS#12");
+        std::fs::write(dir.join("p12cert.der"), &cert_der).unwrap();
+        // A different certificate (different issuer/subject) as the other target.
+        std::fs::copy("testdata/chain/root_ca.der", dir.join("other.der")).unwrap();
+
+        // Open the PKCS#12 and unlock it (populates unlocked_keys this session).
+        let mut app = open_real_file(&dir.join("bundle.p12"));
+        app.start_decrypt();
+        if let Mode::Password(ref mut p) = app.mode {
+            for c in "asn1editor".chars() {
+                p.insert_char(c);
+            }
+        }
+        app.submit_password();
+        assert!(!app.unlocked_keys.is_empty(), "PKCS#12 not unlocked");
+
+        // Matching target: the PKCS#12's EC key (default ECDSA P-256 algorithm) is offered.
+        app.open_file(dir.join("p12cert.der")).unwrap();
+        app.start_rekey();
+        let offered = |app: &App| -> Vec<String> {
+            match app.mode {
+                Mode::EditPubKey(ref s) => s.fitting_keys().iter().map(|k| k.label.clone()).collect(),
+                _ => Vec::new(),
+            }
+        };
+        assert!(
+            offered(&app).iter().any(|l| l.contains("bundle.p12")),
+            "PKCS#12 key not offered for its own certificate: {:?}",
+            offered(&app)
+        );
+
+        // Non-matching target: the same PKCS#12 key is NOT offered.
+        app.cancel_pubkey();
+        app.open_file(dir.join("other.der")).unwrap();
+        app.start_rekey();
+        assert!(
+            !offered(&app).iter().any(|l| l.contains("bundle.p12")),
+            "PKCS#12 key wrongly offered for an unrelated certificate: {:?}",
+            offered(&app)
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
