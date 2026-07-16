@@ -20,7 +20,6 @@ use std::path::{Path, PathBuf};
 
 use ratatui::widgets::ListState;
 
-use crate::basic_constraints;
 use crate::ber::{self, Class, Node};
 use crate::browser::FileBrowser;
 use crate::input::{self, Container};
@@ -30,7 +29,7 @@ use crate::pkcs12;
 use crate::pkcs8;
 use crate::spec::{self, Identification, Label, SpecDb};
 use crate::verify::{self, FileRelations, SignatureStatus};
-use crate::x509::{self, CaCandidate, Kind, Signable, SignableFile};
+use crate::x509::{self, basic_constraints, CaCandidate, Kind, Signable, SignableFile};
 
 /// Bytes per line in the hex editor; the cursor moves in units of hex digits.
 pub const EDIT_BYTES_PER_LINE: usize = 16;
@@ -896,6 +895,11 @@ impl BcEditState {
             if self.path_len.len() < 6 {
                 self.path_len.push(c);
             }
+            // Normalise leading zeros so it reads as a plain integer field
+            // (e.g. default "0" + "5" -> "5", not "05").
+            while self.path_len.len() > 1 && self.path_len.starts_with('0') {
+                self.path_len.remove(0);
+            }
         }
     }
 
@@ -906,12 +910,12 @@ impl BcEditState {
     }
 
     /// The `pathLenConstraint` value to encode: `None` unless cA is asserted
-    /// and the constraint is present with a parseable value.
+    /// and the constraint is present. An empty field encodes as 0.
     fn path_len_value(&self) -> Option<u32> {
         if !self.ca || !self.path_len_present {
             return None;
         }
-        self.path_len.parse().ok()
+        Some(self.path_len.parse().unwrap_or(0))
     }
 }
 
@@ -1593,7 +1597,8 @@ impl App {
             critical,
             ca,
             path_len_present: path_len.is_some(),
-            path_len: path_len.unwrap_or_default(),
+            // The integer field always carries a value; absent defaults to 0.
+            path_len: path_len.unwrap_or_else(|| "0".to_string()),
             field: 0,
         });
         self.status =
@@ -4081,6 +4086,27 @@ mod tests {
         assert!(!bc.ca);
         // pathLenConstraint must not be emitted when cA is FALSE (RFC 5280).
         assert_eq!(bc.path_len, None);
+    }
+
+    #[test]
+    fn basic_constraints_editor_defaults_absent_path_len_to_zero() {
+        // root_ca is cA=TRUE with no pathLenConstraint.
+        let mut app = cert_app("testdata/chain/root_ca.der");
+        let idx = bc_row(&app);
+        app.select(idx);
+        app.start_basic_constraints();
+        {
+            let Mode::EditBasicConstraints(ref s) = app.mode else { panic!("editor") };
+            assert!(!s.path_len_present, "constraint starts absent");
+            assert_eq!(s.path_len, "0", "the integer field defaults to 0 when absent");
+        }
+        // Turning the constraint on without touching the value encodes pathLen 0.
+        app.bc_move_field(1); // present toggle
+        app.bc_toggle();
+        app.commit_basic_constraints();
+        let bc = current_bc(&app);
+        assert!(bc.ca);
+        assert_eq!(bc.path_len.as_deref(), Some("0"));
     }
 
     #[test]

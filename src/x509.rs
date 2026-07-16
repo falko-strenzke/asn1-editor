@@ -22,6 +22,8 @@
 
 use std::path::{Path, PathBuf};
 
+pub mod basic_constraints;
+
 use crate::ber::{
     self, Class, Node, TAG_BIT_STRING, TAG_GENERALIZED_TIME, TAG_INTEGER, TAG_OCTET_STRING,
     TAG_OID, TAG_SEQUENCE, TAG_UTC_TIME,

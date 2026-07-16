@@ -33,7 +33,7 @@ use crate::app::{
     RowSource, TextEditor, TextFormat, DATE_FIELDS, EDIT_BYTES_PER_LINE, EDIT_DIGITS_PER_LINE,
     PICKER_CLASSES, PICKER_UNIVERSAL,
 };
-use crate::basic_constraints;
+use crate::x509::basic_constraints;
 use crate::browser::FileStatus;
 use crate::ber::{
     self, Class, Node, TAG_BIT_STRING, TAG_BOOLEAN, TAG_GENERALIZED_TIME, TAG_INTEGER, TAG_NULL,
@@ -671,7 +671,7 @@ fn draw_basic_constraints(frame: &mut Frame, app: &App, area: Rect) {
         ]),
         Line::from(vec![
             Span::styled("  value            ", path_len_dim),
-            Span::styled(format!("[{}]", value_text), active(2).patch(path_len_dim)),
+            Span::styled(value_text, active(2).patch(path_len_dim)),
         ]),
     ];
     if !s.ca {

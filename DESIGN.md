@@ -121,8 +121,9 @@ src/
   pkcs12.rs  structural decoding + password decryption/re-encryption of
              PKCS#12 (PFX) containers; reuses pkcs8::Pbes2 for the regions
              and the openssl crate for the MacData HMAC (RFC 7292 App. B KDF)
-  basic_constraints.rs  structural decoding, interpretation and re-encoding of
-             the X.509 BasicConstraints extension (structural only, no crypto)
+  x509/basic_constraints.rs  structural decoding, interpretation and
+             re-encoding of the X.509 BasicConstraints extension (a submodule
+             of x509; structural only, no crypto)
   app.rs     application state: tree, flattened rows, selection, edit logic
   tui.rs     ratatui event loop and rendering (no business logic)
 tests/
@@ -161,7 +162,7 @@ digest primitives); `pathval.rs` depends
 on the `openssl` crate + `ber.rs` (it takes raw DER, not the `Node` tree);
 `keygen.rs` depends on `openssl` + `openssl-sys`/`foreign-types` (raw FFI for
 by-name PQ key generation) + `ber.rs` (`verify::sign` does the actual signing);
-`basic_constraints.rs` depends only on `ber.rs` (structural, no crypto);
+`x509::basic_constraints` depends only on `ber.rs` (structural, no crypto);
 `app.rs` depends on all of the above; `tui.rs` renders `app.rs` and resolves
 OID display names through `oid.rs` and formats file change-times through
 `libc` (POSIX `localtime_r` / Windows `localtime_s`). External dependencies: `ratatui`, `aws-lc-rs`,
@@ -1154,14 +1155,15 @@ now data-driven: `MenuState` carries a title and a `Vec<MenuItem>`, and each
 menu machinery renders the five base edit modes, the optional trailing
 **Re-key this cert**, and the two cryptographic adjustments.
 
-## 9f. Basic Constraints interpretation and structured editing (`src/basic_constraints.rs`)
+## 9f. Basic Constraints interpretation and structured editing (`src/x509/basic_constraints.rs`)
 
 The X.509 `BasicConstraints` extension (RFC 5280 §4.2.1.9,
 `id-ce-basicConstraints` = 2.5.29.19) gets a dedicated read and edit path so
 the user does not have to reason about the raw `cA` / `pathLenConstraint`
 encoding.
 
-`basic_constraints.rs` walks a `ber::Node` positionally, like `x509.rs`. It
+`x509::basic_constraints` (`src/x509/basic_constraints.rs`, a submodule of
+`x509`) walks a `ber::Node` positionally, like `x509.rs` itself. It
 operates on the **outer `Extension` SEQUENCE** (`{ extnID, critical?,
 extnValue }`) — the node the user selects in the tree — so one node drives
 everything. `value_index` recognises the extension (first child is the
@@ -1178,7 +1180,8 @@ enclosing extension's `critical` flag.
 
 * **Structured editor.** `Mode::EditBasicConstraints(BcEditState)` is a small
   form editing the two fields "in a natural way": `cA` as a boolean, and
-  `pathLenConstraint` as a present/absent toggle plus a numeric value. It is
+  `pathLenConstraint` as a present/absent toggle plus a plain integer field
+  (which defaults to `0` when the constraint is currently absent). It is
   reached by **`e`** on the extension's outer SEQUENCE (`edit_selected` routes
   there before the generic type-specific editor) and by the **As Basic
   Constraints** entry appended to the `E` edit menu (a new `MenuAction`). On
