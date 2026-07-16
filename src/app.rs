@@ -2971,14 +2971,23 @@ impl App {
     /// or it is not a certificate.
     pub fn recompute_path_status(&mut self) {
         let der = ber::encode_forest(&self.roots);
-        let is_cert = self.file_open
-            && x509::parse_signable(&self.roots, &der)
-                .map(|s| s.kind == Kind::Certificate)
-                .unwrap_or(false);
-        if !is_cert {
+        // The certificate whose path is validated: the open document itself
+        // when it is a certificate, or — for a CMS signed message — its signer
+        // certificate (its chain to a trust anchor is what "path" means here).
+        let target_der = if !self.file_open {
+            None
+        } else if x509::parse_signable(&self.roots, &der)
+            .is_some_and(|s| s.kind == Kind::Certificate)
+        {
+            Some(der.clone())
+        } else {
+            x509::parse_cms_signed(&self.roots, &der)
+                .and_then(|cms| self.cms_signer_cert_der(&cms))
+        };
+        let Some(target_der) = target_der else {
             self.path_status = None;
             return;
-        }
+        };
         let mut trusted = Vec::new();
         let mut untrusted = Vec::new();
         for file in &self.signables {
@@ -3000,7 +3009,19 @@ impl App {
                 untrusted.push(cert_der);
             }
         }
-        self.path_status = Some(pathval::validate(&der, &trusted, &untrusted));
+        self.path_status = Some(pathval::validate(&target_der, &trusted, &untrusted));
+    }
+
+    /// The raw DER of the certificate that signed a CMS message (matched by the
+    /// SignerInfo's issuer + serial among the scanned certificates), read from
+    /// disk. `None` when the signer certificate is not in the folder.
+    fn cms_signer_cert_der(&self, cms: &x509::CmsSigned) -> Option<Vec<u8>> {
+        let signer = self.signables.iter().find(|f| {
+            f.signable.kind == Kind::Certificate
+                && f.signable.issuer == cms.issuer
+                && f.signable.serial.as_deref() == Some(cms.serial.as_slice())
+        })?;
+        read_cert_der(&signer.path)
     }
 
     /// `t`: toggle whether the certificate selected in the browser is a trust
@@ -5912,6 +5933,37 @@ mod tests {
         let edge = app.browser_relations.signed_by.clone().expect("signer edge");
         assert!(edge.other.ends_with("keylink/cert_ec.der"), "{:?}", edge.other);
         assert!(edge.verified);
+    }
+
+    #[test]
+    fn cms_message_path_is_validated_via_its_signer_certificate() {
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("testdata");
+        let mut app = App::new_dir(dir.clone());
+        browser_select_by_name(&mut app, "cms_signed.der");
+        app.preview_browser_selection();
+        // A "Path" status exists for a CMS message (its signer's chain), and
+        // with no trust anchor marked there is no valid path.
+        assert!(
+            matches!(app.path_status, Some(PathStatus::Invalid { .. })),
+            "{:?}",
+            app.path_status
+        );
+        // Trusting the (self-signed) signer certificate makes the path valid —
+        // exactly as trusting a certificate's own anchor would.
+        app.trusted_certs.insert(dir.join("keylink/cert_ec.der"));
+        app.recompute_path_status();
+        assert!(
+            matches!(app.path_status, Some(PathStatus::Valid { .. })),
+            "{:?}",
+            app.path_status
+        );
+    }
+
+    #[test]
+    fn cms_path_is_not_validated_in_single_file_mode() {
+        // No directory scan → no signer certificate → no path status.
+        let app = single_file_app("testdata/cms_signed.der");
+        assert!(app.path_status.is_none());
     }
 
     #[test]

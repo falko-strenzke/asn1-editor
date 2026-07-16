@@ -2790,6 +2790,36 @@ mod tests {
     }
 
     #[test]
+    fn cms_message_content_pane_shows_signature_and_path_lines() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let root = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+        let dir = root.join("testdata");
+        let mut app = App::new_dir(dir.clone());
+        let idx = app
+            .browser
+            .rows
+            .iter()
+            .position(|r| {
+                app.browser.entry_at(&r.path).map(|e| e.name == "cms_signed.der").unwrap_or(false)
+            })
+            .expect("cms row");
+        app.browser.select(idx);
+        app.preview_browser_selection();
+        app.trusted_certs.insert(dir.join("keylink/cert_ec.der"));
+        app.recompute_path_status();
+        let mut term = Terminal::new(TestBackend::new(150, 14)).unwrap();
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let text = buffer_text(term.backend().buffer());
+        // Both the raw-signature line and the certification-path line are in
+        // the content-pane header, exactly like for a certificate.
+        assert!(text.contains("Signature verified"), "signature line missing:\n{text}");
+        assert!(
+            text.contains("Path") && text.contains("valid — path of"),
+            "path line missing:\n{text}"
+        );
+    }
+
+    #[test]
     fn browser_search_bar_spans_and_narrows_the_file_list() {
         use ratatui::{backend::TestBackend, Terminal};
         let dir = std::env::temp_dir()

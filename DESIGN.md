@@ -713,6 +713,15 @@ flow:
 `IssuerNotFound`. The result reuses `SignatureStatus` and therefore the
 same content-pane `Signature` line as certificates and CRLs.
 
+A CMS message also gets the `Path` line (§9d): its "path" is the **signer
+certificate's** chain to a trust anchor, so `recompute_path_status` — when the
+open document is not itself a certificate — resolves the signer certificate
+(again by issuer + serial), reads its DER, and runs the very same
+`pathval::validate` on it against the browser's trust anchors. Trusting the
+signer's (or a higher) certificate makes the path valid, exactly as for a
+certificate. (Unavailable in single-file mode, where there is no signer
+certificate to resolve.)
+
 The directory itself is only walked once, at startup — `signables`/
 `ca_index` are not refreshed to pick up other files changing on disk
 during the session. The *currently open file's own entry* in both is the
