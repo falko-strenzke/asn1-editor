@@ -3637,7 +3637,9 @@ impl App {
                 }
             }
         }
-        // Splice a decrypted CMS `EnvelopedData` plaintext below its ciphertext.
+        // A CMS `EnvelopedData`: splice the decrypted plaintext below its
+        // ciphertext, or — before decryption — the same closed-lock
+        // placeholder a locked PKCS#8/PKCS#12 region shows.
         if let Some(reveal) = &self.cms_reveal {
             if let Some(cipher_row) = rows
                 .iter()
@@ -3648,6 +3650,21 @@ impl App {
                 let labels = reveal.ident.as_ref().map(|i| &i.labels);
                 self.collect_forest(&reveal.roots, depth, RowSource::CmsRevealed, labels, &mut reveal_rows);
                 rows.splice(cipher_row + 1..cipher_row + 1, reveal_rows);
+            }
+        } else if let Some(env) = x509::find_enveloped(&self.roots) {
+            if let Some(cipher_row) = rows
+                .iter()
+                .position(|r| r.source == RowSource::Document && r.path == env.cipher_path)
+            {
+                rows.insert(
+                    cipher_row + 1,
+                    Row {
+                        path: env.cipher_path,
+                        depth: rows[cipher_row].depth + 1,
+                        source: RowSource::DecryptedPlaceholder,
+                        elided: false,
+                    },
+                );
             }
         }
         self.rows = rows;
@@ -6072,6 +6089,24 @@ mod tests {
         let actions: Vec<MenuAction> = m.items.iter().map(|i| i.action).collect();
         assert_eq!(actions, [MenuAction::DecryptCms]);
         assert_eq!(m.items[0].label, "Decrypt message");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn undecrypted_enveloped_cms_shows_a_locked_placeholder() {
+        let (mut app, dir) = cms_decrypt_app("enveloped.der");
+        // Before decryption: a placeholder row below the ciphertext.
+        let env = x509::find_enveloped(&app.roots).expect("enveloped");
+        assert!(
+            app.rows.iter().any(|r| r.source == RowSource::DecryptedPlaceholder
+                && r.path == env.cipher_path),
+            "a locked placeholder should sit below the encryptedContent"
+        );
+        assert!(!app.rows.iter().any(|r| r.source == RowSource::CmsRevealed));
+        // After decryption the placeholder is replaced by the plaintext rows.
+        app.decrypt_cms_message();
+        assert!(!app.rows.iter().any(|r| r.source == RowSource::DecryptedPlaceholder));
+        assert!(app.rows.iter().any(|r| r.source == RowSource::CmsRevealed));
         let _ = std::fs::remove_dir_all(&dir);
     }
 

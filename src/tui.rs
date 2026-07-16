@@ -33,7 +33,7 @@ use crate::app::{
     PickerTarget, RowSource, TextEditor, TextFormat, DATE_FIELDS, EDIT_BYTES_PER_LINE,
     EDIT_DIGITS_PER_LINE, PICKER_CLASSES, PICKER_UNIVERSAL,
 };
-use crate::x509::{basic_constraints, extended_key_usage, key_usage};
+use crate::x509::{self, basic_constraints, extended_key_usage, key_usage};
 use crate::browser::FileStatus;
 use crate::ber::{
     self, Class, Node, TAG_BIT_STRING, TAG_BOOLEAN, TAG_GENERALIZED_TIME, TAG_INTEGER, TAG_NULL,
@@ -1991,7 +1991,14 @@ fn draw_content_browse(frame: &mut Frame, app: &App, area: Rect) {
             Style::new().fg(Color::Yellow).bold(),
         )));
         lines.push(Line::default());
-        lines.push(Line::from("Press 'z' and enter the password to decrypt it."));
+        // Password-based containers (PKCS#8/PKCS#12) prompt directly; a CMS
+        // EnvelopedData is decrypted with a recipient key via the 'z' menu.
+        let hint = if x509::find_enveloped(&app.roots).is_some() {
+            "Press 'z' and choose \"Decrypt message\" (needs the recipient's key)."
+        } else {
+            "Press 'z' and enter the password to decrypt it."
+        };
+        lines.push(Line::from(hint));
     } else if let Some(node) = app.selected_node() {
         lines.push(Line::from(vec![
             Span::styled("Type    ", Style::new().dim()),
@@ -2872,6 +2879,31 @@ mod tests {
         assert!(
             text.contains("Path") && text.contains("valid — path of"),
             "path line missing:\n{text}"
+        );
+    }
+
+    #[test]
+    fn undecrypted_enveloped_cms_renders_the_locked_placeholder() {
+        use crate::input::Container;
+        use ratatui::{backend::TestBackend, Terminal};
+        let der =
+            std::fs::read(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("testdata/enveloped.der"))
+                .unwrap();
+        let roots = parse_forest(&der, 0).unwrap();
+        // Single-file mode is enough — the placeholder is purely structural.
+        let mut app = App::new_single_file(
+            PathBuf::from("enveloped.der"),
+            PathBuf::from("/nonexistent/out"),
+            Container::Raw,
+            roots,
+            der.len(),
+        );
+        let mut term = Terminal::new(TestBackend::new(150, 30)).unwrap();
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let text = buffer_text(term.backend().buffer());
+        assert!(
+            text.contains("decrypted content not available"),
+            "locked placeholder missing:\n{text}"
         );
     }
 

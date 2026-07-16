@@ -1138,7 +1138,13 @@ matches it to a `RecipientInfo` and returns the content. (Unlike re-signing,
 decryption is recipient-**key** based, not password based, so it needs the
 directory scan and is unavailable in single-file mode.)
 
-The plaintext is exposed as a **read-only** virtual subtree
+Before decryption, `rebuild_rows` shows the same closed-lock placeholder
+(`RowSource::DecryptedPlaceholder`, "🔒 decrypted content not available")
+below the `encryptedContent` node that a locked PKCS#8/PKCS#12 region shows;
+the content pane's hint there is CMS-specific ("choose *Decrypt message*",
+since it is recipient-key based, not password based).
+
+After decryption the plaintext is exposed as a **read-only** virtual subtree
 (`RowSource::CmsRevealed` / `App::cms_reveal`) spliced below the
 `encryptedContent` ciphertext node — the same reveal pattern as a PKCS#8 or
 PKCS#12 decryption, but never re-encrypted (that would need the recipients'
