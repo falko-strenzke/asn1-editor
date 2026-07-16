@@ -33,7 +33,7 @@ use crate::app::{
     RowSource, TextEditor, TextFormat, DATE_FIELDS, EDIT_BYTES_PER_LINE, EDIT_DIGITS_PER_LINE,
     PICKER_CLASSES, PICKER_UNIVERSAL,
 };
-use crate::x509::{basic_constraints, key_usage};
+use crate::x509::{basic_constraints, extended_key_usage, key_usage};
 use crate::browser::FileStatus;
 use crate::ber::{
     self, Class, Node, TAG_BIT_STRING, TAG_BOOLEAN, TAG_GENERALIZED_TIME, TAG_INTEGER, TAG_NULL,
@@ -110,6 +110,7 @@ fn event_loop(terminal: &mut DefaultTerminal, app: &mut App) -> io::Result<()> {
             Mode::EditPubKey(_) => handle_pubkey_key(app, key),
             Mode::EditBasicConstraints(_) => handle_basic_constraints_key(app, key),
             Mode::EditKeyUsage(_) => handle_key_usage_key(app, key),
+            Mode::EditExtKeyUsage(_) => handle_ext_key_usage_key(app, key),
             Mode::Notice(_) => app.dismiss_notice(), // any key dismisses
             Mode::Browse => {
                 if key.code != KeyCode::Char('q') {
@@ -252,6 +253,19 @@ fn handle_key_usage_key(app: &mut App, key: KeyEvent) {
     }
 }
 
+fn handle_ext_key_usage_key(app: &mut App, key: KeyEvent) {
+    match key.code {
+        KeyCode::Esc => app.cancel_ext_key_usage(),
+        KeyCode::Enter => app.eku_enter(),
+        KeyCode::Up | KeyCode::BackTab => app.eku_move_field(-1),
+        KeyCode::Down | KeyCode::Tab => app.eku_move_field(1),
+        KeyCode::Char(' ') => app.eku_toggle(),
+        KeyCode::Backspace => app.eku_backspace(),
+        KeyCode::Char(c) => app.eku_insert_char(c),
+        _ => {}
+    }
+}
+
 fn handle_picker_key(app: &mut App, key: KeyEvent) {
     match key.code {
         KeyCode::Esc => app.cancel_picker(),
@@ -347,6 +361,9 @@ fn draw(frame: &mut Frame, app: &mut App) {
     }
     if matches!(app.mode, Mode::EditKeyUsage(_)) {
         draw_key_usage(frame, app, main);
+    }
+    if matches!(app.mode, Mode::EditExtKeyUsage(_)) {
+        draw_ext_key_usage(frame, app, main);
     }
     if matches!(app.mode, Mode::Notice(_)) {
         draw_notice(frame, app, main);
@@ -752,6 +769,81 @@ fn draw_key_usage(frame: &mut Frame, app: &App, area: Rect) {
         "↑↓ select bit   Space toggle   ⏎ apply   Esc cancel",
         Style::new().dim(),
     )));
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+/// Centered popup for the "As Extended Key Usage" structured editor: one
+/// checkbox per well-known key purpose, one per custom OID already present, and
+/// a dot-notation input field for adding new OIDs.
+fn draw_ext_key_usage(frame: &mut Frame, app: &App, area: Rect) {
+    let Mode::EditExtKeyUsage(ref s) = app.mode else { return };
+    let p = extended_key_usage::NUM_PREDEFINED;
+    let active = |f: usize| {
+        if s.field == f {
+            Style::new().add_modifier(Modifier::REVERSED).bold()
+        } else {
+            Style::new().bold()
+        }
+    };
+    let checkbox = |on: bool| if on { "[x]" } else { "[ ]" };
+
+    let mut lines: Vec<Line> = Vec::new();
+    for (i, (arcs, name, _)) in extended_key_usage::PURPOSES.iter().enumerate() {
+        lines.push(Line::from(vec![
+            Span::styled(format!("{} {name}", checkbox(s.predefined[i])), active(i)),
+            Span::styled(format!("  ({})", oid::dotted(arcs)), Style::new().dim()),
+        ]));
+    }
+    if !s.custom.is_empty() {
+        lines.push(Line::from(Span::styled("additional OIDs:", Style::new().dim())));
+        for (j, c) in s.custom.iter().enumerate() {
+            lines.push(Line::from(Span::styled(
+                format!("{} {}", checkbox(c.enabled), c.dotted),
+                active(p + j),
+            )));
+        }
+    }
+    lines.push(Line::default());
+    let focused = s.on_input();
+    let mut input_spans = vec![Span::styled(
+        "add OID: ",
+        if focused { Style::new().bold() } else { Style::new().dim() },
+    )];
+    input_spans.push(Span::styled(s.input.clone(), Style::new().bold()));
+    if focused {
+        input_spans.push(Span::styled("▏", Style::new().fg(Color::Cyan)));
+    }
+    lines.push(Line::from(input_spans));
+    lines.push(Line::from(Span::styled(
+        "(type an OID in dot notation, then Enter to add it)",
+        Style::new().dim(),
+    )));
+    lines.push(Line::default());
+    lines.push(Line::from(vec![
+        Span::styled("critical: ", Style::new().dim()),
+        Span::raw(if s.critical { "yes" } else { "no" }),
+        Span::styled("  (a property of the Extension)", Style::new().dim()),
+    ]));
+    lines.push(Line::from(Span::styled(
+        "↑↓ select   Space toggle   ⏎ add / apply   Esc cancel",
+        Style::new().dim(),
+    )));
+
+    let width = 60.min(area.width);
+    let height = (lines.len() as u16 + 2).min(area.height);
+    let popup = Rect {
+        x: area.x + (area.width.saturating_sub(width)) / 2,
+        y: area.y + (area.height.saturating_sub(height)) / 2,
+        width,
+        height,
+    };
+    frame.render_widget(Clear, popup);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::new().fg(Color::Cyan))
+        .title(" EDIT — Extended Key Usage ");
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
@@ -1846,6 +1938,11 @@ fn draw_content_browse(frame: &mut Frame, app: &App, area: Rect) {
                 "Key Usage (RFC 5280 §4.2.1.3)",
                 key_usage::describe(&ku),
             ));
+        } else if let Some(eku) = extended_key_usage::parse(node) {
+            lines.extend(extension_section(
+                "Extended Key Usage (RFC 5280 §4.2.1.12)",
+                extended_key_usage::describe(&eku),
+            ));
         }
         lines.push(Line::default());
         let content = node.content_octets();
@@ -2118,6 +2215,9 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
             "↑↓ field  Space toggle  digits set pathLen  ⏎ apply  Esc cancel"
         }
         Mode::EditKeyUsage(_) => "↑↓ select bit  Space toggle  ⏎ apply  Esc cancel",
+        Mode::EditExtKeyUsage(_) => {
+            "↑↓ select  Space toggle  type OID + ⏎ add  ⏎ apply  Esc cancel"
+        }
         Mode::Notice(_) => "press any key to dismiss",
     };
     let line = Line::from(vec![
@@ -2447,6 +2547,10 @@ mod tests {
         app_selecting(rel, |n| key_usage::value_index(n).is_some())
     }
 
+    fn app_on_ext_key_usage(rel: &str) -> App {
+        app_selecting(rel, |n| extended_key_usage::value_index(n).is_some())
+    }
+
     /// Flatten a rendered buffer to text, one line per row.
     fn buffer_text(buf: &ratatui::buffer::Buffer) -> String {
         let area = buf.area;
@@ -2512,5 +2616,34 @@ mod tests {
         assert!(text.contains("digitalSignature"), "digitalSignature bit missing");
         assert!(text.contains("decipherOnly"), "decipherOnly bit missing");
         assert!(text.contains("[x]"), "the set bit should render checked");
+    }
+
+    #[test]
+    fn content_pane_renders_ext_key_usage_interpretation() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let mut app = app_on_ext_key_usage("testdata/chain/server.der");
+        let mut term = Terminal::new(TestBackend::new(200, 40)).unwrap();
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let text = buffer_text(term.backend().buffer());
+        assert!(text.contains("Extended Key Usage"), "heading missing:\n{text}");
+        assert!(text.contains("serverAuth"), "serverAuth purpose missing:\n{text}");
+        assert!(
+            text.contains("TLS server authentication"),
+            "meaning missing:\n{text}"
+        );
+    }
+
+    #[test]
+    fn ext_key_usage_editor_popup_renders_purposes_and_input() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let mut app = app_on_ext_key_usage("testdata/chain/server.der");
+        app.start_ext_key_usage();
+        let mut term = Terminal::new(TestBackend::new(200, 40)).unwrap();
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let text = buffer_text(term.backend().buffer());
+        assert!(text.contains("EDIT — Extended Key Usage"), "title missing:\n{text}");
+        assert!(text.contains("serverAuth"), "predefined purpose missing");
+        assert!(text.contains("codeSigning"), "unchecked predefined purpose missing");
+        assert!(text.contains("add OID:"), "OID input field missing");
     }
 }

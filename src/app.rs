@@ -29,7 +29,11 @@ use crate::pkcs12;
 use crate::pkcs8;
 use crate::spec::{self, Identification, Label, SpecDb};
 use crate::verify::{self, FileRelations, SignatureStatus};
-use crate::x509::{self, basic_constraints, key_usage, CaCandidate, Kind, Signable, SignableFile};
+use crate::oid;
+use crate::x509::{
+    self, basic_constraints, extended_key_usage, key_usage, CaCandidate, Kind, Signable,
+    SignableFile,
+};
 
 /// Bytes per line in the hex editor; the cursor moves in units of hex digits.
 pub const EDIT_BYTES_PER_LINE: usize = 16;
@@ -604,6 +608,8 @@ pub enum MenuAction {
     EditBasicConstraints,
     /// Open the structured KeyUsage editor.
     EditKeyUsage,
+    /// Open the structured ExtendedKeyUsage editor.
+    EditExtKeyUsage,
     /// Open the public-key modification dialog (§9e).
     Rekey,
     /// Open the re-sign dialog (§9c).
@@ -656,6 +662,10 @@ pub enum Mode {
     /// outer SEQUENCE, or the "As Key Usage" 'E' entry): toggle the nine
     /// named usage bits directly.
     EditKeyUsage(KuEditState),
+    /// Structured editor for an `ExtKeyUsage` extension ('e' on the extension's
+    /// outer SEQUENCE, or the "As Extended Key Usage" 'E' entry): toggle the
+    /// well-known key purposes and add arbitrary OIDs in dot notation.
+    EditExtKeyUsage(EkuEditState),
     /// A dismissible informational popup shown over the panes — used at
     /// start-up to surface specification-load warnings.
     Notice(NoticeState),
@@ -952,6 +962,120 @@ impl KuEditState {
         if let Some(b) = self.bits.get_mut(self.field) {
             *b = !*b;
         }
+    }
+}
+
+/// One arbitrary (non-well-known) `KeyPurposeId` present in the extension or
+/// added by the user, shown as its own toggle row in the ExtKeyUsage editor.
+pub struct CustomOid {
+    pub arcs: Vec<u64>,
+    pub dotted: String,
+    /// Whether this OID is kept in the extension on apply.
+    pub enabled: bool,
+}
+
+/// State of the "As Extended Key Usage" structured editor. Toggles the
+/// well-known `KeyPurposeId`s of [`extended_key_usage::PURPOSES`], keeps or
+/// drops any arbitrary OIDs already present, and accepts new OIDs typed in dot
+/// notation. On submit the enabled purposes are re-encoded into the `extnValue`
+/// OCTET STRING at [`Self::value_path`].
+pub struct EkuEditState {
+    /// Path (in `roots`) of the `extnValue` OCTET STRING to rewrite on submit.
+    pub value_path: Vec<usize>,
+    /// The enclosing extension's `critical` flag (context only, not edited).
+    pub critical: bool,
+    /// Checked flag per well-known purpose, in [`extended_key_usage::PURPOSES`]
+    /// order.
+    pub predefined: [bool; extended_key_usage::NUM_PREDEFINED],
+    /// Arbitrary OIDs (not among the well-known set), each kept or dropped.
+    pub custom: Vec<CustomOid>,
+    /// Dot-notation input buffer for adding a new OID.
+    pub input: String,
+    /// Active field: `0..P` well-known, `P..P+C` custom, `P+C` the input field.
+    pub field: usize,
+}
+
+impl EkuEditState {
+    fn num_predefined() -> usize {
+        extended_key_usage::NUM_PREDEFINED
+    }
+
+    /// Field index of the dot-notation input row (past the toggle rows).
+    fn input_field(&self) -> usize {
+        Self::num_predefined() + self.custom.len()
+    }
+
+    /// Whether the input row is currently focused.
+    pub fn on_input(&self) -> bool {
+        self.field == self.input_field()
+    }
+
+    fn move_field(&mut self, delta: isize) {
+        let n = (self.input_field() + 1) as isize;
+        self.field = (self.field as isize + delta).rem_euclid(n) as usize;
+    }
+
+    /// Space toggles the focused well-known or custom purpose (no-op on input).
+    fn toggle(&mut self) {
+        let p = Self::num_predefined();
+        if self.field < p {
+            self.predefined[self.field] = !self.predefined[self.field];
+        } else if self.field < self.input_field() {
+            let c = &mut self.custom[self.field - p];
+            c.enabled = !c.enabled;
+        }
+    }
+
+    fn insert_char(&mut self, c: char) {
+        if self.on_input() && (c.is_ascii_digit() || c == '.') {
+            self.input.push(c);
+        }
+    }
+
+    fn backspace(&mut self) {
+        if self.on_input() {
+            self.input.pop();
+        }
+    }
+
+    /// Validate the input OID and fold it into the list: check the matching
+    /// well-known box, re-enable a matching custom entry, or append a new one.
+    /// Returns the display name added, or an error message. Clears the input
+    /// and keeps focus on the (possibly shifted) input row on success.
+    fn add_oid(&mut self) -> Result<String, String> {
+        let text = self.input.trim().to_string();
+        // Reuse the encoder's validation, then recover canonical arcs.
+        let content = ber::encode_oid(&text)?;
+        let arcs = ber::oid_arcs(&content).ok_or("not a valid OID")?;
+        let (name, _, _) = extended_key_usage::purpose_label(&arcs);
+        if let Some(i) = extended_key_usage::predefined_index(&arcs) {
+            self.predefined[i] = true;
+        } else if let Some(existing) = self.custom.iter_mut().find(|c| c.arcs == arcs) {
+            existing.enabled = true;
+        } else {
+            let dotted = oid::dotted(&arcs);
+            self.custom.push(CustomOid { arcs, dotted, enabled: true });
+        }
+        self.input.clear();
+        self.field = self.input_field();
+        Ok(name)
+    }
+
+    /// The enabled purposes to encode, in a stable order: well-known first (in
+    /// table order), then the kept custom OIDs.
+    fn collect_purposes(&self) -> Vec<Vec<u64>> {
+        let mut out = Vec::new();
+        for (i, on) in self.predefined.iter().enumerate() {
+            if *on {
+                out.push(extended_key_usage::PURPOSES[i].0.to_vec());
+            }
+        }
+        for c in &self.custom {
+            if c.enabled {
+                out.push(c.arcs.clone());
+            }
+        }
+        out
     }
 }
 
@@ -1583,6 +1707,10 @@ impl App {
             self.start_key_usage();
             return;
         }
+        if self.selection_ext_key_usage_path().is_some() {
+            self.start_ext_key_usage();
+            return;
+        }
         self.start_edit_type_specific();
     }
 
@@ -1764,6 +1892,130 @@ impl App {
         self.dirty = true;
         self.rebuild();
         self.status = "Key Usage updated — 's' writes the file".to_string();
+    }
+
+    /// If the current tree selection is the outer SEQUENCE of an
+    /// `ExtendedKeyUsage` extension in the document, return its path.
+    fn selection_ext_key_usage_path(&self) -> Option<Vec<usize>> {
+        let row = self.rows.get(self.selected)?;
+        if row.source != RowSource::Document {
+            return None;
+        }
+        let node = node_at(&self.roots, &row.path)?;
+        extended_key_usage::value_index(node).map(|_| row.path.clone())
+    }
+
+    /// Open the structured ExtendedKeyUsage editor for the selected extension
+    /// (reached from its outer SEQUENCE via 'e' or the 'E' edit menu).
+    pub fn start_ext_key_usage(&mut self) {
+        let Some(ext_path) = self.selection_ext_key_usage_path() else {
+            self.status = "the selected element is not an ExtendedKeyUsage extension".to_string();
+            return;
+        };
+        let node = node_at(&self.roots, &ext_path).expect("path just resolved");
+        let value_idx = extended_key_usage::value_index(node).expect("checked above");
+        let eku = extended_key_usage::parse(node);
+        let mut value_path = ext_path;
+        value_path.push(value_idx);
+        let (purposes, critical) = match eku {
+            Some(e) => (e.purposes, e.critical),
+            None => (Vec::new(), false),
+        };
+        let mut predefined = [false; extended_key_usage::NUM_PREDEFINED];
+        let mut custom = Vec::new();
+        for arcs in purposes {
+            if let Some(i) = extended_key_usage::predefined_index(&arcs) {
+                predefined[i] = true;
+            } else {
+                let dotted = oid::dotted(&arcs);
+                custom.push(CustomOid { arcs, dotted, enabled: true });
+            }
+        }
+        self.mode = Mode::EditExtKeyUsage(EkuEditState {
+            value_path,
+            critical,
+            predefined,
+            custom,
+            input: String::new(),
+            field: 0,
+        });
+        self.status =
+            "editing Extended Key Usage — ↑↓ select, Space toggles, type an OID then Enter to add, Enter applies"
+                .to_string();
+    }
+
+    pub fn cancel_ext_key_usage(&mut self) {
+        self.mode = Mode::Browse;
+        self.status = "edit cancelled".to_string();
+    }
+
+    pub fn eku_move_field(&mut self, delta: isize) {
+        if let Mode::EditExtKeyUsage(ref mut s) = self.mode {
+            s.move_field(delta);
+        }
+    }
+
+    pub fn eku_toggle(&mut self) {
+        if let Mode::EditExtKeyUsage(ref mut s) = self.mode {
+            s.toggle();
+        }
+    }
+
+    pub fn eku_insert_char(&mut self, c: char) {
+        if let Mode::EditExtKeyUsage(ref mut s) = self.mode {
+            s.insert_char(c);
+        }
+    }
+
+    pub fn eku_backspace(&mut self) {
+        if let Mode::EditExtKeyUsage(ref mut s) = self.mode {
+            s.backspace();
+        }
+    }
+
+    /// Enter on the ExtKeyUsage editor: on the input row with typed text it adds
+    /// the OID to the list; otherwise it applies the whole dialog.
+    pub fn eku_enter(&mut self) {
+        let add = if let Mode::EditExtKeyUsage(ref mut s) = self.mode {
+            if s.on_input() && !s.input.trim().is_empty() {
+                Some(s.add_oid())
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        match add {
+            Some(Ok(name)) => self.status = format!("added {name} — Enter again applies the changes"),
+            Some(Err(e)) => self.status = format!("invalid OID: {e}"),
+            None => self.commit_ext_key_usage(),
+        }
+    }
+
+    /// Apply the ExtendedKeyUsage edit: re-encode the SEQUENCE OF OID and
+    /// replace the `extnValue` OCTET STRING's content. At least one key purpose
+    /// is required (RFC 5280), so an empty list keeps the dialog open.
+    pub fn commit_ext_key_usage(&mut self) {
+        let Mode::EditExtKeyUsage(ref s) = self.mode else { return };
+        let purposes = s.collect_purposes();
+        if purposes.is_empty() {
+            self.status =
+                "Extended Key Usage needs at least one key purpose (RFC 5280)".to_string();
+            return; // stay in the dialog
+        }
+        let der = extended_key_usage::encode_der(&purposes);
+        let value_path = s.value_path.clone();
+        let Some(node) = node_at_mut(&mut self.roots, &value_path) else {
+            self.status = "internal error: extnValue node missing".to_string();
+            return;
+        };
+        node.value = der;
+        node.children.clear();
+        node.encapsulates = false;
+        self.mode = Mode::Browse;
+        self.dirty = true;
+        self.rebuild();
+        self.status = "Extended Key Usage updated — 's' writes the file".to_string();
     }
 
     /// Open the public-key modification dialog for the open certificate,
@@ -2817,6 +3069,14 @@ impl App {
                 desc: "toggle the named key-usage bits",
             });
         }
+        // On an ExtendedKeyUsage extension, offer the structured editor.
+        if self.selection_ext_key_usage_path().is_some() {
+            items.push(MenuItem {
+                action: MenuAction::EditExtKeyUsage,
+                label: "As Extended Key Usage",
+                desc: "toggle key purposes and add OIDs in dot notation",
+            });
+        }
         // On a certificate's subjectPublicKeyInfo, offer to re-key the cert.
         if self.selection_is_cert_spki() {
             items.push(MenuItem {
@@ -2878,6 +3138,7 @@ impl App {
             MenuAction::EditTypeSpecific => self.start_edit_type_specific(),
             MenuAction::EditBasicConstraints => self.start_basic_constraints(),
             MenuAction::EditKeyUsage => self.start_key_usage(),
+            MenuAction::EditExtKeyUsage => self.start_ext_key_usage(),
             MenuAction::Rekey => self.start_rekey(),
             MenuAction::Resign => self.start_resign(),
         }
@@ -4316,6 +4577,143 @@ mod tests {
         app.ku_toggle();
         app.commit_key_usage();
         assert_eq!(current_ku_set(&app), ["keyCertSign"]);
+    }
+
+    /// Row index of the first ExtendedKeyUsage Extension SEQUENCE.
+    fn eku_row(app: &App) -> usize {
+        (0..app.rows.len())
+            .find(|&i| {
+                let row = &app.rows[i];
+                row.source == RowSource::Document
+                    && node_at(&app.roots, &row.path)
+                        .is_some_and(|n| extended_key_usage::value_index(n).is_some())
+            })
+            .expect("ExtendedKeyUsage extension row")
+    }
+
+    /// The key-purpose OIDs (dotted) of the current document's EKU extension.
+    fn current_eku(app: &App) -> Vec<String> {
+        fn find(nodes: &[Node]) -> Option<&Node> {
+            for n in nodes {
+                if extended_key_usage::value_index(n).is_some() {
+                    return Some(n);
+                }
+                if let Some(f) = find(&n.children) {
+                    return Some(f);
+                }
+            }
+            None
+        }
+        let eku = extended_key_usage::parse(find(&app.roots).expect("extension")).expect("parse");
+        eku.purposes.iter().map(|a| oid::dotted(a)).collect()
+    }
+
+    #[test]
+    fn e_on_ext_key_usage_opens_structured_editor() {
+        let mut app = cert_app("testdata/chain/server.der");
+        let idx = eku_row(&app);
+        app.select(idx);
+        app.edit_selected(); // the 'e' action
+        let Mode::EditExtKeyUsage(ref s) = app.mode else {
+            panic!("ExtendedKeyUsage editor not opened by 'e'");
+        };
+        // server.der lists serverAuth (predefined index 1) and nothing custom.
+        assert!(s.predefined[1], "serverAuth starts checked");
+        assert!(s.custom.is_empty());
+    }
+
+    #[test]
+    fn edit_menu_offers_ext_key_usage_entry() {
+        let mut app = cert_app("testdata/chain/server.der");
+        let idx = eku_row(&app);
+        app.select(idx);
+        app.open_edit_menu();
+        let Mode::EditMenu(ref m) = app.mode else { panic!("menu not open") };
+        assert!(
+            m.items.iter().any(|i| i.action == MenuAction::EditExtKeyUsage),
+            "the 'E' menu should offer 'As Extended Key Usage'"
+        );
+    }
+
+    #[test]
+    fn ext_key_usage_editor_toggles_a_predefined_purpose() {
+        // server.der is serverAuth; add clientAuth (predefined index 2).
+        let mut app = cert_app("testdata/chain/server.der");
+        let idx = eku_row(&app);
+        app.select(idx);
+        app.start_ext_key_usage();
+        app.eku_move_field(2); // 0 -> clientAuth
+        app.eku_toggle();
+        app.commit_ext_key_usage();
+        assert!(app.dirty);
+        assert!(matches!(app.mode, Mode::Browse));
+        assert_eq!(
+            current_eku(&app),
+            ["1.3.6.1.5.5.7.3.1", "1.3.6.1.5.5.7.3.2"],
+            "serverAuth then clientAuth (predefined table order)"
+        );
+        assert!(ber::parse_forest(&ber::encode_forest(&app.roots), 0).is_ok());
+    }
+
+    #[test]
+    fn ext_key_usage_editor_adds_a_custom_oid() {
+        let mut app = cert_app("testdata/chain/server.der");
+        let idx = eku_row(&app);
+        app.select(idx);
+        app.start_ext_key_usage();
+        // Move to the input row, type a dot-notation OID, Enter adds it.
+        {
+            let Mode::EditExtKeyUsage(ref mut s) = app.mode else { panic!() };
+            s.field = s.input_field();
+        }
+        for c in "1.2.3.4".chars() {
+            app.eku_insert_char(c);
+        }
+        app.eku_enter(); // add (input non-empty) — stays in the dialog
+        assert!(matches!(app.mode, Mode::EditExtKeyUsage(_)), "add keeps the dialog open");
+        {
+            let Mode::EditExtKeyUsage(ref s) = app.mode else { panic!() };
+            assert_eq!(s.custom.len(), 1);
+            assert_eq!(s.custom[0].dotted, "1.2.3.4");
+            assert!(s.input.is_empty(), "input cleared after add");
+        }
+        app.eku_enter(); // input now empty -> apply
+        assert_eq!(current_eku(&app), ["1.3.6.1.5.5.7.3.1", "1.2.3.4"]);
+    }
+
+    #[test]
+    fn ext_key_usage_editor_rejects_invalid_oid() {
+        let mut app = cert_app("testdata/chain/server.der");
+        let idx = eku_row(&app);
+        app.select(idx);
+        app.start_ext_key_usage();
+        {
+            let Mode::EditExtKeyUsage(ref mut s) = app.mode else { panic!() };
+            s.field = s.input_field();
+        }
+        for c in "9.9.9".chars() {
+            // first arc > 2 is invalid
+            app.eku_insert_char(c);
+        }
+        app.eku_enter();
+        assert!(matches!(app.mode, Mode::EditExtKeyUsage(_)), "stays open on invalid OID");
+        assert!(app.status.contains("invalid OID"), "status reports the error: {}", app.status);
+        let Mode::EditExtKeyUsage(ref s) = app.mode else { panic!() };
+        assert!(s.custom.is_empty(), "nothing added");
+    }
+
+    #[test]
+    fn ext_key_usage_editor_refuses_empty_list() {
+        // server.der is serverAuth only; unchecking it leaves an empty list.
+        let mut app = cert_app("testdata/chain/server.der");
+        let idx = eku_row(&app);
+        app.select(idx);
+        app.start_ext_key_usage();
+        app.eku_move_field(1); // serverAuth
+        app.eku_toggle(); // uncheck it
+        app.eku_enter(); // apply attempt with an empty list
+        assert!(matches!(app.mode, Mode::EditExtKeyUsage(_)), "an empty list keeps the dialog open");
+        assert!(!app.dirty);
     }
 
     #[test]

@@ -23,6 +23,7 @@
 use std::path::{Path, PathBuf};
 
 pub mod basic_constraints;
+pub mod extended_key_usage;
 pub mod key_usage;
 
 use crate::ber::{

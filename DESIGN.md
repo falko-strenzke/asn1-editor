@@ -60,10 +60,12 @@ Goals:
   FIPS 205 (SLH-DSA) algorithms, alongside the classical RSA/ECDSA/Ed25519
   set — so PQ-signed certificates and CRLs verify, and objects can be
   re-signed or re-keyed with any of them (§9c/§9e).
-* Interpret the X.509 `BasicConstraints` and `KeyUsage` extensions in plain
-  language in the content pane, and edit their fields through a structured form
-  (`e` on the extension, or the `E` edit menu) — `cA` / `pathLenConstraint` for
-  Basic Constraints (§9f), the nine named usage bits for Key Usage (§9g).
+* Interpret the X.509 `BasicConstraints`, `KeyUsage` and `ExtendedKeyUsage`
+  extensions in plain language in the content pane, and edit their fields
+  through a structured form (`e` on the extension, or the `E` edit menu) —
+  `cA` / `pathLenConstraint` for Basic Constraints (§9f), the nine named usage
+  bits for Key Usage (§9g), and a set of well-known key purposes plus arbitrary
+  dot-notation OIDs for Extended Key Usage (§9h).
 
 Non-goals (see §14):
 
@@ -127,6 +129,8 @@ src/
              of x509; structural only, no crypto)
   x509/key_usage.rs  the same for the X.509 KeyUsage extension (a BIT STRING
              of nine named bits)
+  x509/extended_key_usage.rs  the same for the X.509 ExtendedKeyUsage extension
+             (a SEQUENCE OF key-purpose OID; also uses oid.rs for names)
   app.rs     application state: tree, flattened rows, selection, edit logic
   tui.rs     ratatui event loop and rendering (no business logic)
 tests/
@@ -165,8 +169,8 @@ digest primitives); `pathval.rs` depends
 on the `openssl` crate + `ber.rs` (it takes raw DER, not the `Node` tree);
 `keygen.rs` depends on `openssl` + `openssl-sys`/`foreign-types` (raw FFI for
 by-name PQ key generation) + `ber.rs` (`verify::sign` does the actual signing);
-`x509::basic_constraints` and `x509::key_usage` depend only on `ber.rs`
-(structural, no crypto);
+`x509::basic_constraints` and `x509::key_usage` depend only on `ber.rs`, and
+`x509::extended_key_usage` on `ber.rs` + `oid.rs` (all structural, no crypto);
 `app.rs` depends on all of the above; `tui.rs` renders `app.rs` and resolves
 OID display names through `oid.rs` and formats file change-times through
 `libc` (POSIX `localtime_r` / Windows `localtime_s`). External dependencies: `ratatui`, `aws-lc-rs`,
@@ -1217,6 +1221,35 @@ The only differences are in the value:
   follows the DER rule for named bit strings: trailing zero bits are trimmed,
   so the encoded length tracks the highest set bit (bit 0 alone → `03 02 07 80`;
   `keyCertSign`+`cRLSign` → `03 02 01 06`).
+
+## 9h. Extended Key Usage interpretation and structured editing (`src/x509/extended_key_usage.rs`)
+
+The `ExtKeyUsage` extension (RFC 5280 §4.2.1.12, `id-ce-extKeyUsage` =
+2.5.29.37) is an open `SEQUENCE OF KeyPurposeId` (each an OBJECT IDENTIFIER).
+`x509::extended_key_usage` handles it like the other two extension modules
+(§9f/§9g) — same outer-`Extension` anchoring and write-back path — but the
+value is a variable-length OID list rather than a fixed set of fields, so the
+editor is richer:
+
+* **Interpretation.** `describe` lists each `KeyPurposeId`, naming the
+  well-known ones from a built-in table (`PURPOSES`: `serverAuth`,
+  `clientAuth`, `codeSigning`, `emailProtection`, `timeStamping`,
+  `OCSPSigning`, `anyExtendedKeyUsage`) with a short meaning, resolving other
+  known OIDs through the `oid.rs` repository, and showing unrecognised ones by
+  their dotted form.
+
+* **Structured editor.** `Mode::EditExtKeyUsage(EkuEditState)` is a checkbox
+  list of the well-known purposes, followed by a checkbox per arbitrary OID
+  already present, followed by a **dot-notation input field**. `Space` toggles
+  the focused checkbox; on the input row, typing an OID and pressing `Enter`
+  validates it (via `ber::encode_oid`), folds it into the list (checking the
+  matching well-known box, re-enabling a matching custom row, or appending a
+  new one) and clears the field — `Enter` on any other row (or an empty input)
+  applies the whole dialog. `encode_der` emits a `SEQUENCE OF` the enabled OIDs
+  (well-known in table order, then customs). RFC 5280 requires at least one
+  `KeyPurposeId`, so applying an empty list is refused and keeps the dialog
+  open. Reached by `e` on the extension or the **As Extended Key Usage**
+  `E`-menu entry.
 
 ## 10. Input containers
 
