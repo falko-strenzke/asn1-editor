@@ -100,6 +100,19 @@ impl FileBrowser {
         browser
     }
 
+    /// A browser with no scanned contents, for single-file mode where the pane
+    /// is hidden and the filesystem is deliberately never inspected.
+    pub fn empty(root: PathBuf) -> Self {
+        FileBrowser {
+            root,
+            entries: Vec::new(),
+            rows: Vec::new(),
+            selected: 0,
+            list_state: ListState::default(),
+            baseline: HashMap::new(),
+        }
+    }
+
     /// Re-read the loaded parts of the tree from disk and re-tag every entry
     /// against the startup baseline: newly created files are added, vanished
     /// ones marked `Deleted` (kept visible), and modification times refreshed.

@@ -1229,6 +1229,11 @@ pub struct App {
     pub browser: FileBrowser,
     /// Which pane currently receives navigation keys.
     pub focus: Focus,
+    /// True when the program was started with an explicit file argument: only
+    /// that file is opened, no directory is scanned, the browser pane is hidden
+    /// and the re-signing / re-keying actions (which need other files) are
+    /// disabled.
+    pub single_file: bool,
     /// False when the program was started with a directory and no file has
     /// been picked from the browser yet: `roots`/`rows` are empty, and
     /// document-mutating actions (`save`, insert) are refused.
@@ -1322,6 +1327,7 @@ impl App {
             ident: None,
             browser,
             focus: Focus::Document,
+            single_file: false,
             file_open: true,
             open_confirm: false,
             ca_index,
@@ -1367,6 +1373,7 @@ impl App {
             ident: None,
             browser,
             focus: Focus::Browser,
+            single_file: false,
             file_open: false,
             open_confirm: false,
             ca_index,
@@ -1383,6 +1390,58 @@ impl App {
         };
         app.rebuild_rows();
         app.recompute_browser_relations();
+        app
+    }
+
+    /// Started with an explicit file argument: only this file is opened. The
+    /// directory is never scanned (so there is no file browser, no relation
+    /// graph and no key↔certificate links) and the re-signing / re-keying
+    /// actions — which need other files on disk — are disabled. Signature
+    /// verification against the document itself (self-signed) still works.
+    pub fn new_single_file(
+        path: PathBuf,
+        out_path: PathBuf,
+        container: Container,
+        roots: Vec<Node>,
+        total_len: usize,
+    ) -> Self {
+        let (dir, path) = normalize_file_path(&path);
+        let mut app = App {
+            path,
+            out_path,
+            container: container.clone(),
+            roots,
+            total_len,
+            rows: Vec::new(),
+            selected: 0,
+            tree_state: ListState::default(),
+            mode: Mode::Browse,
+            status: format!("loaded {} bytes ({})", total_len, container.describe()),
+            dirty: false,
+            quit_confirm: false,
+            delete_confirm: false,
+            content_scroll: 0,
+            spec_db: SpecDb::default(),
+            ident: None,
+            browser: FileBrowser::empty(dir),
+            focus: Focus::Document,
+            single_file: true,
+            file_open: true,
+            open_confirm: false,
+            ca_index: Vec::new(),
+            sig_status: None,
+            trusted_certs: BTreeSet::new(),
+            path_status: None,
+            signables: Vec::new(),
+            browser_relations: FileRelations::default(),
+            key_files: Vec::new(),
+            unlocked_keys: Vec::new(),
+            retained_passwords: RetainedPasswords::default(),
+            decrypted: None,
+            pkcs12: None,
+        };
+        app.rebuild_rows();
+        app.recompute_sig_status();
         app
     }
 
@@ -1409,6 +1468,9 @@ impl App {
     /// e.g. a key file this program just wrote appears immediately, with its
     /// key↔certificate link. Returns whether anything changed.
     pub fn refresh_filesystem(&mut self) -> bool {
+        if self.single_file {
+            return false; // single-file mode never inspects the filesystem
+        }
         let changed = self.browser.refresh();
         if changed {
             let dir = self.browser.root.clone();
@@ -1460,6 +1522,9 @@ impl App {
     /// Toggle keyboard focus between the file browser and the document
     /// panes ('Tab').
     pub fn toggle_focus(&mut self) {
+        if self.single_file {
+            return; // no browser pane to switch to
+        }
         self.focus = match self.focus {
             Focus::Browser => Focus::Document,
             Focus::Document => Focus::Browser,
@@ -1539,6 +1604,10 @@ impl App {
     /// whether the issuer's signing key is available. Not a signed object →
     /// just a status message.
     pub fn start_resign(&mut self) {
+        if self.single_file {
+            self.status = "re-signing is not available in single-file mode".to_string();
+            return;
+        }
         let der = ber::encode_forest(&self.roots);
         let signable = ber::parse_forest(&der, 0)
             .ok()
@@ -1717,7 +1786,9 @@ impl App {
     /// Open the public-key modification dialog when the current selection is a
     /// certificate's `subjectPublicKeyInfo`. Returns whether it was opened.
     fn open_public_key_editor(&mut self) -> bool {
-        if !self.file_open || !self.selection_is_cert_spki() {
+        // Re-keying is unavailable in single-file mode, so 'e' on the SPKI falls
+        // through to the ordinary value editor there.
+        if self.single_file || !self.file_open || !self.selection_is_cert_spki() {
             return false;
         }
         self.start_rekey();
@@ -2034,6 +2105,10 @@ impl App {
     /// regardless of the current selection (reached from the SPKI via 'e', from
     /// the 'E' edit menu, or from the 'z' cryptographic-adjustment menu).
     pub fn start_rekey(&mut self) {
+        if self.single_file {
+            self.status = "re-keying is not available in single-file mode".to_string();
+            return;
+        }
         if cert_paths(&self.roots).is_none() {
             self.status = "re-keying is only available for a certificate".to_string();
             return;
@@ -3089,8 +3164,9 @@ impl App {
                 desc: "toggle key purposes and add OIDs in dot notation",
             });
         }
-        // On a certificate's subjectPublicKeyInfo, offer to re-key the cert.
-        if self.selection_is_cert_spki() {
+        // On a certificate's subjectPublicKeyInfo, offer to re-key the cert
+        // (not in single-file mode, where re-keying is disabled).
+        if !self.single_file && self.selection_is_cert_spki() {
             items.push(MenuItem {
                 action: MenuAction::Rekey,
                 label: "Re-key this cert",
@@ -3105,6 +3181,11 @@ impl App {
     /// 'z' on a certificate or CRL: offer the cryptographic adjustments —
     /// re-signing and (for a certificate) re-keying — as a small menu.
     fn start_crypto_menu(&mut self) {
+        if self.single_file {
+            self.status =
+                "re-signing and re-keying are not available in single-file mode".to_string();
+            return;
+        }
         let der = ber::encode_forest(&self.roots);
         let Some(signable) = x509::parse_signable(&self.roots, &der) else {
             self.status = "not an encrypted key, PKCS#12, certificate or CRL".to_string();
@@ -4390,6 +4471,29 @@ mod tests {
         test_app(&der)
     }
 
+    /// Build a single-file-mode app over a committed certificate fixture.
+    fn single_file_app(rel: &str) -> App {
+        let der =
+            std::fs::read(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(rel)).unwrap();
+        let roots = ber::parse_forest(&der, 0).unwrap();
+        App::new_single_file(
+            PathBuf::from(rel),
+            PathBuf::from("/nonexistent/out"),
+            Container::Raw,
+            roots,
+            der.len(),
+        )
+    }
+
+    /// Select the certificate's subjectPublicKeyInfo row.
+    fn select_spki(app: &mut App) {
+        let paths = cert_paths(&app.roots).expect("certificate");
+        let idx = (0..app.rows.len())
+            .find(|&i| app.rows[i].source == RowSource::Document && app.rows[i].path == paths.spki)
+            .expect("SPKI row");
+        app.select(idx);
+    }
+
     /// Row index of the first BasicConstraints Extension SEQUENCE.
     fn bc_row(app: &App) -> usize {
         (0..app.rows.len())
@@ -4804,6 +4908,114 @@ mod tests {
             ),
             "the extensions container must not open an extension-specific editor"
         );
+    }
+
+    /// Dir mode keeps the issuer↔issued relations: selecting a leaf shows who
+    /// signed it, selecting the root shows what it signs.
+    #[test]
+    fn dir_mode_relations_survive_selection_and_preview() {
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("testdata/chain");
+        let mut app = App::new_dir(dir);
+        browser_select_by_name(&mut app, "server.der");
+        app.preview_browser_selection();
+        app.recompute_browser_relations();
+        assert!(
+            app.browser_relations.signed_by.is_some(),
+            "server.der should show its issuer arrow"
+        );
+        browser_select_by_name(&mut app, "root_ca.der");
+        app.preview_browser_selection();
+        app.recompute_browser_relations();
+        assert!(
+            !app.browser_relations.signs.is_empty(),
+            "root_ca.der should show arrows to what it signs"
+        );
+    }
+
+    #[test]
+    fn single_file_mode_opens_only_the_given_file() {
+        let app = single_file_app("testdata/chain/server.der");
+        assert!(app.single_file);
+        assert!(app.file_open);
+        assert!(matches!(app.focus, Focus::Document));
+        // No *other* file on disk is looked at: the browser is empty, no keys
+        // were scanned, and the only signable/CA candidate is the open document
+        // itself (added for self-signed verification, not from a scan).
+        assert!(app.browser.rows.is_empty(), "browser is not populated");
+        assert!(app.key_files.is_empty(), "no key-file scan");
+        assert!(
+            app.signables.iter().all(|f| f.path == app.path),
+            "signables holds only the open document"
+        );
+        assert!(
+            app.ca_index.iter().all(|c| c.path == app.path),
+            "ca_index holds only the open document"
+        );
+        // The document itself is still parsed and shown.
+        assert!(!app.rows.is_empty());
+    }
+
+    #[test]
+    fn single_file_mode_disables_focus_toggle_and_fs_refresh() {
+        let mut app = single_file_app("testdata/chain/server.der");
+        app.toggle_focus();
+        assert!(matches!(app.focus, Focus::Document), "Tab must not switch panes");
+        assert!(!app.refresh_filesystem(), "the filesystem is never polled");
+    }
+
+    #[test]
+    fn single_file_mode_refuses_resign_and_rekey() {
+        let mut app = single_file_app("testdata/chain/server.der");
+        app.start_resign();
+        assert!(matches!(app.mode, Mode::Browse));
+        assert!(app.status.contains("not available"), "resign refused: {}", app.status);
+
+        app.start_rekey();
+        assert!(matches!(app.mode, Mode::Browse));
+        assert!(app.status.contains("not available"), "rekey refused: {}", app.status);
+    }
+
+    #[test]
+    fn single_file_mode_z_on_certificate_does_not_open_crypto_menu() {
+        let mut app = single_file_app("testdata/chain/server.der");
+        app.start_decrypt(); // 'z' — not an encrypted container, so it would be the crypto menu
+        assert!(matches!(app.mode, Mode::Browse), "no cryptographic-adjustment menu");
+        assert!(app.status.contains("not available"));
+    }
+
+    #[test]
+    fn single_file_mode_edit_menu_omits_rekey_on_spki() {
+        let mut app = single_file_app("testdata/chain/server.der");
+        select_spki(&mut app);
+        app.open_edit_menu();
+        let Mode::EditMenu(ref m) = app.mode else { panic!("menu not open") };
+        assert!(
+            !m.items.iter().any(|i| i.action == MenuAction::Rekey),
+            "single-file mode must not offer 'Re-key this cert'"
+        );
+    }
+
+    #[test]
+    fn single_file_mode_e_on_spki_does_not_open_pubkey_editor() {
+        let mut app = single_file_app("testdata/chain/server.der");
+        select_spki(&mut app);
+        app.edit_selected(); // 'e' — would open the re-key dialog in full mode
+        assert!(
+            !matches!(app.mode, Mode::EditPubKey(_)),
+            "single-file mode must not open the public-key editor"
+        );
+    }
+
+    /// In full (directory) mode the same actions remain available — a guard
+    /// against the single-file flag leaking into normal operation.
+    #[test]
+    fn full_mode_still_offers_rekey_on_spki() {
+        let mut app = cert_app("testdata/chain/server.der");
+        assert!(!app.single_file);
+        select_spki(&mut app);
+        app.open_edit_menu();
+        let Mode::EditMenu(ref m) = app.mode else { panic!("menu not open") };
+        assert!(m.items.iter().any(|i| i.action == MenuAction::Rekey));
     }
 
     #[test]

@@ -744,8 +744,12 @@ outgoing edge is broken the whole trunk turns red, otherwise only the
 broken targets' stubs do. The gutters take up columns only while there is
 an arrow to draw. Routing (corner/junction/color selection per row) lives
 in `tui::arrow_gutters`, a pure function unit-tested separately from any
-rendering; edges to rows hidden inside collapsed directories are skipped.
-A short colored legend sits on the pane's bottom border.
+rendering. An edge whose endpoint is hidden inside a collapsed directory
+is routed to the **deepest visible ancestor directory row** instead
+(`endpoint_row`), so the association stays indicated — the arrow points at
+the folder the counterpart lives in; several hidden edges resolving to the
+same directory row merge into one stub (red only when every covered edge
+is broken). A short colored legend sits on the pane's bottom border.
 
 `App::browser_relations` is recomputed whenever the browser selection
 moves, and also whenever `sig_status` is (`App::recompute_sig_status`,
@@ -1284,7 +1288,21 @@ Built with ratatui 0.29 (bundled crossterm backend, `ratatui::init()` /
   status message      | q quit  Tab switch pane  ↑↓ move  ←→ fold  ⏎ toggle  e edit  s save
 ```
 
-* **Far-left pane — file browser.** A folding directory tree (`src/browser.rs`)
+**Startup modes.** The three-pane layout above is the *directory mode*, entered
+when the program is given a directory (`App::new_dir`) or — for the tests — a
+file with a full directory scan (`App::new`). Giving an explicit **file** on the
+command line instead enters **single-file mode** (`App::new_single_file`): only
+that file is opened, the directory is *never* scanned (no `signables`,
+`ca_index`, `key_files`, relation graph or key links, and
+`refresh_filesystem` is a no-op), the browser pane is **hidden** (the structure
+and content panes take the full width), and the cross-file cryptographic actions
+— **re-signing** and **re-keying** — are disabled (`start_resign` / `start_rekey`
+/ `start_crypto_menu` refuse, and the `E`-menu / `e`-on-SPKI entry points do not
+offer them). Read-only signature verification against the document itself
+(self-signed) still runs. The `single_file` flag on `App` gates all of this.
+
+* **Far-left pane — file browser** (directory mode only; hidden in single-file
+  mode). A folding directory tree (`src/browser.rs`)
   of the directory the current file lives in (or, if the program was
   started with a directory instead of a file, that directory, with the
   other two panes starting empty until the first navigation). Fold marker

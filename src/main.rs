@@ -21,9 +21,14 @@ const USAGE: &str = "\
 Usage: asn1-editor [OPTIONS] <FILE|DIR>
 
 TUI ASN.1 (BER/DER) viewer and editor. Accepts raw DER/BER, PEM,
-base64 and hex input files. Given a directory instead of a file, it
-starts with the file browser pane showing that directory and no
-document loaded; pick a file from it (Enter) to open it.
+base64 and hex input files.
+
+Given a single file, only that file is opened (single-file mode): no
+other files are looked at, the file browser pane is hidden and the
+re-signing / re-keying actions are unavailable. Given a directory
+instead, it starts with the file browser pane showing that directory
+and no document loaded; pick a file from it (Enter) to open it, with
+the full cross-file features (relation arrows, key links, re-signing).
 
 Options:
   -d, --dump        print a dumpasn1-style dump instead of starting the TUI
@@ -97,7 +102,9 @@ fn main() -> ExitCode {
     }
 
     let out_path = out_path.unwrap_or_else(|| path.clone());
-    let mut app = App::new(path, out_path, container, roots, der.len());
+    // An explicit file argument opens exactly that file: single-file mode, with
+    // no directory scan, no browser pane and no re-signing / re-keying.
+    let mut app = App::new_single_file(path, out_path, container, roots, der.len());
     load_specs_into(&mut app);
     match tui::run(app) {
         Ok(()) => ExitCode::SUCCESS,

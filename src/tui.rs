@@ -331,15 +331,24 @@ fn handle_edit_key(app: &mut App, key: KeyEvent) {
 fn draw(frame: &mut Frame, app: &mut App) {
     let [main, status] =
         Layout::vertical([Constraint::Min(3), Constraint::Length(1)]).areas(frame.area());
-    let [browser, tree, content] = Layout::horizontal([
-        Constraint::Percentage(20),
-        Constraint::Percentage(34),
-        Constraint::Percentage(46),
-    ])
-    .areas(main);
-    draw_browser(frame, app, browser);
-    draw_tree(frame, app, tree);
-    draw_content(frame, app, content);
+    if app.single_file {
+        // No browser pane: give the structure and content panes the full width.
+        let [tree, content] =
+            Layout::horizontal([Constraint::Percentage(42), Constraint::Percentage(58)])
+                .areas(main);
+        draw_tree(frame, app, tree);
+        draw_content(frame, app, content);
+    } else {
+        let [browser, tree, content] = Layout::horizontal([
+            Constraint::Percentage(20),
+            Constraint::Percentage(34),
+            Constraint::Percentage(46),
+        ])
+        .areas(main);
+        draw_browser(frame, app, browser);
+        draw_tree(frame, app, tree);
+        draw_content(frame, app, content);
+    }
     draw_status(frame, app, status);
     if matches!(app.mode, Mode::TypePicker(_)) {
         draw_picker(frame, app, main);
@@ -886,6 +895,29 @@ struct ArrowGutters {
 /// the file path of every *visible* browser row; edges whose other end is
 /// not visible (inside a collapsed directory) are skipped — there is no
 /// row to draw them to.
+/// Map a relation endpoint to the browser row it should be drawn at: the
+/// row of the path itself or — when the file is hidden inside a collapsed
+/// directory — the deepest *visible* ancestor directory row, so the
+/// association is still indicated (the arrow points at the folder the
+/// counterpart lives in). `None` when no row covers the path at all.
+fn endpoint_row(row_paths: &[&std::path::Path], p: &std::path::Path) -> Option<usize> {
+    if let Some(i) = row_paths.iter().position(|q| *q == p) {
+        return Some(i);
+    }
+    // Only directory rows can be a proper prefix of a file path, and of the
+    // visible ancestors the deepest one is the collapsed dir hiding the file.
+    let mut best: Option<(usize, usize)> = None; // (row, ancestor depth)
+    for (i, q) in row_paths.iter().enumerate() {
+        if p.starts_with(q) {
+            let depth = q.components().count();
+            if best.is_none_or(|(_, d)| depth > d) {
+                best = Some((i, depth));
+            }
+        }
+    }
+    best.map(|(i, _)| i)
+}
+
 fn arrow_gutters(row_paths: &[&std::path::Path], selected: usize, rel: &FileRelations) -> ArrowGutters {
     let n = row_paths.len();
     let mut g =
@@ -904,9 +936,11 @@ fn arrow_gutters(row_paths: &[&std::path::Path], selected: usize, rel: &FileRela
     let mut endpoints: Vec<usize> = rel
         .key_links
         .iter()
-        .filter_map(|p| row_paths.iter().position(|q| q == p))
+        .filter_map(|p| endpoint_row(row_paths, p))
         .filter(|&i| i != selected)
         .collect();
+    endpoints.sort_unstable();
+    endpoints.dedup();
     if !endpoints.is_empty() {
         endpoints.push(selected);
         let lo = *endpoints.iter().min().unwrap();
@@ -927,7 +961,7 @@ fn arrow_gutters(row_paths: &[&std::path::Path], selected: usize, rel: &FileRela
     //   │                  or  │
     //   ╰─►  selected          ╰──  signer
     if let Some(edge) = &rel.signed_by {
-        if let Some(src) = row_paths.iter().position(|p| *p == edge.other) {
+        if let Some(src) = endpoint_row(row_paths, &edge.other) {
             if src != selected {
                 let color = if edge.verified { REL_SIGNER } else { REL_BROKEN };
                 let (top, bottom) = (src.min(selected), src.max(selected));
@@ -950,17 +984,18 @@ fn arrow_gutters(row_paths: &[&std::path::Path], selected: usize, rel: &FileRela
     //   target   ◄──┤
     //   other        │
     //   target   ◄──╯
-    let targets: Vec<(usize, bool)> = rel
-        .signs
-        .iter()
-        .filter_map(|e| {
-            row_paths
-                .iter()
-                .position(|p| *p == e.other)
-                .filter(|i| *i != selected)
-                .map(|i| (i, e.verified))
-        })
-        .collect();
+    // Several hidden edges may resolve to the same collapsed-directory row;
+    // merge them (the merged stub is red only when every covered edge is).
+    let mut targets: Vec<(usize, bool)> = Vec::new();
+    for e in &rel.signs {
+        let Some(i) = endpoint_row(row_paths, &e.other).filter(|i| *i != selected) else {
+            continue;
+        };
+        match targets.iter_mut().find(|(row, _)| *row == i) {
+            Some((_, verified)) => *verified = *verified || e.verified,
+            None => targets.push((i, e.verified)),
+        }
+    }
     if !targets.is_empty() {
         let rows_min = targets.iter().map(|(i, _)| *i).min().unwrap().min(selected);
         let rows_max = targets.iter().map(|(i, _)| *i).max().unwrap().max(selected);
@@ -2197,6 +2232,10 @@ fn draw_edit_menu(frame: &mut Frame, app: &App, area: Rect) {
 fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
     let dirty = if app.dirty { " [modified]" } else { "" };
     let hints = match app.mode {
+        // Single-file mode: no browser pane, no re-signing — trimmed hints.
+        Mode::Browse if app.single_file => {
+            "q quit  ↑↓ move  ←→ fold  ⏎ toggle  e edit  E edit-menu  i/I insert  d delete  J/K reorder  s save  z decrypt  [ ] scroll"
+        }
         Mode::Browse if app.focus == Focus::Browser => {
             "q quit  Tab switch pane  ↑↓ move+preview  ←→ fold  ⏎ switch to file/fold  z decrypt/re-sign  t trust"
         }
@@ -2549,6 +2588,96 @@ mod tests {
 
     fn app_on_ext_key_usage(rel: &str) -> App {
         app_selecting(rel, |n| extended_key_usage::value_index(n).is_some())
+    }
+
+    /// Interactive dir-mode flow: arrows render as the selection moves.
+    #[test]
+    fn dir_mode_renders_issuer_arrows_interactively() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("testdata/chain");
+        let mut app = App::new_dir(dir);
+        let mut term = Terminal::new(TestBackend::new(170, 30)).unwrap();
+        // Simulate the real event loop: draw, then key presses via the handler.
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let down = KeyEvent::new(KeyCode::Down, event::KeyModifiers::NONE);
+        for _ in 0..5 {
+            handle_browser_key(&mut app, down);
+            term.draw(|f| draw(f, &mut app)).unwrap();
+            let text = buffer_text(term.backend().buffer());
+            assert!(
+                text.contains('►') || text.contains('◄'),
+                "issuer arrows should render for {:?}",
+                app.browser.selected_entry().map(|e| e.name.clone())
+            );
+        }
+    }
+
+    #[test]
+    fn endpoint_row_resolves_exact_and_deepest_visible_ancestor() {
+        let rows =
+            [Path::new("/d/a.der"), Path::new("/d/sub"), Path::new("/d/sub/deep"), Path::new("/d/b.der")];
+        // Exact match wins.
+        assert_eq!(endpoint_row(&rows, Path::new("/d/b.der")), Some(3));
+        // Hidden inside a collapsed dir: the deepest visible ancestor row.
+        assert_eq!(endpoint_row(&rows, Path::new("/d/sub/x.der")), Some(1));
+        assert_eq!(endpoint_row(&rows, Path::new("/d/sub/deep/y.der")), Some(2));
+        // No covering row at all.
+        assert_eq!(endpoint_row(&rows, Path::new("/elsewhere/z.der")), None);
+    }
+
+    /// A signer hidden inside a collapsed directory still gets an arrow —
+    /// routed to the directory row (regression: the user's playground held a
+    /// duplicate copy of the issuer inside an unexpanded subdirectory, and
+    /// the issuer edge silently vanished).
+    #[test]
+    fn hidden_signer_routes_arrow_to_collapsed_directory_row() {
+        let rows = [Path::new("/d/server.der"), Path::new("/d/sub")];
+        let rel = FileRelations {
+            signed_by: Some(edge("/d/sub/ca.der", true)),
+            signs: vec![],
+            key_links: vec![],
+        };
+        let g = arrow_gutters(&rows, 0, &rel);
+        assert_eq!(cells(&g.left), [Some("╭─► "), Some("╰── ")]);
+    }
+
+    /// Multiple hidden signed objects inside the same collapsed directory
+    /// merge into a single stub on the directory row.
+    #[test]
+    fn hidden_signs_edges_merge_on_the_directory_row() {
+        let rows = [Path::new("/d/ca.der"), Path::new("/d/sub")];
+        let rel = FileRelations {
+            signed_by: None,
+            signs: vec![edge("/d/sub/leaf1.der", true), edge("/d/sub/leaf2.der", false)],
+            key_links: vec![],
+        };
+        let g = arrow_gutters(&rows, 0, &rel);
+        assert_eq!(cells(&g.right), [Some("───╮"), Some("◄──╯")]);
+        // Merged stub keeps the healthy color while any covered edge verifies.
+        assert_eq!(g.right[1].as_ref().unwrap().1, REL_SIGNS);
+    }
+
+    #[test]
+    fn single_file_mode_hides_the_browser_pane() {
+        use crate::input::Container;
+        use ratatui::{backend::TestBackend, Terminal};
+        let der =
+            std::fs::read(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("testdata/cert_ec.der"))
+                .unwrap();
+        let roots = parse_forest(&der, 0).unwrap();
+        let mut app = App::new_single_file(
+            PathBuf::from("cert_ec.der"),
+            PathBuf::from("/nonexistent/out"),
+            Container::Raw,
+            roots,
+            der.len(),
+        );
+        let mut term = Terminal::new(TestBackend::new(160, 30)).unwrap();
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let text = buffer_text(term.backend().buffer());
+        assert!(text.contains("Structure"), "the structure pane is shown:\n{text}");
+        assert!(text.contains("Content"), "the content pane is shown");
+        assert!(!text.contains("Files"), "the file browser pane must be hidden:\n{text}");
     }
 
     /// Flatten a rendered buffer to text, one line per row.

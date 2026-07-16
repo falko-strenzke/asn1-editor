@@ -52,6 +52,7 @@ fn is_pq(sig_alg: &[u64]) -> bool {
     matches!(sig_alg, [2, 16, 840, 1, 101, 3, 4, 3, arc] if PQ_SIG_ARCS.contains(arc))
 }
 
+#[derive(Debug)]
 pub enum SignatureStatus {
     Verified { issuer_path: PathBuf, issuer_summary: String, self_signed: bool },
     Invalid { issuer_path: PathBuf, issuer_summary: String },
