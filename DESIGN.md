@@ -140,10 +140,12 @@ tests/
   oid_repository.rs  test-corpus OID coverage plus ML-DSA/SLH-DSA coverage
 specs/asn1/  ASN.1 specification modules (rfc5280: certificates + CRLs;
              rfc5208: PKCS#8 private keys; rfc5958: asymmetric key packages;
-             rfc5915: SEC1 EC private keys; rfc7292: PKCS#12)
+             rfc5915: SEC1 EC private keys; rfc7292: PKCS#12; rfc5652: CMS;
+             rfc9881/rfc9909: ML-DSA / SLH-DSA)
 testdata/  DER samples (EC cert, RSA cert, SEC1 EC key, PKCS#8 key,
            encrypted PKCS#8 key [password "asn1editor"], PKCS#12
-           [password "asn1editor"], PKCS#7, CRL)
+           [password "asn1editor"], PKCS#7, CRL, CMS signed message
+           [cms_signed.der, signed by keylink/cert_ec.der])
   chain/   a 3-level ECDSA P-256 hierarchy (root CA -> intermediate CA ->
            TLS server leaf) plus CRLs from the root and intermediate, for
            exercising signature verification (§9) end to end; also
@@ -156,7 +158,8 @@ testdata/  DER samples (EC cert, RSA cert, SEC1 EC key, PKCS#8 key,
 ```
 
 Dependency rule: `ber.rs` and `oid.rs` depend on nothing; `input.rs` and
-`spec.rs` depend only on `ber.rs`, while `dump.rs` uses `ber.rs` plus the
+`spec.rs` depend only on `ber.rs` (`spec.rs` additionally consults `oid.rs`
+for `ANY DEFINED BY` resolution), while `dump.rs` uses `ber.rs` plus the
 shared OID repository; `browser.rs` depends only on the standard library
 (it knows nothing about ASN.1); `x509.rs` depends on `ber.rs` + `input.rs`
 (structural decoding only, no crypto); `verify.rs` depends on `x509.rs` +
@@ -541,15 +544,27 @@ or lose its labels as edits make it conform or not conform to a spec.
 * Content pane: a `Spec` line with the selected element's field and type
   name plus the overall document type and source file.
 
-Not yet done (future work): OID-to-*type* dispatch for `ANY DEFINED BY`
-and OCTET STRING bodies whose type is selected by a sibling OID (e.g.
-labeling an X.509 extension's `extnValue` according to its `extnID`, or an
-RSA private key by its algorithm OID). This is separate from the OID name
-repository in §8a: the latter resolves values for display but does not map
-an algorithm/extension OID to an ASN.1 schema. The encapsulation post-pass
-above labels nested content only when it structurally matches a bundled
-type on its own. Value-level checks are also future work (constraints are
-ignored).
+**`ANY DEFINED BY` resolution.** `ANY DEFINED BY <field>` is a distinct type
+(`Type::AnyDefinedBy`) that first tries to resolve the value's actual type
+through the defining OBJECT IDENTIFIER: during SEQUENCE/SET matching, the
+arcs of the most recently matched OID sibling travel in the match context
+(surviving EXPLICIT-tag wrappers, for `content [0] EXPLICIT ANY DEFINED BY
+contentType` shapes); the OID's §8a repository short name, capitalised, is
+looked up in the database (id-signedData → "signedData" → `SignedData`) and
+must then match structurally — labeling the entire subtree. An unknown OID,
+an unresolvable name, or a structural mismatch falls back to plain `ANY`.
+This is how a CMS `ContentInfo` (RFC 5652) gets its `SignedData` content
+fully annotated. Equally scoring identification candidates are ranked:
+a definition that is itself a transparent untagged CHOICE/ANY loses to a
+direct type (a certificate is a `Certificate`, not CMS's transparent
+`CertificateChoices`), then the newer source wins (RFC 5958 over RFC 5208).
+
+Not yet done (future work): the same OID-to-type dispatch for OCTET STRING
+bodies whose type is selected by a sibling OID (e.g. labeling an X.509
+extension's `extnValue` according to its `extnID`, or an RSA private key by
+its algorithm OID) — the encapsulation post-pass above labels such nested
+content only when it structurally matches a bundled type on its own.
+Value-level checks are also future work (constraints are ignored).
 
 ## 8a. Built-in OID repository (`src/oid.rs`)
 

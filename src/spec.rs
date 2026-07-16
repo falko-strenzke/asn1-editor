@@ -46,8 +46,15 @@ pub enum TagMode {
 pub enum Type {
     /// Reference to a named type (resolved via the whole database).
     Reference(String),
-    /// ANY / ANY DEFINED BY ...: matches any single element.
+    /// ANY: matches any single element.
     Any,
+    /// ANY DEFINED BY <field>: matches any single element, but first tries
+    /// to resolve the value's type through the defining OBJECT IDENTIFIER
+    /// (the most recently matched OID sibling): the OID's repository short
+    /// name, capitalised, is looked up in the database (id-signedData →
+    /// "signedData" → `SignedData`) and matched structurally. Unknown or
+    /// non-matching content falls back to plain ANY.
+    AnyDefinedBy(String),
     /// A universal primitive type, identified by its tag number.
     Primitive(u32),
     Sequence(Vec<Field>),
@@ -442,9 +449,13 @@ impl Parser {
                     if !self.eat_kw("BY") {
                         return self.err("expected BY");
                     }
-                    self.next(); // the field name
+                    match self.next() {
+                        Some(Tok::Ident(field)) => Type::AnyDefinedBy(field),
+                        _ => return self.err("expected the defining field name"),
+                    }
+                } else {
+                    Type::Any
                 }
-                Type::Any
             }
             "BOOLEAN" => Type::Primitive(1),
             "NULL" => Type::Primitive(5),
@@ -588,6 +599,10 @@ pub struct Identification {
 struct Ctx {
     field: Option<String>,
     names: Vec<String>,
+    /// Arcs of the most recently matched OBJECT IDENTIFIER sibling in the
+    /// enclosing SEQUENCE/SET — the value `ANY DEFINED BY` resolves through.
+    /// Inherited across EXPLICIT-tag wrappers.
+    defined_by: Option<Vec<u64>>,
 }
 
 /// Try to identify the document (a single top-level element) against every
@@ -612,10 +627,10 @@ pub fn identify(db: &SpecDb, roots: &[Node]) -> Option<Identification> {
     if roots.len() != 1 {
         return None;
     }
-    let mut best: Option<(usize, Identification)> = None;
+    let mut best: Option<(usize, usize, Identification)> = None;
     for def in &db.types {
         let mut out = Vec::new();
-        let ctx = Ctx { field: None, names: vec![def.name.clone()] };
+        let ctx = Ctx { field: None, names: vec![def.name.clone()], defined_by: None };
         if match_type(db, &def.ty, &roots[0], &ctx, &[0], &mut out, def.implicit_tags, true, 0) {
             let score = out.len();
             // A single labeled node means the type carried no structural
@@ -623,13 +638,26 @@ pub fn identify(db: &SpecDb, roots: &[Node]) -> Option<Identification> {
             if score < 2 {
                 continue;
             }
+            // Rank equally scoring matches by how strong a structural claim
+            // the definition makes: an untagged CHOICE (or ANY) adds no
+            // encoding of its own — it matched purely through one of its
+            // alternatives, so the direct type is the more precise
+            // identification (e.g. a certificate is a `Certificate`, not
+            // RFC 5652's `CertificateChoices`). Beyond that, the newer
+            // source wins (RFC 5958 over RFC 5208).
+            let rank = usize::from(!resolves_to_untagged(db, &def.ty, 0));
             let better = match &best {
                 None => true,
-                Some((s, id)) => score > *s || (score == *s && def.source > id.source),
+                Some((s, best_rank, id)) => {
+                    score > *s
+                        || (score == *s && rank > *best_rank)
+                        || (score == *s && rank == *best_rank && def.source > id.source)
+                }
             };
             if better {
                 best = Some((
                     score,
+                    rank,
                     Identification {
                         type_name: def.name.clone(),
                         source: def.source.clone(),
@@ -639,7 +667,7 @@ pub fn identify(db: &SpecDb, roots: &[Node]) -> Option<Identification> {
             }
         }
     }
-    let mut ident = best.map(|(_, ident)| ident)?;
+    let mut ident = best.map(|(_, _, ident)| ident)?;
     label_encapsulated(db, roots, &[], &mut ident.labels);
     Some(ident)
 }
@@ -681,7 +709,7 @@ fn kind_name(ty: &Type) -> String {
         Type::Sequence(_) | Type::SequenceOf(_) => "SEQUENCE".to_string(),
         Type::Set(_) | Type::SetOf(_) => "SET".to_string(),
         Type::Choice(_) => "CHOICE".to_string(),
-        Type::Any => "ANY".to_string(),
+        Type::Any | Type::AnyDefinedBy(_) => "ANY".to_string(),
         Type::Primitive(t) => crate::ber::universal_tag_name(*t).to_string(),
         Type::Reference(n) => n.clone(),
         Type::Tagged { number, .. } => format!("[{}]", number),
@@ -701,7 +729,7 @@ fn resolves_to_untagged(db: &SpecDb, ty: &Type, depth: usize) -> bool {
         return false;
     }
     match ty {
-        Type::Choice(_) | Type::Any => true,
+        Type::Choice(_) | Type::Any | Type::AnyDefinedBy(_) => true,
         Type::Reference(name) => db
             .resolve(name)
             .is_some_and(|d| resolves_to_untagged(db, &d.ty, depth + 1)),
@@ -738,6 +766,42 @@ fn match_type(
             match_type(db, &def.ty, node, &ctx, path, out, def.implicit_tags, check_tag, depth + 1)
         }
         Type::Any => {
+            commit(ctx, ty, path, out);
+            true
+        }
+        Type::AnyDefinedBy(_) => {
+            // Resolve the value's type through the defining OID: repository
+            // short name, capitalised, looked up in the database
+            // (id-signedData → "signedData" → `SignedData`). The resolved
+            // type must then match structurally — which labels the whole
+            // subtree; anything else falls back to plain ANY.
+            if let Some(arcs) = &ctx.defined_by {
+                if let Some(entry) = crate::oid::lookup(arcs) {
+                    let mut name = entry.short_name.to_string();
+                    if let Some(first) = name.get_mut(0..1) {
+                        first.make_ascii_uppercase();
+                    }
+                    if let Some(def) = db.resolve(&name) {
+                        let mark = out.len();
+                        let mut sub = ctx.clone();
+                        sub.names.push(name);
+                        if match_type(
+                            db,
+                            &def.ty,
+                            node,
+                            &sub,
+                            path,
+                            out,
+                            def.implicit_tags,
+                            true,
+                            depth + 1,
+                        ) {
+                            return true;
+                        }
+                        out.truncate(mark);
+                    }
+                }
+            }
             commit(ctx, ty, path, out);
             true
         }
@@ -813,7 +877,9 @@ fn match_type(
                 commit(ctx, ty, path, out);
                 let mut child_path = path.to_vec();
                 child_path.push(0);
-                let ctx = Ctx::default();
+                // The defining OID stays visible through the wrapper, for
+                // `content [0] EXPLICIT ANY DEFINED BY contentType` shapes.
+                let ctx = Ctx { defined_by: ctx.defined_by.clone(), ..Ctx::default() };
                 match_type(db, inner, &node.children[0], &ctx, &child_path, out, implicit_default, true, depth + 1)
             }
         }
@@ -841,6 +907,7 @@ fn match_fields(
         path: &[usize],
         out: &mut Vec<(Vec<usize>, Label)>,
         implicit_default: bool,
+        defined_by: Option<Vec<u64>>,
         depth: usize,
     ) -> bool {
         if fi == fields.len() {
@@ -851,20 +918,34 @@ fn match_fields(
             let mark = out.len();
             let mut child_path = path.to_vec();
             child_path.push(ci);
-            let ctx = Ctx { field: Some(field.name.clone()), names: Vec::new() };
-            if match_type(db, &field.ty, &node.children[ci], &ctx, &child_path, out, implicit_default, true, depth + 1)
-                && rec(db, fields, node, fi + 1, ci + 1, path, out, implicit_default, depth)
+            let child = &node.children[ci];
+            let ctx = Ctx {
+                field: Some(field.name.clone()),
+                names: Vec::new(),
+                defined_by: defined_by.clone(),
+            };
+            if match_type(db, &field.ty, child, &ctx, &child_path, out, implicit_default, true, depth + 1)
             {
-                return true;
+                // Track the most recent OBJECT IDENTIFIER sibling: it is what
+                // a later `ANY DEFINED BY` component resolves through.
+                let next_defined_by = if child.is_universal(crate::ber::TAG_OID) {
+                    crate::ber::oid_arcs(&child.value).or_else(|| defined_by.clone())
+                } else {
+                    defined_by.clone()
+                };
+                if rec(db, fields, node, fi + 1, ci + 1, path, out, implicit_default, next_defined_by, depth)
+                {
+                    return true;
+                }
             }
             out.truncate(mark);
         }
         if field.optional {
-            return rec(db, fields, node, fi + 1, ci, path, out, implicit_default, depth);
+            return rec(db, fields, node, fi + 1, ci, path, out, implicit_default, defined_by, depth);
         }
         false
     }
-    rec(db, fields, node, 0, 0, path, out, implicit_default, depth)
+    rec(db, fields, node, 0, 0, path, out, implicit_default, None, depth)
 }
 
 #[cfg(test)]
@@ -902,6 +983,54 @@ mod tests {
     /// time, so the test is independent of the working directory).
     fn specs_root() -> std::path::PathBuf {
         std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("specs")
+    }
+
+    #[test]
+    fn any_defined_by_resolves_through_the_oid_repository() {
+        let mut db = SpecDb::default();
+        db.add(
+            parse_spec(
+                "mini-cms",
+                r#"
+                MiniCms { iso(1) test(99) } DEFINITIONS EXPLICIT TAGS ::=
+                BEGIN
+                Wrap ::= SEQUENCE {
+                    ct   OBJECT IDENTIFIER,
+                    body [0] EXPLICIT ANY DEFINED BY ct }
+                SignedData ::= SEQUENCE { version INTEGER }
+                END
+                "#,
+            )
+            .unwrap(),
+        );
+        // SEQUENCE { OID id-signedData, [0] { SEQUENCE { INTEGER 1 } } }:
+        // the defining OID's repository name ("signedData", capitalised)
+        // resolves the ANY to the SignedData definition — through the
+        // EXPLICIT [0] wrapper — and its interior gets labeled.
+        let der = [
+            0x30, 0x12, 0x06, 0x09, 0x2A, 0x86, 0x48, 0x86, 0xF7, 0x0D, 0x01, 0x07, 0x02,
+            0xA0, 0x05, 0x30, 0x03, 0x02, 0x01, 0x01,
+        ];
+        let roots = parse_forest(&der, 0).unwrap();
+        let ident = identify(&db, &roots).expect("identified");
+        assert_eq!(ident.type_name, "Wrap");
+        let l = |p: &[usize]| ident.labels.get(p).unwrap();
+        assert!(l(&[0, 1, 0]).type_name.contains("SignedData"), "{:?}", l(&[0, 1, 0]));
+        assert_eq!(l(&[0, 1, 0, 0]).field.as_deref(), Some("version"));
+
+        // An OID the repository does not know falls back to plain ANY (the
+        // body stays a single opaque label).
+        let der_unknown = [
+            0x30, 0x0C, 0x06, 0x03, 0x2A, 0x03, 0x04, // OID 1.2.3.4
+            0xA0, 0x05, 0x30, 0x03, 0x02, 0x01, 0x01,
+        ];
+        let roots = parse_forest(&der_unknown, 0).unwrap();
+        let ident = identify(&db, &roots).expect("identified");
+        assert_eq!(ident.type_name, "Wrap");
+        assert!(!ident
+            .labels
+            .values()
+            .any(|l| l.type_name.contains("SignedData")));
     }
 
     #[test]

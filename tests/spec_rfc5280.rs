@@ -182,12 +182,13 @@ fn pkcs12_is_identified_as_pfx() {
     assert_eq!(ident.type_name, "PFX");
     assert_eq!(ident.source, "rfc7292");
     let label = |path: &[usize]| ident.labels.get(path).unwrap();
-    // PFX ::= SEQUENCE { version, authSafe ContentInfo, macData }
+    // PFX ::= SEQUENCE { version, authSafe PKCS7ContentInfo, macData }
+    // (the local PKCS#7 ContentInfo copy; RFC 5652 owns the plain name)
     assert_eq!(label(&[0, 0]).field.as_deref(), Some("version"));
     assert_eq!(label(&[0, 1]).field.as_deref(), Some("authSafe"));
-    assert_eq!(label(&[0, 1]).type_name, "ContentInfo");
+    assert_eq!(label(&[0, 1]).type_name, "PKCS7ContentInfo");
     assert_eq!(label(&[0, 2]).field.as_deref(), Some("macData"));
-    // ContentInfo ::= SEQUENCE { contentType, content [0] }
+    // PKCS7ContentInfo ::= SEQUENCE { contentType, content [0] }
     assert_eq!(label(&[0, 1, 0]).field.as_deref(), Some("contentType"));
 }
 
@@ -288,4 +289,40 @@ fn unrelated_structure_is_not_misidentified_as_certificate() {
         assert_ne!(ident.type_name, "Certificate");
         assert_ne!(ident.type_name, "CertificateList");
     }
+}
+
+#[test]
+fn cms_signed_message_is_identified_as_content_info() {
+    let db = rfc5280_db();
+    let data = std::fs::read(manifest("testdata/cms_signed.der")).unwrap();
+    let roots = ber::parse_forest(&data, 0).unwrap();
+    let ident = spec::identify(&db, &roots).expect("CMS message not identified");
+    assert_eq!(ident.type_name, "ContentInfo");
+    assert_eq!(ident.source, "rfc5652");
+
+    let label = |path: &[usize]| ident.labels.get(path).unwrap();
+    assert_eq!(label(&[0]).type_name, "ContentInfo");
+    assert_eq!(label(&[0, 0]).field.as_deref(), Some("contentType"));
+    assert_eq!(label(&[0, 0]).type_name, "ContentType");
+    assert_eq!(label(&[0, 1]).field.as_deref(), Some("content"));
+
+    // `content [0] EXPLICIT ANY DEFINED BY contentType`: the defining OID is
+    // id-signedData, so the wrapped element resolves to — and is labeled
+    // throughout as — `SignedData`.
+    let inner = label(&[0, 1, 0]);
+    assert!(
+        inner.type_name.contains("SignedData"),
+        "content resolved through the OID: {:?}",
+        inner
+    );
+    assert_eq!(label(&[0, 1, 0, 0]).field.as_deref(), Some("version"));
+    assert_eq!(label(&[0, 1, 0, 0]).type_name, "CMSVersion");
+    assert_eq!(label(&[0, 1, 0, 1]).field.as_deref(), Some("digestAlgorithms"));
+    assert_eq!(label(&[0, 1, 0, 2]).field.as_deref(), Some("encapContentInfo"));
+    assert_eq!(label(&[0, 1, 0, 2]).type_name, "EncapsulatedContentInfo");
+    assert_eq!(label(&[0, 1, 0, 2, 0]).field.as_deref(), Some("eContentType"));
+    // certificates [0] IMPLICIT CertificateSet OPTIONAL is present (the
+    // signer certificate travels with the message).
+    assert_eq!(label(&[0, 1, 0, 3]).field.as_deref(), Some("certificates"));
+    assert_eq!(label(&[0, 1, 0, 4]).field.as_deref(), Some("signerInfos"));
 }

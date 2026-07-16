@@ -396,6 +396,49 @@ pub static OIDS: &[OidEntry] = &[
             "emailAddress"
         ]
     ),
+    // PKCS#9 attributes carried by CMS signedAttrs (RFC 5652 §11).
+    oid!(
+        "1.2.840.113549.1.9.3",
+        [1, 2, 840, 113549, 1, 9, 3],
+        "contentType",
+        [
+            "iso",
+            "member-body",
+            "us",
+            "rsadsi",
+            "pkcs",
+            "pkcs-9",
+            "contentType"
+        ]
+    ),
+    oid!(
+        "1.2.840.113549.1.9.4",
+        [1, 2, 840, 113549, 1, 9, 4],
+        "messageDigest",
+        [
+            "iso",
+            "member-body",
+            "us",
+            "rsadsi",
+            "pkcs",
+            "pkcs-9",
+            "messageDigest"
+        ]
+    ),
+    oid!(
+        "1.2.840.113549.1.9.5",
+        [1, 2, 840, 113549, 1, 9, 5],
+        "signingTime",
+        [
+            "iso",
+            "member-body",
+            "us",
+            "rsadsi",
+            "pkcs",
+            "pkcs-9",
+            "signingTime"
+        ]
+    ),
     // PKCS#9 attributes carried by PKCS#12 SafeBags (RFC 7292 / RFC 2985).
     oid!(
         "1.2.840.113549.1.9.20",

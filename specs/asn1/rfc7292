@@ -2,7 +2,9 @@
 -- Information Exchange Syntax v1.1", Appendix C, plus the PKCS#7 content
 -- types (ContentInfo, EncryptedData, DigestInfo) it imports from RFC 2315,
 -- reproduced here so a PKCS#12 `PFX` structurally identifies without an
--- external PKCS#7 module.
+-- external PKCS#7 module. The local copy of ContentInfo is spelled
+-- `PKCS7ContentInfo`: the bundled RFC 5652 (CMS) module owns the plain name,
+-- and the PKCS#7 flavor differs in making the content OPTIONAL.
 -- Source: https://www.rfc-editor.org/rfc/rfc7292.txt
 --
 -- Adapted for this tool's ASN.1 subset parser, which implements neither
@@ -43,7 +45,7 @@ AlgorithmIdentifier
 
 PFX ::= SEQUENCE {
     version     INTEGER,
-    authSafe    ContentInfo,
+    authSafe    PKCS7ContentInfo,
     macData     MacData OPTIONAL }
 
 MacData ::= SEQUENCE {
@@ -61,7 +63,7 @@ MacData ::= SEQUENCE {
 
 -- PKCS#7 content types (RFC 2315), reduced to what PKCS#12 uses
 
-ContentInfo ::= SEQUENCE {
+PKCS7ContentInfo ::= SEQUENCE {
     contentType   OBJECT IDENTIFIER,
     content   [0] EXPLICIT ANY OPTIONAL }
 
@@ -76,7 +78,7 @@ EncryptedContentInfo ::= SEQUENCE {
 
 -- The authenticated safe and its bags
 
-AuthenticatedSafe ::= SEQUENCE OF ContentInfo
+AuthenticatedSafe ::= SEQUENCE OF PKCS7ContentInfo
 
 SafeContents ::= SEQUENCE OF SafeBag
 
