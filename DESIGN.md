@@ -1464,9 +1464,12 @@ document pane.
 
 Pressing `/` in the tree view focuses a one-line **filter bar** above the
 Structure pane; it stays visible while its content is non-empty, focused or
-not. The tree updates live as the filter is typed. The single entered string
-is interpreted **simultaneously** in every plausible reading
-(`app::FilterMatcher`) and an element matches when any reading hits:
+not. The tree updates live as the filter is typed. The field is a small line
+editor: `←`/`→` move the cursor (shown as a reversed cell), `Home`/`End`
+jump, `Backspace`/`Delete` edit around it, and characters insert at the
+cursor. The single entered string is interpreted **simultaneously** in every
+plausible reading (`app::FilterMatcher`) and an element matches when any
+reading hits:
 
 * **hex octets** (whitespace ignored, case-insensitive) — substring of a
   primitive element's content octets;
@@ -1488,6 +1491,14 @@ across file switches until cleared with `Esc` in the field. Rows inside the
 decrypted/PKCS#12 virtual trees (§9a/§9b) are filtered with the same matcher
 (a virtual subtree is only reachable while its ciphertext row itself stays
 visible).
+
+While the filter is set and its **hex reading** parses, the content pane's
+hex dump additionally **highlights every occurrence** of those bytes in the
+selected node's content octets (both the hex and the ASCII column,
+black-on-yellow; `hex_match_marks` + the mark-aware `hex_dump_lines`) — so
+after filtering by raw bytes, selecting a matched node shows exactly where
+inside it the bytes sit. The highlight follows the filter: it persists while
+the field is unfocused and disappears when the filter is cleared.
 
 ## 12. Verification against dumpasn1
 

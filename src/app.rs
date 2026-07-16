@@ -89,6 +89,12 @@ impl FilterMatcher {
         FilterMatcher { text: filter.to_lowercase(), hex }
     }
 
+    /// The filter's hex-octets reading, if the string parses as one — used by
+    /// the content pane to highlight the matched bytes in its hex dump.
+    pub fn hex_bytes(&self) -> Option<&[u8]> {
+        self.hex.as_deref()
+    }
+
     /// Whether `node` (with its optional spec label) matches the filter.
     pub fn matches(&self, node: &Node, label: Option<&Label>) -> bool {
         if self.text.is_empty() {
@@ -1302,6 +1308,8 @@ pub struct App {
     /// Tree-filter string ('/'): while non-empty, `rebuild_rows` shows only
     /// matching elements and their ancestors, eliding the rest as `[...]`.
     pub filter: String,
+    /// Cursor position inside the filter field, in characters.
+    pub filter_cursor: usize,
     /// Loaded ASN.1 specifications (may be empty).
     pub spec_db: SpecDb,
     /// Result of matching the document against the specifications.
@@ -1405,6 +1413,7 @@ impl App {
             delete_confirm: false,
             content_scroll: 0,
             filter: String::new(),
+            filter_cursor: 0,
             spec_db: SpecDb::default(),
             ident: None,
             browser,
@@ -1452,6 +1461,7 @@ impl App {
             delete_confirm: false,
             content_scroll: 0,
             filter: String::new(),
+            filter_cursor: 0,
             spec_db: SpecDb::default(),
             ident: None,
             browser,
@@ -1505,6 +1515,7 @@ impl App {
             delete_confirm: false,
             content_scroll: 0,
             filter: String::new(),
+            filter_cursor: 0,
             spec_db: SpecDb::default(),
             ident: None,
             browser: FileBrowser::empty(dir),
@@ -2937,22 +2948,62 @@ impl App {
             return;
         }
         self.mode = Mode::FilterInput;
+        self.filter_cursor = self.filter.chars().count();
         self.status =
             "type to filter — hex / text / integer / OID readings; ⏎ or Tab navigates, Esc clears"
                 .to_string();
     }
 
+    /// Byte offset of the character position `char_idx` in the filter string.
+    fn filter_byte_idx(&self, char_idx: usize) -> usize {
+        self.filter
+            .char_indices()
+            .nth(char_idx)
+            .map(|(i, _)| i)
+            .unwrap_or(self.filter.len())
+    }
+
     pub fn filter_insert_char(&mut self, c: char) {
         if matches!(self.mode, Mode::FilterInput) && !c.is_control() {
-            self.filter.push(c);
+            let at = self.filter_byte_idx(self.filter_cursor);
+            self.filter.insert(at, c);
+            self.filter_cursor += 1;
             self.rebuild_rows();
         }
     }
 
     pub fn filter_backspace(&mut self) {
-        if matches!(self.mode, Mode::FilterInput) {
-            self.filter.pop();
+        if matches!(self.mode, Mode::FilterInput) && self.filter_cursor > 0 {
+            self.filter_cursor -= 1;
+            let at = self.filter_byte_idx(self.filter_cursor);
+            self.filter.remove(at);
             self.rebuild_rows();
+        }
+    }
+
+    /// Delete key: remove the character under the cursor.
+    pub fn filter_delete(&mut self) {
+        if matches!(self.mode, Mode::FilterInput)
+            && self.filter_cursor < self.filter.chars().count()
+        {
+            let at = self.filter_byte_idx(self.filter_cursor);
+            self.filter.remove(at);
+            self.rebuild_rows();
+        }
+    }
+
+    /// ←/→ inside the filter field.
+    pub fn filter_move_cursor(&mut self, delta: isize) {
+        if matches!(self.mode, Mode::FilterInput) {
+            let n = self.filter.chars().count() as isize;
+            self.filter_cursor = (self.filter_cursor as isize + delta).clamp(0, n) as usize;
+        }
+    }
+
+    /// Home/End inside the filter field.
+    pub fn filter_cursor_to(&mut self, end: bool) {
+        if matches!(self.mode, Mode::FilterInput) {
+            self.filter_cursor = if end { self.filter.chars().count() } else { 0 };
         }
     }
 
@@ -2971,6 +3022,7 @@ impl App {
     /// Esc in the filter field: clear the filter and show the full tree again.
     pub fn filter_clear(&mut self) {
         self.filter.clear();
+        self.filter_cursor = 0;
         self.mode = Mode::Browse;
         self.rebuild_rows();
         self.status = "filter cleared".to_string();
@@ -5360,6 +5412,43 @@ mod tests {
         assert_eq!(app.rows.first().map(|r| (r.path.clone(), r.elided)), Some((vec![0], false)));
         assert!(app.rows.iter().any(|r| r.elided));
         assert!(app.rows.len() < 20, "most of the certificate is filtered out");
+    }
+
+    #[test]
+    fn filter_field_cursor_moves_and_edits_in_the_middle() {
+        let mut app = test_app(&FILTER_DOC);
+        app.start_filter();
+        for c in "helo".chars() {
+            app.filter_insert_char(c);
+        }
+        assert_eq!(app.filter_cursor, 4);
+        // ← twice, insert the missing 'l' between "he" and "lo".
+        app.filter_move_cursor(-1);
+        app.filter_move_cursor(-1);
+        app.filter_insert_char('l');
+        assert_eq!(app.filter, "hello");
+        assert_eq!(app.filter_cursor, 3);
+        // Home + Delete removes the leading character.
+        app.filter_cursor_to(false);
+        app.filter_delete();
+        assert_eq!(app.filter, "ello");
+        assert_eq!(app.filter_cursor, 0);
+        // Backspace at position 0 is a no-op; End returns to the tail.
+        app.filter_backspace();
+        assert_eq!(app.filter, "ello");
+        app.filter_cursor_to(true);
+        assert_eq!(app.filter_cursor, 4);
+        app.filter_backspace();
+        assert_eq!(app.filter, "ell");
+        // Cursor never moves past the ends.
+        app.filter_move_cursor(10);
+        assert_eq!(app.filter_cursor, 3);
+        app.filter_move_cursor(-10);
+        assert_eq!(app.filter_cursor, 0);
+        // Re-opening the field puts the cursor at the end again.
+        app.filter_accept();
+        app.start_filter();
+        assert_eq!(app.filter_cursor, 3);
     }
 
     #[test]

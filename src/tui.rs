@@ -29,9 +29,9 @@ use ratatui::widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Wrap};
 use ratatui::{DefaultTerminal, Frame};
 
 use crate::app::{
-    App, DateTimeEditor, EditKind, EditState, Editor, Focus, HexEditor, Mode, PickerTarget,
-    RowSource, TextEditor, TextFormat, DATE_FIELDS, EDIT_BYTES_PER_LINE, EDIT_DIGITS_PER_LINE,
-    PICKER_CLASSES, PICKER_UNIVERSAL,
+    App, DateTimeEditor, EditKind, EditState, Editor, FilterMatcher, Focus, HexEditor, Mode,
+    PickerTarget, RowSource, TextEditor, TextFormat, DATE_FIELDS, EDIT_BYTES_PER_LINE,
+    EDIT_DIGITS_PER_LINE, PICKER_CLASSES, PICKER_UNIVERSAL,
 };
 use crate::x509::{basic_constraints, extended_key_usage, key_usage};
 use crate::browser::FileStatus;
@@ -265,6 +265,11 @@ fn handle_filter_key(app: &mut App, key: KeyEvent) {
         KeyCode::Esc => app.filter_clear(),
         KeyCode::Enter | KeyCode::Tab => app.filter_accept(),
         KeyCode::Backspace => app.filter_backspace(),
+        KeyCode::Delete => app.filter_delete(),
+        KeyCode::Left => app.filter_move_cursor(-1),
+        KeyCode::Right => app.filter_move_cursor(1),
+        KeyCode::Home => app.filter_cursor_to(false),
+        KeyCode::End => app.filter_cursor_to(true),
         KeyCode::Char(c) => app.filter_insert_char(c),
         _ => {}
     }
@@ -1409,17 +1414,30 @@ fn draw_tree(frame: &mut Frame, app: &mut App, area: Rect) {
     let area = if filter_editing || !app.filter.is_empty() {
         let [bar, rest] =
             Layout::vertical([Constraint::Length(1), Constraint::Min(3)]).areas(area);
-        let text_style = if filter_editing { Style::new().bold() } else { Style::new() };
-        let mut spans = vec![
-            Span::styled(" filter / ", Style::new().fg(Color::Cyan).bold()),
-            Span::styled(app.filter.clone(), text_style),
-        ];
+        let mut spans = vec![Span::styled(" filter / ", Style::new().fg(Color::Cyan).bold())];
         if filter_editing {
-            spans.push(Span::styled("▏", Style::new().fg(Color::Cyan)));
+            // Show the cursor position: the character under it is reversed
+            // (a reversed space when the cursor sits at the end).
+            let chars: Vec<char> = app.filter.chars().collect();
+            let cur = app.filter_cursor.min(chars.len());
+            let cursor_style = Style::new().add_modifier(Modifier::REVERSED).bold();
+            spans.push(Span::styled(chars[..cur].iter().collect::<String>(), Style::new().bold()));
+            match chars.get(cur) {
+                Some(c) => {
+                    spans.push(Span::styled(c.to_string(), cursor_style));
+                    spans.push(Span::styled(
+                        chars[cur + 1..].iter().collect::<String>(),
+                        Style::new().bold(),
+                    ));
+                }
+                None => spans.push(Span::styled(" ", cursor_style)),
+            }
             spans.push(Span::styled(
-                "  (⏎/Tab navigate, Esc clears)",
+                "  (←→ move, ⏎/Tab navigate, Esc clears)",
                 Style::new().dim(),
             ));
+        } else {
+            spans.push(Span::raw(app.filter.clone()));
         }
         frame.render_widget(Paragraph::new(Line::from(spans)), bar);
         rest
@@ -1522,24 +1540,55 @@ fn draw_tree(frame: &mut Frame, app: &mut App, area: Rect) {
     frame.render_stateful_widget(list, area, &mut app.tree_state);
 }
 
-fn hex_dump_lines(bytes: &[u8]) -> Vec<Line<'static>> {
+/// Style for content bytes matched by the tree filter's hex reading.
+const HEX_MATCH_STYLE: Style =
+    Style::new().fg(Color::Black).bg(Color::Yellow);
+
+/// Per-byte flags marking every occurrence of `needle` in the shown prefix
+/// of `bytes` (the tree filter's hex reading), for dump highlighting.
+fn hex_match_marks(bytes: &[u8], needle: &[u8]) -> Vec<bool> {
+    let shown = bytes.len().min(CONTENT_HEX_LIMIT);
+    let mut marks = vec![false; shown];
+    if needle.is_empty() || needle.len() > bytes.len() {
+        return marks;
+    }
+    for start in 0..=bytes.len() - needle.len() {
+        if &bytes[start..start + needle.len()] == needle {
+            for m in marks.iter_mut().skip(start).take(needle.len()) {
+                *m = true;
+            }
+        }
+    }
+    marks
+}
+
+/// Hex dump of `bytes`; positions flagged in `marks` (from the tree filter's
+/// hex reading) are highlighted in both the hex and the ASCII column. Pass an
+/// empty slice for a plain dump.
+fn hex_dump_lines(bytes: &[u8], marks: &[bool]) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     let shown = bytes.len().min(CONTENT_HEX_LIMIT);
+    let marked = |i: usize| marks.get(i).copied().unwrap_or(false);
     for (i, chunk) in bytes[..shown].chunks(16).enumerate() {
-        let hex = chunk
-            .iter()
-            .map(|b| format!("{:02X}", b))
-            .collect::<Vec<_>>()
-            .join(" ");
-        let ascii: String = chunk
-            .iter()
-            .map(|&b| if (0x20..=0x7E).contains(&b) { b as char } else { '.' })
-            .collect();
-        lines.push(Line::from(vec![
-            Span::styled(format!("{:08X}  ", i * 16), Style::new().dim()),
-            Span::raw(format!("{:<47}  ", hex)),
-            Span::styled(format!("|{}|", ascii), Style::new().dim()),
-        ]));
+        let mut spans = vec![Span::styled(format!("{:08X}  ", i * 16), Style::new().dim())];
+        for (j, b) in chunk.iter().enumerate() {
+            let style = if marked(i * 16 + j) { HEX_MATCH_STYLE } else { Style::new() };
+            spans.push(Span::styled(format!("{:02X}", b), style));
+            if j + 1 < chunk.len() {
+                spans.push(Span::raw(" "));
+            }
+        }
+        // Pad the hex column to its full width (16*3-1) plus the separator.
+        let hex_w = chunk.len() * 3 - 1;
+        spans.push(Span::raw(" ".repeat(47 - hex_w + 2)));
+        spans.push(Span::styled("|", Style::new().dim()));
+        for (j, &b) in chunk.iter().enumerate() {
+            let c = if (0x20..=0x7E).contains(&b) { b as char } else { '.' };
+            let style = if marked(i * 16 + j) { HEX_MATCH_STYLE } else { Style::new().dim() };
+            spans.push(Span::styled(c.to_string(), style));
+        }
+        spans.push(Span::styled("|", Style::new().dim()));
+        lines.push(Line::from(spans));
     }
     if shown < bytes.len() {
         lines.push(Line::from(Span::styled(
@@ -2043,7 +2092,13 @@ fn draw_content_browse(frame: &mut Frame, app: &App, area: Rect) {
             ),
             Style::new().underlined(),
         )));
-        lines.extend(hex_dump_lines(&content));
+        // While the tree filter is set and reads as hex, highlight every
+        // occurrence of those bytes in the dump.
+        let marks = (!app.filter.is_empty())
+            .then(|| FilterMatcher::new(&app.filter))
+            .and_then(|m| m.hex_bytes().map(|n| hex_match_marks(&content, n)))
+            .unwrap_or_default();
+        lines.extend(hex_dump_lines(&content, &marks));
     } else if !app.file_open {
         lines.push(Line::from(
             "no file open — move ↑↓ over a file in the Files pane on the left to preview it",
@@ -2710,6 +2765,64 @@ mod tests {
         assert_eq!(cells(&g.right), [Some("───╮"), Some("◄──╯")]);
         // Merged stub keeps the healthy color while any covered edge verifies.
         assert_eq!(g.right[1].as_ref().unwrap().1, REL_SIGNS);
+    }
+
+    #[test]
+    fn hex_match_marks_flags_every_occurrence() {
+        let bytes = [0xAA, 0xBB, 0xCC, 0xAA, 0xBB, 0xDD];
+        assert_eq!(
+            hex_match_marks(&bytes, &[0xAA, 0xBB]),
+            [true, true, false, true, true, false]
+        );
+        // No occurrence / empty needle → nothing marked.
+        assert!(hex_match_marks(&bytes, &[0xEE]).iter().all(|&m| !m));
+        assert!(hex_match_marks(&bytes, &[]).iter().all(|&m| !m));
+        // Needle longer than the buffer.
+        assert!(hex_match_marks(&[0xAA], &[0xAA, 0xBB]).iter().all(|&m| !m));
+    }
+
+    #[test]
+    fn hex_filter_highlights_matched_bytes_in_the_content_pane() {
+        use crate::input::Container;
+        use ratatui::{backend::TestBackend, Terminal};
+        // SEQUENCE { INTEGER 1234, UTF8String "hello", OID 2.5.4.3 }
+        let doc = [
+            0x30, 0x10, 0x02, 0x02, 0x04, 0xD2, 0x0C, 0x05, 0x68, 0x65, 0x6C, 0x6C, 0x6F,
+            0x06, 0x03, 0x55, 0x04, 0x03,
+        ];
+        let roots = parse_forest(&doc, 0).unwrap();
+        let mut app = App::new_single_file(
+            PathBuf::from("doc.der"),
+            PathBuf::from("/nonexistent/out"),
+            Container::Raw,
+            roots,
+            doc.len(),
+        );
+        app.start_filter();
+        for c in "04 D2".chars() {
+            app.filter_insert_char(c); // hex reading of the INTEGER's value
+        }
+        app.filter_accept();
+        let highlighted = |term: &Terminal<TestBackend>| {
+            let buf = term.backend().buffer();
+            let area = buf.area;
+            (0..area.height)
+                .flat_map(|y| (0..area.width).map(move |x| (x, y)))
+                .filter(|&(x, y)| buf[(x, y)].style().bg == Some(Color::Yellow))
+                .count()
+        };
+        let mut term = Terminal::new(TestBackend::new(160, 30)).unwrap();
+        // Root selected: its content octets contain 04 D2 → highlighted in
+        // both the hex and the ASCII column (2 bytes ×3 cells... hex "04",
+        // "D2" = 4 cells + 2 ascii cells).
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        assert_eq!(highlighted(&term), 6, "04 D2 highlighted while the filter is set");
+        // The highlight survives leaving the filter field (filter still set),
+        // and vanishes once the filter is cleared.
+        app.start_filter();
+        app.filter_clear();
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        assert_eq!(highlighted(&term), 0, "no highlight without a filter");
     }
 
     #[test]
