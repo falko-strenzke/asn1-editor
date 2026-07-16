@@ -1394,6 +1394,10 @@ pub struct App {
     /// startup — the source for both `ca_index` and the browser relation
     /// graph. Static snapshot of the on-disk state.
     pub signables: Vec<SignableFile>,
+    /// CMS signed messages found in the browser tree at startup — the source
+    /// for the signer→message relation arrows. A snapshot like `signables`,
+    /// refreshed on filesystem changes. Empty in single-file mode.
+    pub cms_files: Vec<x509::CmsFile>,
     /// Cryptographic relations of the currently selected browser file to
     /// the others (who signed it / what it signs). Recomputed whenever the
     /// browser selection changes; empty when a directory or nothing is
@@ -1441,6 +1445,7 @@ impl App {
         let mut browser = FileBrowser::new(dir.clone());
         browser.reveal(&path);
         let signables = x509::scan_dir_signables(&dir);
+        let cms_files = x509::scan_dir_cms(&dir);
         let ca_index = x509::cert_candidates(&signables);
         let key_files = scan_usable_key_files(&dir);
         let mut app = App {
@@ -1474,6 +1479,7 @@ impl App {
             trusted_certs: BTreeSet::new(),
             path_status: None,
             signables,
+            cms_files,
             browser_relations: FileRelations::default(),
             key_files,
             unlocked_keys: Vec::new(),
@@ -1491,6 +1497,7 @@ impl App {
     pub fn new_dir(dir: PathBuf) -> Self {
         let browser = FileBrowser::new(dir.clone());
         let signables = x509::scan_dir_signables(&dir);
+        let cms_files = x509::scan_dir_cms(&dir);
         let ca_index = x509::cert_candidates(&signables);
         let key_files = scan_usable_key_files(&dir);
         let mut app = App {
@@ -1524,6 +1531,7 @@ impl App {
             trusted_certs: BTreeSet::new(),
             path_status: None,
             signables,
+            cms_files,
             browser_relations: FileRelations::default(),
             key_files,
             unlocked_keys: Vec::new(),
@@ -1580,6 +1588,7 @@ impl App {
             trusted_certs: BTreeSet::new(),
             path_status: None,
             signables: Vec::new(),
+            cms_files: Vec::new(),
             browser_relations: FileRelations::default(),
             key_files: Vec::new(),
             unlocked_keys: Vec::new(),
@@ -1604,6 +1613,7 @@ impl App {
             }
         };
         let mut relations = verify::relations_for(&self.signables, &selected);
+        verify::cms_relations(&self.signables, &self.cms_files, &selected, &mut relations);
         relations.key_links = self.compute_key_links(&selected);
         self.browser_relations = relations;
     }
@@ -1624,6 +1634,7 @@ impl App {
             self.signables = x509::scan_dir_signables(&dir);
             self.ca_index = x509::cert_candidates(&self.signables);
             self.key_files = scan_usable_key_files(&dir);
+            self.cms_files = x509::scan_dir_cms(&dir);
             // Re-inserts the open document's live (possibly unsaved) content
             // over its on-disk copy, and recomputes sig/path status + the
             // browser relation arrows.
@@ -5735,6 +5746,19 @@ mod tests {
             }
             ref other => panic!("expected Verified, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn browser_shows_signer_to_cms_arrow() {
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("testdata");
+        let mut app = App::new_dir(dir);
+        // Selecting the CMS message: an incoming edge from its signer
+        // certificate (keylink/cert_ec.der), colored verified. The reverse
+        // direction is covered precisely in `verify::cms_relations` tests.
+        browser_select_by_name(&mut app, "cms_signed.der");
+        let edge = app.browser_relations.signed_by.clone().expect("signer edge");
+        assert!(edge.other.ends_with("keylink/cert_ec.der"), "{:?}", edge.other);
+        assert!(edge.verified);
     }
 
     #[test]

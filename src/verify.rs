@@ -514,6 +514,35 @@ pub fn relations_for(signables: &[SignableFile], selected: &Path) -> FileRelatio
     relations
 }
 
+/// Extend `relations` with signer→message edges for CMS signed messages: the
+/// signer certificate is resolved by the SignerInfo's issuer + serial among
+/// `signables` (only certificates can sign), and the edge is colored by
+/// whether the signature verifies — exactly like a certificate's issuance
+/// edge. No edge when the signer certificate is not present in the tree.
+pub fn cms_relations(
+    signables: &[x509::SignableFile],
+    cms_files: &[x509::CmsFile],
+    selected: &Path,
+    relations: &mut FileRelations,
+) {
+    for file in cms_files {
+        let (signer_path, verified) = match verify_cms(signables, &file.cms, &file.der) {
+            SignatureStatus::Verified { issuer_path, .. } => (issuer_path, true),
+            SignatureStatus::Invalid { issuer_path, .. } => (issuer_path, false),
+            SignatureStatus::IssuerNotFound | SignatureStatus::UnsupportedAlgorithm(_) => continue,
+        };
+        if signer_path == file.path {
+            continue; // never an arrow from a file to itself
+        }
+        if file.path == selected {
+            relations.signed_by = Some(RelationEdge { other: signer_path.clone(), verified });
+        }
+        if signer_path == selected {
+            relations.signs.push(RelationEdge { other: file.path.clone(), verified });
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -609,6 +638,55 @@ mod tests {
             .expect("payload text in the fixture");
         der[at] ^= 0x01;
         assert!(matches!(verify_cms(&signables, &cms, &der), SignatureStatus::Invalid { .. }));
+    }
+
+    #[test]
+    fn cms_relations_link_signer_certificate_to_the_message() {
+        let signables = x509::scan_dir_signables(Path::new("testdata"));
+        let cms_files = x509::scan_dir_cms(Path::new("testdata"));
+        let cms_path = Path::new("testdata/cms_signed.der");
+        let signer = Path::new("testdata/keylink/cert_ec.der");
+
+        // Selecting the CMS message: an incoming (verified) edge from the signer.
+        let mut r = FileRelations::default();
+        cms_relations(&signables, &cms_files, cms_path, &mut r);
+        let edge = r.signed_by.expect("CMS message shows its signer");
+        assert!(edge.other.ends_with("keylink/cert_ec.der"));
+        assert!(edge.verified);
+
+        // Selecting the signer certificate: an outgoing edge to the message.
+        let mut r = FileRelations::default();
+        cms_relations(&signables, &cms_files, signer, &mut r);
+        assert!(r.signs.iter().any(|e| e.other == cms_path && e.verified));
+    }
+
+    #[test]
+    fn cms_relations_are_red_when_the_signature_is_broken() {
+        // A CMS file whose signer is present but whose signature does not
+        // verify still gets an edge — colored broken (red).
+        let signables = x509::scan_dir_signables(Path::new("testdata"));
+        let mut cms_files = x509::scan_dir_cms(Path::new("testdata"));
+        // Corrupt the message content of every CMS snapshot in place.
+        for f in &mut cms_files {
+            if let Some(c) = f.cms.econtent.as_mut() {
+                c[0] ^= 0x01;
+            }
+        }
+        let cms_path = Path::new("testdata/cms_signed.der");
+        let mut r = FileRelations::default();
+        cms_relations(&signables, &cms_files, cms_path, &mut r);
+        let edge = r.signed_by.expect("a claimed-but-broken signer still gets an edge");
+        assert!(!edge.verified, "broken signature → red edge");
+    }
+
+    #[test]
+    fn cms_relations_absent_without_the_signer() {
+        // testdata/chain has no CMS files and not the signer either.
+        let signables = x509::scan_dir_signables(Path::new("testdata/chain"));
+        let cms_files = x509::scan_dir_cms(Path::new("testdata"));
+        let mut r = FileRelations::default();
+        cms_relations(&signables, &cms_files, Path::new("testdata/cms_signed.der"), &mut r);
+        assert!(r.signed_by.is_none() && r.signs.is_empty());
     }
 
     #[test]

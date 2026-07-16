@@ -290,6 +290,7 @@ const ID_MESSAGE_DIGEST: &[u64] = &[1, 2, 840, 113549, 1, 9, 4];
 /// message, extracted structurally like [`Signable`]. Only signers
 /// identified by `IssuerAndSerialNumber` are handled (the RFC 5652 v1
 /// SignerInfo shape openssl emits); a `subjectKeyIdentifier` sid is skipped.
+#[derive(Clone)]
 pub struct CmsSigned {
     /// Raw DER of the sid's `issuer` Name (header + content).
     pub issuer: Vec<u8>,
@@ -514,6 +515,54 @@ fn find_attr(rdn_sequence: &Node, oid: &[u64]) -> Option<String> {
 pub struct SignableFile {
     pub path: PathBuf,
     pub signable: Signable,
+}
+
+/// A CMS `SignedData` file found in the directory scan, kept so its
+/// signer→message relation arrow can be drawn in the browser. Carries the
+/// raw DER for the OpenSSL half of `verify::verify_cms`.
+pub struct CmsFile {
+    pub path: PathBuf,
+    pub cms: CmsSigned,
+    pub der: Vec<u8>,
+}
+
+/// Recursively scan `root` for CMS signed messages, with the same depth and
+/// size caps as [`scan_dir_signables`]. Certificates/CRLs and unparseable
+/// files are skipped.
+pub fn scan_dir_cms(root: &Path) -> Vec<CmsFile> {
+    let mut out = Vec::new();
+    scan_cms_rec(root, 0, &mut out);
+    out
+}
+
+fn scan_cms_rec(dir: &Path, depth: usize, out: &mut Vec<CmsFile>) {
+    if depth > MAX_SCAN_DEPTH {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    for entry in entries.filter_map(|e| e.ok()) {
+        let Ok(file_type) = entry.file_type() else { continue };
+        let path = entry.path();
+        if file_type.is_dir() {
+            scan_cms_rec(&path, depth + 1, out);
+        } else if file_type.is_file() {
+            if let Some(file) = scan_cms_file(&path) {
+                out.push(file);
+            }
+        }
+    }
+}
+
+fn scan_cms_file(path: &Path) -> Option<CmsFile> {
+    let meta = std::fs::metadata(path).ok()?;
+    if meta.len() > MAX_SCAN_FILE_SIZE {
+        return None;
+    }
+    let raw = std::fs::read(path).ok()?;
+    let (der, _container) = input::load(&raw).ok()?;
+    let roots = ber::parse_forest(&der, 0).ok()?;
+    let cms = parse_cms_signed(&roots, &der)?;
+    Some(CmsFile { path: path.to_path_buf(), cms, der })
 }
 
 /// Recursively scan `root` for files that decode as a signed object

@@ -745,6 +745,15 @@ the two kinds of edge touching `selected`:
 * `signed_by` (incoming) — the one file whose signature covers `selected`;
 * `signs` (outgoing) — every file `selected` is the issuer of.
 
+`verify::cms_relations` then adds the same two edge kinds for **CMS signed
+messages** (§9, "CMS signed messages"): a separate `scan_dir_cms` snapshot
+(`App::cms_files`) holds each parseable CMS file with its DER, and for each
+one the signer certificate is resolved by the SignerInfo's issuer + serial
+among `signables` and `verify_cms` colors the edge — so a signer certificate
+points at every message it signed, and a message points back at its signer.
+A CMS message is never itself a signer, so it only ever adds an edge when
+its signer certificate is present in the tree.
+
 Each `RelationEdge` carries a `verified` flag: true when the signature
 cryptographically checks out, false when the issuance is only *claimed*
 (the issuer is present but its signature does not verify). Self-signed
