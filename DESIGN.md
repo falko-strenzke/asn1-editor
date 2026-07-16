@@ -685,6 +685,34 @@ Recomputed after every edit (the same `rebuild()` that re-runs spec
 identification), so an in-TUI edit that breaks a certificate's signature
 is reflected immediately, without saving.
 
+### CMS signed messages (RFC 5652)
+
+An open document that is neither a Certificate nor a CRL is also tried as a
+CMS `SignedData` message (`x509::parse_cms_signed`, the same positional
+`Node`-walking style: `ContentInfo` → `SignedData` → the first `SignerInfo`
+whose sid is an `IssuerAndSerialNumber`; a `subjectKeyIdentifier` sid and
+detached content are not handled). **Directory mode only** — the signer
+certificate is looked up by the sid's issuer + serial among the scanned
+certificates (`Signable` carries the `serialNumber` for this), and
+single-file mode never looks at other files. When the signer is found,
+`verify::verify_cms` checks the signature twice, mirroring the certificate
+flow:
+
+* **raw**, with the same primitives as certificates: the SignerInfo
+  signature over the message RFC 5652 §5.4 prescribes — the `signedAttrs`
+  re-encoded with the explicit `SET OF` tag in place of the `[0]`, or the
+  `eContent` octets when no attributes are signed — plus, with signed
+  attributes, the `messageDigest` attribute against digest(eContent)
+  (SHA-256/384/512 via aws-lc-rs);
+* **via the OpenSSL bindings**: `CMS_verify` pinned to exactly the
+  identified signer certificate (`NOINTERN` — embedded certificates are
+  ignored — and `NO_SIGNER_CERT_VERIFY`, since chain building is §9d's
+  job, and here the anchor is the scanned file, not a trust store).
+
+`Verified` only when both halves agree; a missing signer is
+`IssuerNotFound`. The result reuses `SignatureStatus` and therefore the
+same content-pane `Signature` line as certificates and CRLs.
+
 The directory itself is only walked once, at startup — `signables`/
 `ca_index` are not refreshed to pick up other files changing on disk
 during the session. The *currently open file's own entry* in both is the

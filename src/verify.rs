@@ -266,6 +266,104 @@ pub fn claimed_issuers<'a>(index: &'a [CaCandidate], signable: &Signable) -> Vec
     }
 }
 
+/// Verify a CMS `SignedData` message (RFC 5652) against the certificates
+/// found in the directory scan. The signer certificate is identified by the
+/// SignerInfo's `IssuerAndSerialNumber`; if none of the scanned certificates
+/// carries that issuer + serial, the result is `IssuerNotFound`. Otherwise
+/// the signature is checked twice, like a certificate's (§9): a raw check
+/// with our own primitives (signature over the re-tagged `signedAttrs` SET —
+/// or the `eContent` when no attributes are signed — plus the
+/// `messageDigest` attribute against digest(eContent)), and an independent
+/// `CMS_verify` through the OpenSSL bindings pinned to the identified
+/// signer certificate (chain building disabled — path validation is §9d's
+/// job). `Verified` only when both agree.
+pub fn verify_cms(files: &[SignableFile], cms: &x509::CmsSigned, cms_der: &[u8]) -> SignatureStatus {
+    let signer = files.iter().find(|f| {
+        f.signable.kind == x509::Kind::Certificate
+            && f.signable.issuer == cms.issuer
+            && f.signable.serial.as_deref() == Some(cms.serial.as_slice())
+    });
+    let Some(signer) = signer else {
+        return SignatureStatus::IssuerNotFound;
+    };
+    let summary = signer.signable.subject_summary.clone().unwrap_or_default();
+    if !is_pq(&cms.sig_alg) && algorithm_for(&cms.sig_alg).is_none() {
+        return SignatureStatus::UnsupportedAlgorithm(oid_string(&cms.sig_alg));
+    }
+    let raw_ok = cms_raw_verify(cms, &signer.signable);
+    let openssl_ok = cms_openssl_verify(cms_der, &signer.path);
+    if raw_ok && openssl_ok {
+        SignatureStatus::Verified {
+            issuer_path: signer.path.clone(),
+            issuer_summary: summary,
+            self_signed: false,
+        }
+    } else {
+        SignatureStatus::Invalid { issuer_path: signer.path.clone(), issuer_summary: summary }
+    }
+}
+
+/// The raw half of CMS verification: the SignerInfo signature over the
+/// message RFC 5652 §5.4 prescribes, plus — when attributes are signed —
+/// the `messageDigest` attribute against the digest of the attached content.
+fn cms_raw_verify(cms: &x509::CmsSigned, signer: &Signable) -> bool {
+    let Some(pubkey) = signer.pubkey.as_deref() else { return false };
+    let message: &[u8] = match (&cms.signed_attrs, &cms.econtent) {
+        (Some(set), _) => set,
+        (None, Some(content)) => content,
+        (None, None) => return false, // detached content is not supported
+    };
+    if !verify_signature(&cms.sig_alg, pubkey, message, &cms.signature) {
+        return false;
+    }
+    // With signed attributes, the content is covered indirectly: the
+    // messageDigest attribute must hash the attached eContent.
+    if cms.signed_attrs.is_some() {
+        let (Some(expected), Some(content)) = (&cms.message_digest, &cms.econtent) else {
+            return false;
+        };
+        let Some(alg) = digest_for(&cms.digest_alg) else { return false };
+        if aws_lc_rs::digest::digest(alg, content).as_ref() != expected.as_slice() {
+            return false;
+        }
+    }
+    true
+}
+
+/// Map a CMS `digestAlgorithm` OID to the aws-lc-rs digest.
+fn digest_for(oid: &[u64]) -> Option<&'static aws_lc_rs::digest::Algorithm> {
+    match oid {
+        [2, 16, 840, 1, 101, 3, 4, 2, 1] => Some(&aws_lc_rs::digest::SHA256),
+        [2, 16, 840, 1, 101, 3, 4, 2, 2] => Some(&aws_lc_rs::digest::SHA384),
+        [2, 16, 840, 1, 101, 3, 4, 2, 3] => Some(&aws_lc_rs::digest::SHA512),
+        _ => None,
+    }
+}
+
+/// The OpenSSL half of CMS verification: `CMS_verify` against exactly the
+/// identified signer certificate (read from disk), with chain verification
+/// disabled and embedded certificates ignored (`NOINTERN`), so the result
+/// reflects this signature under that certificate — nothing else.
+fn cms_openssl_verify(cms_der: &[u8], signer_path: &Path) -> bool {
+    use openssl::cms::{CMSOptions, CmsContentInfo};
+    let Ok(raw) = std::fs::read(signer_path) else { return false };
+    let Ok((cert_der, _)) = crate::input::load(&raw) else { return false };
+    let Ok(cert) = openssl::x509::X509::from_der(&cert_der) else { return false };
+    let Ok(mut certs) = openssl::stack::Stack::new() else { return false };
+    if certs.push(cert).is_err() {
+        return false;
+    }
+    let Ok(mut cms) = CmsContentInfo::from_der(cms_der) else { return false };
+    cms.verify(
+        Some(&certs),
+        None,
+        None,
+        None,
+        CMSOptions::NOINTERN | CMSOptions::NO_SIGNER_CERT_VERIFY,
+    )
+    .is_ok()
+}
+
 pub fn verify_against(index: &[CaCandidate], signable: &Signable) -> SignatureStatus {
     let candidates = claimed_issuers(index, signable);
     let Some(first) = candidates.first() else {
@@ -453,6 +551,72 @@ mod tests {
         let dir = Path::new("testdata/chain");
         let signables = x509::scan_dir_signables(dir);
         relations_for(&signables, &dir.join(file))
+    }
+
+    // ---- CMS signed-message verification -----------------------------------
+
+    /// The committed CMS fixture, parsed, plus its raw DER.
+    fn cms_fixture() -> (x509::CmsSigned, Vec<u8>) {
+        let der = std::fs::read("testdata/cms_signed.der").unwrap();
+        let roots = ber::parse_forest(&der, 0).unwrap();
+        let cms = x509::parse_cms_signed(&roots, &der).expect("CMS fixture parses");
+        (cms, der)
+    }
+
+    #[test]
+    fn cms_message_verifies_against_the_scanned_signer() {
+        // The signer (keylink/cert_ec.der) is found by issuer + serial in the
+        // recursive scan of testdata/, and both verification halves pass.
+        let signables = x509::scan_dir_signables(Path::new("testdata"));
+        let (cms, der) = cms_fixture();
+        match verify_cms(&signables, &cms, &der) {
+            SignatureStatus::Verified { issuer_path, issuer_summary, self_signed } => {
+                assert!(issuer_path.ends_with("keylink/cert_ec.der"), "{issuer_path:?}");
+                assert!(!issuer_summary.is_empty());
+                assert!(!self_signed);
+            }
+            other => panic!("expected Verified, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cms_message_with_tampered_signature_is_invalid() {
+        let signables = x509::scan_dir_signables(Path::new("testdata"));
+        let (mut cms, der) = cms_fixture();
+        *cms.signature.last_mut().unwrap() ^= 0x01;
+        assert!(matches!(verify_cms(&signables, &cms, &der), SignatureStatus::Invalid { .. }));
+    }
+
+    #[test]
+    fn cms_message_with_tampered_content_fails_the_digest_check() {
+        // The signature over signedAttrs still verifies, but the messageDigest
+        // attribute no longer hashes the (tampered) eContent.
+        let signables = x509::scan_dir_signables(Path::new("testdata"));
+        let (mut cms, der) = cms_fixture();
+        cms.econtent.as_mut().unwrap()[0] ^= 0x01;
+        assert!(matches!(verify_cms(&signables, &cms, &der), SignatureStatus::Invalid { .. }));
+    }
+
+    #[test]
+    fn cms_openssl_half_rejects_a_tampered_message() {
+        // The in-memory struct stays pristine (the raw half passes); only the
+        // DER handed to OpenSSL is tampered — CMS_verify must catch it.
+        let signables = x509::scan_dir_signables(Path::new("testdata"));
+        let (cms, mut der) = cms_fixture();
+        let at = der
+            .windows(8)
+            .position(|w| w == b"CMS test")
+            .expect("payload text in the fixture");
+        der[at] ^= 0x01;
+        assert!(matches!(verify_cms(&signables, &cms, &der), SignatureStatus::Invalid { .. }));
+    }
+
+    #[test]
+    fn cms_message_without_its_signer_is_issuer_not_found() {
+        // testdata/chain does not contain the signer certificate.
+        let signables = x509::scan_dir_signables(Path::new("testdata/chain"));
+        let (cms, der) = cms_fixture();
+        assert!(matches!(verify_cms(&signables, &cms, &der), SignatureStatus::IssuerNotFound));
     }
 
     fn signer(rel: &FileRelations) -> Option<(String, bool)> {

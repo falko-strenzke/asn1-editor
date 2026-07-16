@@ -67,6 +67,10 @@ pub struct Signable {
     pub signature: Vec<u8>,
     /// Raw DER encoding of the `issuer` Name (header + content).
     pub issuer: Vec<u8>,
+    /// `serialNumber` INTEGER content octets. Certificate only. Together
+    /// with `issuer` this is what a CMS `IssuerAndSerialNumber` signer
+    /// identifier points at.
+    pub serial: Option<Vec<u8>>,
     /// Raw DER encoding of the `subject` Name. Certificate only.
     pub subject: Option<Vec<u8>>,
     /// `subjectPublicKeyInfo.algorithm.algorithm` OID arcs. Certificate only.
@@ -198,12 +202,18 @@ fn try_certificate(
         }
     }
 
+    let serial_node = &children[i];
+    if serial_node.constructed || !serial_node.is_universal(ber::TAG_INTEGER) {
+        return None;
+    }
+
     Some(Signable {
         kind: Kind::Certificate,
         tbs,
         sig_alg,
         signature,
         issuer: der_span(der, issuer_node),
+        serial: Some(serial_node.value.clone()),
         subject: Some(der_span(der, subject_node)),
         pubkey_alg: Some(pubkey_alg),
         pubkey: Some(pubkey),
@@ -259,6 +269,7 @@ fn try_crl(
         sig_alg,
         signature,
         issuer: der_span(der, issuer_node),
+        serial: None,
         subject: None,
         pubkey_alg: None,
         pubkey: None,
@@ -269,6 +280,160 @@ fn try_crl(
 }
 
 /// `ext_container` is the EXPLICIT `[3]`/`[0]` context-tag node wrapping
+/// `id-signedData` (RFC 5652): the ContentInfo content type of a CMS
+/// signed message.
+const ID_SIGNED_DATA: &[u64] = &[1, 2, 840, 113549, 1, 7, 2];
+/// PKCS#9 `messageDigest` signed-attribute OID.
+const ID_MESSAGE_DIGEST: &[u64] = &[1, 2, 840, 113549, 1, 9, 4];
+
+/// Everything needed to verify the (first) signature of a CMS `SignedData`
+/// message, extracted structurally like [`Signable`]. Only signers
+/// identified by `IssuerAndSerialNumber` are handled (the RFC 5652 v1
+/// SignerInfo shape openssl emits); a `subjectKeyIdentifier` sid is skipped.
+pub struct CmsSigned {
+    /// Raw DER of the sid's `issuer` Name (header + content).
+    pub issuer: Vec<u8>,
+    /// The sid's `serialNumber` INTEGER content octets.
+    pub serial: Vec<u8>,
+    /// `digestAlgorithm.algorithm` OID arcs.
+    pub digest_alg: Vec<u64>,
+    /// `signatureAlgorithm.algorithm` OID arcs.
+    pub sig_alg: Vec<u64>,
+    /// The `signature` OCTET STRING content.
+    pub signature: Vec<u8>,
+    /// When `signedAttrs` is present: its DER re-encoded with the explicit
+    /// `SET OF` tag (0x31) — the exact message the signature covers
+    /// (RFC 5652 §5.4).
+    pub signed_attrs: Option<Vec<u8>>,
+    /// The `messageDigest` signed attribute's OCTET STRING content, when
+    /// signedAttrs carries one — must equal digest(eContent).
+    pub message_digest: Option<Vec<u8>>,
+    /// The `eContent` OCTET STRING content octets, when attached.
+    pub econtent: Option<Vec<u8>>,
+}
+
+/// Try to structurally decode `roots` as a CMS `ContentInfo` carrying
+/// `SignedData` with at least one `IssuerAndSerialNumber`-identified signer.
+/// `None` for any other document — not an error.
+pub fn parse_cms_signed(roots: &[Node], der: &[u8]) -> Option<CmsSigned> {
+    if roots.len() != 1 {
+        return None;
+    }
+    // ContentInfo ::= SEQUENCE { contentType OID, content [0] EXPLICIT ... }
+    let root = &roots[0];
+    if !root.constructed || !root.is_universal(TAG_SEQUENCE) || root.children.len() != 2 {
+        return None;
+    }
+    let ct = &root.children[0];
+    if ct.constructed || !ct.is_universal(TAG_OID) || ber::oid_arcs(&ct.value)? != ID_SIGNED_DATA {
+        return None;
+    }
+    let wrapper = &root.children[1];
+    if !(wrapper.class == Class::ContextSpecific && wrapper.tag == 0 && wrapper.constructed) {
+        return None;
+    }
+    // SignedData ::= SEQUENCE { version, digestAlgorithms, encapContentInfo,
+    //   certificates [0]?, crls [1]?, signerInfos SET }
+    let sd = wrapper.children.first()?;
+    if !sd.constructed || !sd.is_universal(TAG_SEQUENCE) || sd.children.len() < 4 {
+        return None;
+    }
+    // EncapsulatedContentInfo ::= SEQUENCE { eContentType OID,
+    //   eContent [0] EXPLICIT OCTET STRING OPTIONAL }
+    let eci = &sd.children[2];
+    if !eci.constructed || !eci.is_universal(TAG_SEQUENCE) {
+        return None;
+    }
+    let econtent = eci.children.iter().find_map(|c| {
+        if c.class == Class::ContextSpecific && c.tag == 0 && c.constructed {
+            let os = c.children.first()?;
+            (os.is_universal(TAG_OCTET_STRING)).then(|| os.content_octets())
+        } else {
+            None
+        }
+    });
+    // signerInfos is the last child.
+    let signer_infos = sd.children.last()?;
+    if !signer_infos.constructed || !signer_infos.is_universal(ber::TAG_SET) {
+        return None;
+    }
+    // First SignerInfo whose sid is an IssuerAndSerialNumber.
+    for si in &signer_infos.children {
+        if let Some(mut parsed) = try_signer_info(si, der) {
+            parsed.econtent = econtent;
+            return Some(parsed);
+        }
+    }
+    None
+}
+
+/// `SignerInfo ::= SEQUENCE { version, sid, digestAlgorithm,
+/// signedAttrs [0] IMPLICIT OPTIONAL, signatureAlgorithm, signature,
+/// unsignedAttrs [1] IMPLICIT OPTIONAL }` with
+/// `sid = IssuerAndSerialNumber ::= SEQUENCE { issuer Name, serialNumber }`.
+fn try_signer_info(si: &Node, der: &[u8]) -> Option<CmsSigned> {
+    if !si.constructed || !si.is_universal(TAG_SEQUENCE) || si.children.len() < 5 {
+        return None;
+    }
+    let sid = &si.children[1];
+    if !sid.constructed || !sid.is_universal(TAG_SEQUENCE) || sid.children.len() != 2 {
+        return None; // a [0] subjectKeyIdentifier sid is not handled
+    }
+    let issuer_node = &sid.children[0];
+    let serial_node = &sid.children[1];
+    if !issuer_node.constructed || !issuer_node.is_universal(TAG_SEQUENCE) {
+        return None;
+    }
+    if serial_node.constructed || !serial_node.is_universal(ber::TAG_INTEGER) {
+        return None;
+    }
+    let digest_alg = alg_oid(&si.children[2])?;
+
+    // Optional signedAttrs [0] IMPLICIT SET OF Attribute.
+    let mut idx = 3;
+    let mut signed_attrs = None;
+    let mut message_digest = None;
+    let attrs = &si.children[3];
+    if attrs.class == Class::ContextSpecific && attrs.tag == 0 && attrs.constructed {
+        // The signature covers the DER with the explicit SET OF tag (0x31)
+        // in place of the [0] — rebuild it from the attribute encodings.
+        let content = attrs.content_octets();
+        let mut set = Vec::with_capacity(content.len() + 4);
+        set.push(0x31);
+        set.extend_from_slice(&ber::length_octets(content.len()));
+        set.extend_from_slice(&content);
+        signed_attrs = Some(set);
+        message_digest = attrs.children.iter().find_map(|attr| {
+            let oid = attr.children.first()?;
+            if !oid.is_universal(TAG_OID) || ber::oid_arcs(&oid.value)? != ID_MESSAGE_DIGEST {
+                return None;
+            }
+            let values = attr.children.get(1)?;
+            let os = values.children.first()?;
+            os.is_universal(TAG_OCTET_STRING).then(|| os.content_octets())
+        });
+        idx = 4;
+    }
+    if si.children.len() < idx + 2 {
+        return None;
+    }
+    let sig_alg = alg_oid(&si.children[idx])?;
+    let sig_node = &si.children[idx + 1];
+    if sig_node.constructed || !sig_node.is_universal(TAG_OCTET_STRING) {
+        return None;
+    }
+    Some(CmsSigned {
+        issuer: der_span(der, issuer_node),
+        serial: serial_node.value.clone(),
+        digest_alg,
+        sig_alg,
+        signature: sig_node.value.clone(),
+        signed_attrs,
+        message_digest,
+        econtent: None, // filled in by the caller
+    })
+}
+
 /// `Extensions ::= SEQUENCE OF Extension`; each `Extension ::= SEQUENCE {
 /// extnID OID, critical BOOLEAN DEFAULT FALSE, extnValue OCTET STRING }`.
 /// Relies on the parser's own encapsulation heuristic having already
@@ -810,6 +975,31 @@ mod tests {
             let (_der, roots) = parse_der(Path::new(f));
             assert!(is_plaintext_private_key(&roots), "{} not detected as a private key", f);
         }
+    }
+
+    #[test]
+    fn parse_cms_signed_extracts_the_signer_info() {
+        let (der, roots) = parse_der(Path::new("testdata/cms_signed.der"));
+        let cms = parse_cms_signed(&roots, &der).expect("CMS fixture parses");
+        // sid = issuer + serial of keylink/cert_ec.der (the signer).
+        let (signer_der, signer_roots) = parse_der(Path::new("testdata/keylink/cert_ec.der"));
+        let signer = parse_signable(&signer_roots, &signer_der).unwrap();
+        assert_eq!(cms.issuer, signer.issuer);
+        assert_eq!(Some(cms.serial.as_slice()), signer.serial.as_deref());
+        assert_eq!(cms.sig_alg, [1, 2, 840, 10045, 4, 3, 2], "ecdsa-with-SHA256");
+        assert_eq!(cms.digest_alg, [2, 16, 840, 1, 101, 3, 4, 2, 1], "sha256");
+        assert!(!cms.signature.is_empty());
+        // openssl signs with attributes; the re-tagged SET and the digest
+        // attribute and the attached content are all present.
+        assert!(cms.signed_attrs.as_ref().is_some_and(|s| s[0] == 0x31));
+        assert_eq!(cms.message_digest.as_ref().map(|d| d.len()), Some(32));
+        assert!(cms
+            .econtent
+            .as_deref()
+            .is_some_and(|c| c.starts_with(b"asn1-editor CMS test message")));
+        // A certificate is not a CMS message.
+        let (cder, croots) = parse_der(Path::new("testdata/cert_ec.der"));
+        assert!(parse_cms_signed(&croots, &cder).is_none());
     }
 
     #[test]

@@ -2822,6 +2822,15 @@ impl App {
         }
 
         self.sig_status = own_signable.map(|s| verify::verify_against(&self.ca_index, &s));
+        // Not a certificate/CRL: try a CMS signed message. Its signer is
+        // looked up (by the SignerInfo's issuer + serial) among the scanned
+        // certificates, so this only applies in directory mode — single-file
+        // mode never looks at other files.
+        if self.sig_status.is_none() && self.file_open && !self.single_file {
+            if let Some(cms) = x509::parse_cms_signed(&self.roots, &der) {
+                self.sig_status = Some(verify::verify_cms(&self.signables, &cms, &der));
+            }
+        }
         self.refresh_own_key_file();
         self.recompute_path_status();
         self.recompute_browser_relations();
@@ -5709,6 +5718,31 @@ mod tests {
         app.filter = "no-such-thing".to_string();
         app.rebuild_rows();
         assert_eq!(doc_rows(&app), [(vec![0], true)]);
+    }
+
+    #[test]
+    fn cms_message_signature_is_verified_in_directory_mode() {
+        // Opening the CMS fixture from the browser: its signer certificate
+        // (keylink/cert_ec.der) is found via the SignerInfo's issuer + serial
+        // in the recursive directory scan, and the signature verifies.
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("testdata");
+        let mut app = App::new_dir(dir);
+        browser_select_by_name(&mut app, "cms_signed.der");
+        app.preview_browser_selection();
+        match app.sig_status {
+            Some(SignatureStatus::Verified { ref issuer_path, .. }) => {
+                assert!(issuer_path.ends_with("keylink/cert_ec.der"), "{issuer_path:?}");
+            }
+            ref other => panic!("expected Verified, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn cms_signature_is_not_checked_in_single_file_mode() {
+        // Single-file mode never looks at other files, so no signer lookup
+        // and no CMS verification happens.
+        let app = single_file_app("testdata/cms_signed.der");
+        assert!(app.sig_status.is_none());
     }
 
     /// In full (directory) mode the same actions remain available — a guard
