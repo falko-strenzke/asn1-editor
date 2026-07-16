@@ -46,6 +46,9 @@ pub struct Row {
     pub path: Vec<usize>,
     pub depth: usize,
     pub source: RowSource,
+    /// A `[...]` placeholder standing in for a run of elements the tree
+    /// filter omitted (`path` is the first omitted sibling). Carries no node.
+    pub elided: bool,
 }
 
 /// A tree row either addresses the serialized document, the virtual
@@ -58,6 +61,77 @@ pub enum RowSource {
     /// A virtual row of the PKCS#12 reveal: the plaintext of the `usize`-th
     /// decrypted region (see [`Pkcs12Reveal`]).
     Pkcs12Revealed(usize),
+}
+
+/// Compiled form of the tree-filter string ('/'). The one entered string is
+/// interpreted *simultaneously* in every plausible reading and an element
+/// matches when any of them hits:
+///
+/// * as **hex bytes** (whitespace ignored, case-insensitive) — matched as a
+///   substring of a primitive element's content octets;
+/// * as **text** — matched case-insensitively against string-type values,
+///   the spec-derived field/type names, and the textual names of OIDs;
+/// * as the natural representation of an **integer** (decimal) or an **OID**
+///   (dot notation) — via the same substring test against the decoded value.
+pub struct FilterMatcher {
+    /// Lowercased filter string for the textual readings.
+    text: String,
+    /// The filter read as hex octets, when it parses as such.
+    hex: Option<Vec<u8>>,
+}
+
+impl FilterMatcher {
+    pub fn new(filter: &str) -> Self {
+        let stripped: String = filter.chars().filter(|c| !c.is_whitespace()).collect();
+        let hex = (stripped.len() >= 2 && stripped.len().is_multiple_of(2))
+            .then(|| input::hex_decode(&stripped).ok())
+            .flatten();
+        FilterMatcher { text: filter.to_lowercase(), hex }
+    }
+
+    /// Whether `node` (with its optional spec label) matches the filter.
+    pub fn matches(&self, node: &Node, label: Option<&Label>) -> bool {
+        if self.text.is_empty() {
+            return false;
+        }
+        // Field and type names from the ASN.1 specification.
+        if let Some(l) = label {
+            if l.field.as_deref().is_some_and(|f| f.to_lowercase().contains(&self.text))
+                || l.type_name.to_lowercase().contains(&self.text)
+            {
+                return true;
+            }
+        }
+        if node.constructed {
+            return false; // values live in the primitives
+        }
+        // Content octets read as hex.
+        if let Some(bytes) = &self.hex {
+            if node.value.windows(bytes.len()).any(|w| w == bytes.as_slice()) {
+                return true;
+            }
+        }
+        if node.class != Class::Universal {
+            return false;
+        }
+        match node.tag {
+            ber::TAG_INTEGER | ber::TAG_ENUMERATED => ber::integer_decimal(&node.value)
+                .is_some_and(|s| s.contains(&self.text)),
+            ber::TAG_OID => ber::oid_arcs(&node.value).is_some_and(|arcs| {
+                oid::dotted(&arcs).contains(&self.text)
+                    || oid::lookup(&arcs).is_some_and(|e| {
+                        e.short_name.to_lowercase().contains(&self.text)
+                            || e.long_name().to_lowercase().contains(&self.text)
+                    })
+            }),
+            28 => decode_utf32be(&node.value).to_lowercase().contains(&self.text),
+            30 => decode_utf16be(&node.value).to_lowercase().contains(&self.text),
+            7 | ber::TAG_UTF8_STRING | 18..=22 | 25..=27 => {
+                String::from_utf8_lossy(&node.value).to_lowercase().contains(&self.text)
+            }
+            _ => false,
+        }
+    }
 }
 
 /// What the hex editor is operating on.
@@ -666,6 +740,10 @@ pub enum Mode {
     /// outer SEQUENCE, or the "As Extended Key Usage" 'E' entry): toggle the
     /// well-known key purposes and add arbitrary OIDs in dot notation.
     EditExtKeyUsage(EkuEditState),
+    /// The tree-filter field ('/') has keyboard focus: typed characters edit
+    /// [`App::filter`] and the tree updates live. Enter/Tab return to
+    /// navigating the (filtered) tree, Esc clears the filter.
+    FilterInput,
     /// A dismissible informational popup shown over the panes — used at
     /// start-up to surface specification-load warnings.
     Notice(NoticeState),
@@ -1221,6 +1299,9 @@ pub struct App {
     pub delete_confirm: bool,
     /// Scroll offset of the content pane in browse mode.
     pub content_scroll: u16,
+    /// Tree-filter string ('/'): while non-empty, `rebuild_rows` shows only
+    /// matching elements and their ancestors, eliding the rest as `[...]`.
+    pub filter: String,
     /// Loaded ASN.1 specifications (may be empty).
     pub spec_db: SpecDb,
     /// Result of matching the document against the specifications.
@@ -1323,6 +1404,7 @@ impl App {
             quit_confirm: false,
             delete_confirm: false,
             content_scroll: 0,
+            filter: String::new(),
             spec_db: SpecDb::default(),
             ident: None,
             browser,
@@ -1369,6 +1451,7 @@ impl App {
             quit_confirm: false,
             delete_confirm: false,
             content_scroll: 0,
+            filter: String::new(),
             spec_db: SpecDb::default(),
             ident: None,
             browser,
@@ -1421,6 +1504,7 @@ impl App {
             quit_confirm: false,
             delete_confirm: false,
             content_scroll: 0,
+            filter: String::new(),
             spec_db: SpecDb::default(),
             ident: None,
             browser: FileBrowser::empty(dir),
@@ -2845,6 +2929,53 @@ impl App {
         }
     }
 
+    /// '/' in the tree view: give the tree-filter field keyboard focus.
+    /// A previously set filter string is kept and extended.
+    pub fn start_filter(&mut self) {
+        if !self.file_open {
+            self.status = "no file open — nothing to filter".to_string();
+            return;
+        }
+        self.mode = Mode::FilterInput;
+        self.status =
+            "type to filter — hex / text / integer / OID readings; ⏎ or Tab navigates, Esc clears"
+                .to_string();
+    }
+
+    pub fn filter_insert_char(&mut self, c: char) {
+        if matches!(self.mode, Mode::FilterInput) && !c.is_control() {
+            self.filter.push(c);
+            self.rebuild_rows();
+        }
+    }
+
+    pub fn filter_backspace(&mut self) {
+        if matches!(self.mode, Mode::FilterInput) {
+            self.filter.pop();
+            self.rebuild_rows();
+        }
+    }
+
+    /// Enter/Tab in the filter field: keep the filter and navigate the
+    /// (filtered) tree.
+    pub fn filter_accept(&mut self) {
+        self.mode = Mode::Browse;
+        self.focus = Focus::Document;
+        self.status = if self.filter.is_empty() {
+            "filter cleared".to_string()
+        } else {
+            format!("tree filtered by \"{}\" — '/' edits the filter", self.filter)
+        };
+    }
+
+    /// Esc in the filter field: clear the filter and show the full tree again.
+    pub fn filter_clear(&mut self) {
+        self.filter.clear();
+        self.mode = Mode::Browse;
+        self.rebuild_rows();
+        self.status = "filter cleared".to_string();
+    }
+
     fn identify(&mut self) {
         self.ident = spec::identify(&self.spec_db, &self.roots);
         if let Some(ref mut decrypted) = self.decrypted {
@@ -2863,6 +2994,9 @@ impl App {
     }
 
     pub fn label_for_row(&self, row: &Row) -> Option<&Label> {
+        if row.elided {
+            return None;
+        }
         match row.source {
             RowSource::Document => self.label_at(&row.path),
             RowSource::Decrypted => self
@@ -2885,6 +3019,9 @@ impl App {
     }
 
     pub fn node_for_row(&self, row: &Row) -> Option<&Node> {
+        if row.elided {
+            return None; // a `[...]` filter placeholder carries no node
+        }
         match row.source {
             RowSource::Document => node_at(&self.roots, &row.path),
             RowSource::Decrypted => {
@@ -2904,6 +3041,9 @@ impl App {
 
     pub fn selected_node_mut(&mut self) -> Option<&mut Node> {
         let row = self.rows.get(self.selected)?.clone();
+        if row.elided {
+            return None;
+        }
         match row.source {
             RowSource::Document => node_at_mut(&mut self.roots, &row.path),
             RowSource::Decrypted => {
@@ -2916,15 +3056,46 @@ impl App {
         }
     }
 
+    /// Flatten `forest` into rows, applying the tree filter when one is set.
+    /// Filtered top-level runs with no match inside collapse into `[...]`
+    /// rows just like sibling runs deeper in the tree.
+    fn collect_forest(
+        &self,
+        forest: &[Node],
+        base_depth: usize,
+        source: RowSource,
+        labels: Option<&std::collections::HashMap<Vec<usize>, Label>>,
+        rows: &mut Vec<Row>,
+    ) {
+        if self.filter.is_empty() {
+            for (i, node) in forest.iter().enumerate() {
+                collect_rows(node, vec![i], base_depth, source, rows);
+            }
+            return;
+        }
+        let matcher = FilterMatcher::new(&self.filter);
+        let mut in_elided_run = false;
+        for (i, node) in forest.iter().enumerate() {
+            let mut sub = Vec::new();
+            if collect_rows_filtered(node, vec![i], base_depth, source, &matcher, labels, &mut sub)
+            {
+                in_elided_run = false;
+                rows.extend(sub);
+            } else if !in_elided_run {
+                in_elided_run = true;
+                rows.push(Row { depth: base_depth, path: vec![i], source, elided: true });
+            }
+        }
+    }
+
     pub fn rebuild_rows(&mut self) {
         let mut rows = Vec::new();
         let encrypted_path = pkcs8::parse(&self.roots)
             .ok()
             .flatten()
             .map(|enc| enc.encrypted_path);
-        for (i, node) in self.roots.iter().enumerate() {
-            collect_rows(node, vec![i], 0, RowSource::Document, &mut rows);
-        }
+        let doc_labels = self.ident.as_ref().map(|i| &i.labels);
+        self.collect_forest(&self.roots, 0, RowSource::Document, doc_labels, &mut rows);
         // A PKCS#8 encrypted key (handled by the `encrypted_path` branch) and
         // a PKCS#12 container (handled below) are mutually exclusive.
         let is_pkcs8 = encrypted_path.is_some();
@@ -2935,20 +3106,20 @@ impl App {
                 let depth = rows[encrypted_row].depth + 1;
                 let mut virtual_rows = Vec::new();
                 if let Some(decrypted) = &self.decrypted {
-                    for (i, node) in decrypted.roots.iter().enumerate() {
-                        collect_rows(
-                            node,
-                            vec![i],
-                            depth,
-                            RowSource::Decrypted,
-                            &mut virtual_rows,
-                        );
-                    }
+                    let labels = decrypted.ident.as_ref().map(|i| &i.labels);
+                    self.collect_forest(
+                        &decrypted.roots,
+                        depth,
+                        RowSource::Decrypted,
+                        labels,
+                        &mut virtual_rows,
+                    );
                 } else {
                     virtual_rows.push(Row {
                         path: encrypted_path,
                         depth,
                         source: RowSource::DecryptedPlaceholder,
+                        elided: false,
                     });
                 }
                 rows.splice(encrypted_row + 1..encrypted_row + 1, virtual_rows);
@@ -2967,9 +3138,14 @@ impl App {
                 };
                 let depth = rows[cipher_row].depth + 1;
                 let mut region_rows = Vec::new();
-                for (i, node) in region.roots.iter().enumerate() {
-                    collect_rows(node, vec![i], depth, RowSource::Pkcs12Revealed(idx), &mut region_rows);
-                }
+                let labels = region.ident.as_ref().map(|i| &i.labels);
+                self.collect_forest(
+                    &region.roots,
+                    depth,
+                    RowSource::Pkcs12Revealed(idx),
+                    labels,
+                    &mut region_rows,
+                );
                 inserts.push((cipher_row + 1, region_rows));
             }
             inserts.sort_by(|a, b| b.0.cmp(&a.0));
@@ -2992,6 +3168,7 @@ impl App {
                                 path: region.cipher_path.clone(),
                                 depth: rows[cipher_row].depth + 1,
                                 source: RowSource::DecryptedPlaceholder,
+                                elided: false,
                             },
                         ));
                     }
@@ -3096,6 +3273,18 @@ impl App {
         {
             self.select(self.selected + 1);
         }
+    }
+
+    /// Structural actions on a `[...]` filter placeholder bail out: the row
+    /// stands for hidden elements and carries no node of its own. Returns
+    /// `true` (having set the status) when the action must be refused.
+    fn reject_elided_selection(&mut self) -> bool {
+        if self.rows.get(self.selected).is_some_and(|r| r.elided) {
+            self.status =
+                "these rows are hidden by the filter — '/' edits it, Esc there clears".to_string();
+            return true;
+        }
+        false
     }
 
     /// Editing actions on a PKCS#12 revealed row bail out with a message
@@ -3361,7 +3550,7 @@ impl App {
                 self.status = "decrypt the content before editing it".to_string();
                 return;
             }
-            if self.reject_uneditable_reveal() {
+            if self.reject_elided_selection() || self.reject_uneditable_reveal() {
                 return;
             }
             let path = row.path;
@@ -3403,7 +3592,7 @@ impl App {
             self.status = "decrypt the content before editing it".to_string();
             return;
         }
-        if self.reject_uneditable_reveal() {
+        if self.reject_elided_selection() || self.reject_uneditable_reveal() {
             return;
         }
         let Some(row) = self.rows.get(self.selected) else { return };
@@ -3578,7 +3767,7 @@ impl App {
             self.status = "decrypt the content before editing it".to_string();
             return;
         }
-        if self.reject_uneditable_reveal() {
+        if self.reject_elided_selection() || self.reject_uneditable_reveal() {
             return;
         }
         let (&last, parent) = row.path.split_last().expect("row paths are non-empty");
@@ -3636,7 +3825,7 @@ impl App {
             self.status = "decrypt the content before editing it".to_string();
             return;
         }
-        if self.reject_uneditable_reveal() {
+        if self.reject_elided_selection() || self.reject_uneditable_reveal() {
             return;
         }
         if matches!(row.source, RowSource::Decrypted | RowSource::Pkcs12Revealed(_))
@@ -4191,7 +4380,7 @@ fn collect_rows(
     source: RowSource,
     rows: &mut Vec<Row>,
 ) {
-    rows.push(Row { depth: base_depth + path.len() - 1, path: path.clone(), source });
+    rows.push(Row { depth: base_depth + path.len() - 1, path: path.clone(), source, elided: false });
     if node.expanded {
         for (i, child) in node.children.iter().enumerate() {
             let mut child_path = path.clone();
@@ -4199,6 +4388,53 @@ fn collect_rows(
             collect_rows(child, child_path, base_depth, source, rows);
         }
     }
+}
+
+/// Filtered variant of [`collect_rows`]: emit the node's row only when the
+/// node itself matches `matcher` or some descendant does (so every ancestor
+/// of a match stays visible, up to the outermost element). Runs of omitted
+/// siblings collapse into a single `[...]` placeholder row. Expansion flags
+/// are ignored — the filter decides visibility. Returns the rows of this
+/// subtree, or `None` when it contains no match at all.
+fn collect_rows_filtered(
+    node: &Node,
+    path: Vec<usize>,
+    base_depth: usize,
+    source: RowSource,
+    matcher: &FilterMatcher,
+    labels: Option<&std::collections::HashMap<Vec<usize>, Label>>,
+    out: &mut Vec<Row>,
+) -> bool {
+    let self_match = matcher.matches(node, labels.and_then(|m| m.get(&path)));
+    let mut children_rows: Vec<Row> = Vec::new();
+    let mut any_child = false;
+    let mut in_elided_run = false;
+    for (i, child) in node.children.iter().enumerate() {
+        let mut child_path = path.clone();
+        child_path.push(i);
+        let mut sub = Vec::new();
+        if collect_rows_filtered(child, child_path.clone(), base_depth, source, matcher, labels, &mut sub) {
+            any_child = true;
+            in_elided_run = false;
+            children_rows.extend(sub);
+        } else if !in_elided_run {
+            in_elided_run = true;
+            children_rows.push(Row {
+                depth: base_depth + child_path.len() - 1,
+                path: child_path,
+                source,
+                elided: true,
+            });
+        }
+    }
+    if !self_match && !any_child {
+        return false;
+    }
+    out.push(Row { depth: base_depth + path.len() - 1, path, source, elided: false });
+    if !node.children.is_empty() {
+        out.extend(children_rows);
+    }
+    true
 }
 
 /// Tree paths of the mutable signature-bearing nodes of a `Certificate`,
@@ -5004,6 +5240,134 @@ mod tests {
             !matches!(app.mode, Mode::EditPubKey(_)),
             "single-file mode must not open the public-key editor"
         );
+    }
+
+    // ---- tree filter ('/') -------------------------------------------------
+
+    /// SEQUENCE { INTEGER 1234, UTF8String "hello", OID 2.5.4.3 (commonName) }
+    const FILTER_DOC: [u8; 18] = [
+        0x30, 0x10, 0x02, 0x02, 0x04, 0xD2, 0x0C, 0x05, 0x68, 0x65, 0x6C, 0x6C, 0x6F, 0x06,
+        0x03, 0x55, 0x04, 0x03,
+    ];
+
+    fn doc_rows(app: &App) -> Vec<(Vec<usize>, bool)> {
+        app.rows.iter().map(|r| (r.path.clone(), r.elided)).collect()
+    }
+
+    #[test]
+    fn filter_matcher_reads_hex_text_integer_and_oid() {
+        let roots = ber::parse_forest(&FILTER_DOC, 0).unwrap();
+        let int = &roots[0].children[0];
+        let string = &roots[0].children[1];
+        let oid_node = &roots[0].children[2];
+
+        // Integer: natural decimal representation.
+        assert!(FilterMatcher::new("1234").matches(int, None));
+        assert!(!FilterMatcher::new("1234").matches(string, None));
+        // Text in a string type, case-insensitive.
+        assert!(FilterMatcher::new("ELL").matches(string, None));
+        // OID in dot notation and by its repository name.
+        assert!(FilterMatcher::new("2.5.4.3").matches(oid_node, None));
+        assert!(FilterMatcher::new("commonname").matches(oid_node, None));
+        // Hex reading: whitespace and case are ignored ("hel" = 68 65 6C).
+        assert!(FilterMatcher::new("68 65 6c").matches(string, None));
+        assert!(FilterMatcher::new("6865 6C").matches(string, None));
+        assert!(FilterMatcher::new("55 04 03").matches(oid_node, None));
+        assert!(!FilterMatcher::new("55 04 04").matches(oid_node, None));
+        // Spec-derived field names match regardless of the node's value.
+        let label = Label { field: Some("serialNumber".into()), type_name: "INTEGER".into() };
+        assert!(FilterMatcher::new("serial").matches(int, Some(&label)));
+    }
+
+    #[test]
+    fn filter_shows_matches_ancestors_and_elides_the_rest() {
+        let mut app = test_app(&FILTER_DOC);
+        assert_eq!(app.rows.len(), 4); // root + 3 children
+        app.filter = "1234".to_string();
+        app.rebuild_rows();
+        // Root (ancestor), the matching INTEGER, one [...] for the omitted run.
+        assert_eq!(
+            doc_rows(&app),
+            [(vec![0], false), (vec![0, 0], false), (vec![0, 1], true)]
+        );
+        // The elided placeholder carries no node and refuses edits.
+        app.select(2);
+        assert!(app.selected_node().is_none());
+        app.delete_selected();
+        assert_eq!(ber::encode_forest(&app.roots), FILTER_DOC, "delete must not touch hidden rows");
+    }
+
+    #[test]
+    fn filter_run_between_matches_collapses_to_one_placeholder() {
+        let mut app = test_app(&FILTER_DOC);
+        app.filter = "commonname".to_string();
+        app.rebuild_rows();
+        // OID matches; INTEGER + UTF8String collapse into one leading [...].
+        assert_eq!(
+            doc_rows(&app),
+            [(vec![0], false), (vec![0, 0], true), (vec![0, 2], false)]
+        );
+    }
+
+    #[test]
+    fn filter_input_flow_edits_accepts_and_clears() {
+        let mut app = test_app(&FILTER_DOC);
+        app.start_filter();
+        assert!(matches!(app.mode, Mode::FilterInput));
+        for c in "hello".chars() {
+            app.filter_insert_char(c);
+        }
+        assert_eq!(app.filter, "hello");
+        // Matching middle child: root, [...] run, the match, [...] run.
+        assert_eq!(
+            doc_rows(&app),
+            [(vec![0], false), (vec![0, 0], true), (vec![0, 1], false), (vec![0, 2], true)],
+            "live filtering while typing"
+        );
+        app.filter_backspace();
+        assert_eq!(app.filter, "hell");
+        // Enter/Tab keeps the filter and returns to tree navigation.
+        app.filter_accept();
+        assert!(matches!(app.mode, Mode::Browse));
+        assert_eq!(app.filter, "hell");
+        assert_eq!(app.rows.len(), 4);
+        // Esc in the field clears it and restores the full tree.
+        app.start_filter();
+        app.filter_clear();
+        assert!(matches!(app.mode, Mode::Browse));
+        assert!(app.filter.is_empty());
+        assert_eq!(app.rows.len(), 4);
+    }
+
+    #[test]
+    fn filter_matches_spec_field_names_on_a_real_certificate() {
+        let mut app = cert_app("testdata/chain/server.der");
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("specs/asn1");
+        let (db, errors) = spec::load_dir(&dir);
+        assert!(errors.is_empty(), "bundled specs parse: {errors:?}");
+        app.set_spec_db(db);
+        app.filter = "serialnumber".to_string();
+        app.rebuild_rows();
+        // The RFC 5280-labeled serialNumber row is kept...
+        assert!(
+            app.rows.iter().any(|r| !r.elided
+                && app
+                    .label_for_row(r)
+                    .is_some_and(|l| l.field.as_deref() == Some("serialNumber"))),
+            "serialNumber field row should match the filter"
+        );
+        // ...the outermost SEQUENCE is always shown, and the rest is elided.
+        assert_eq!(app.rows.first().map(|r| (r.path.clone(), r.elided)), Some((vec![0], false)));
+        assert!(app.rows.iter().any(|r| r.elided));
+        assert!(app.rows.len() < 20, "most of the certificate is filtered out");
+    }
+
+    #[test]
+    fn filter_with_no_match_shows_a_single_placeholder() {
+        let mut app = test_app(&FILTER_DOC);
+        app.filter = "no-such-thing".to_string();
+        app.rebuild_rows();
+        assert_eq!(doc_rows(&app), [(vec![0], true)]);
     }
 
     /// In full (directory) mode the same actions remain available — a guard

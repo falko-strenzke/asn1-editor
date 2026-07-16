@@ -1456,8 +1456,38 @@ document pane.
 | `s` | save (re-encode + re-wrap container) |
 | `z` | context action: decrypt an `EncryptedPrivateKeyInfo` (§9a) or PKCS#12 (§9b, prompts for a password), or — on a certificate/CRL — open the *Cryptographic adjustment* menu (re-sign §9c / re-key §9e) |
 | `t` | (browser) mark/unmark the selected certificate as a path-validation trust anchor (§9d) |
+| `/` | (tree) focus the tree-filter field; `⏎`/`Tab` there returns to navigating the filtered tree, `Esc` clears the filter |
 | `[` / `]` | scroll content pane |
 | `q` | quit (`q q` to discard unsaved changes) |
+
+### Tree filter (`/`)
+
+Pressing `/` in the tree view focuses a one-line **filter bar** above the
+Structure pane; it stays visible while its content is non-empty, focused or
+not. The tree updates live as the filter is typed. The single entered string
+is interpreted **simultaneously** in every plausible reading
+(`app::FilterMatcher`) and an element matches when any reading hits:
+
+* **hex octets** (whitespace ignored, case-insensitive) — substring of a
+  primitive element's content octets;
+* **text** (case-insensitive) — against string-type values, the spec-derived
+  field/type names (§8), and the textual names of OIDs from the built-in
+  repository (§8a);
+* the natural representation of an **integer** (decimal) or an **OID**
+  (dot notation) — substring of the decoded value.
+
+While a filter is set, `rebuild_rows` shows only matching elements and their
+ancestors (recursively, so the outermost element is always visible;
+`collect_rows_filtered`, which ignores the manual expansion flags). Each
+non-empty run of omitted siblings collapses into one gray `[...]` placeholder
+row (`Row::elided`) that carries no node: it renders a dedicated content-pane
+notice, and structural actions on it (`e`/`d`/`i`/`J`/`K`/retag) are refused
+so hidden elements cannot be edited accidentally. `Tab`/`Enter` in the field
+return focus to the tree, which is navigated as usual; the filter persists
+across file switches until cleared with `Esc` in the field. Rows inside the
+decrypted/PKCS#12 virtual trees (§9a/§9b) are filtered with the same matcher
+(a virtual subtree is only reachable while its ciphertext row itself stays
+visible).
 
 ## 12. Verification against dumpasn1
 

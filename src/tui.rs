@@ -92,6 +92,11 @@ fn event_loop(terminal: &mut DefaultTerminal, app: &mut App) -> io::Result<()> {
                             app.pubkey_insert_char(c);
                         }
                     }
+                    Mode::FilterInput => {
+                        for c in text.chars() {
+                            app.filter_insert_char(c);
+                        }
+                    }
                     _ => {}
                 }
                 continue;
@@ -111,6 +116,7 @@ fn event_loop(terminal: &mut DefaultTerminal, app: &mut App) -> io::Result<()> {
             Mode::EditBasicConstraints(_) => handle_basic_constraints_key(app, key),
             Mode::EditKeyUsage(_) => handle_key_usage_key(app, key),
             Mode::EditExtKeyUsage(_) => handle_ext_key_usage_key(app, key),
+            Mode::FilterInput => handle_filter_key(app, key),
             Mode::Notice(_) => app.dismiss_notice(), // any key dismisses
             Mode::Browse => {
                 if key.code != KeyCode::Char('q') {
@@ -182,6 +188,7 @@ fn handle_document_key(app: &mut App, key: KeyEvent) {
         KeyCode::Char('J') => app.move_selected(1),
         KeyCode::Char('s') => app.save(),
         KeyCode::Char('z') => app.start_decrypt(),
+        KeyCode::Char('/') => app.start_filter(),
         KeyCode::Char('[') => app.content_scroll = app.content_scroll.saturating_sub(4),
         KeyCode::Char(']') => app.content_scroll = app.content_scroll.saturating_add(4),
         _ => {}
@@ -249,6 +256,16 @@ fn handle_key_usage_key(app: &mut App, key: KeyEvent) {
         KeyCode::Up | KeyCode::BackTab => app.ku_move_field(-1),
         KeyCode::Down | KeyCode::Tab => app.ku_move_field(1),
         KeyCode::Char(' ') => app.ku_toggle(),
+        _ => {}
+    }
+}
+
+fn handle_filter_key(app: &mut App, key: KeyEvent) {
+    match key.code {
+        KeyCode::Esc => app.filter_clear(),
+        KeyCode::Enter | KeyCode::Tab => app.filter_accept(),
+        KeyCode::Backspace => app.filter_backspace(),
+        KeyCode::Char(c) => app.filter_insert_char(c),
         _ => {}
     }
 }
@@ -1386,10 +1403,40 @@ fn preview_text_or_hex(v: &[u8]) -> String {
 }
 
 fn draw_tree(frame: &mut Frame, app: &mut App, area: Rect) {
+    // The filter bar sits above the tree while the field has focus or holds
+    // a non-empty filter string.
+    let filter_editing = matches!(app.mode, Mode::FilterInput);
+    let area = if filter_editing || !app.filter.is_empty() {
+        let [bar, rest] =
+            Layout::vertical([Constraint::Length(1), Constraint::Min(3)]).areas(area);
+        let text_style = if filter_editing { Style::new().bold() } else { Style::new() };
+        let mut spans = vec![
+            Span::styled(" filter / ", Style::new().fg(Color::Cyan).bold()),
+            Span::styled(app.filter.clone(), text_style),
+        ];
+        if filter_editing {
+            spans.push(Span::styled("▏", Style::new().fg(Color::Cyan)));
+            spans.push(Span::styled(
+                "  (⏎/Tab navigate, Esc clears)",
+                Style::new().dim(),
+            ));
+        }
+        frame.render_widget(Paragraph::new(Line::from(spans)), bar);
+        rest
+    } else {
+        area
+    };
     let items: Vec<ListItem> = app
         .rows
         .iter()
         .map(|row| {
+            if row.elided {
+                // A run of elements the tree filter omitted.
+                return ListItem::new(Line::from(vec![
+                    Span::raw("  ".repeat(row.depth + 1)),
+                    Span::styled("[...]", Style::new().fg(Color::DarkGray)),
+                ]));
+            }
             if row.source == RowSource::DecryptedPlaceholder {
                 return ListItem::new(Line::from(vec![
                     Span::raw("  ".repeat(row.depth + 1)),
@@ -1835,7 +1882,14 @@ fn path_status_line(status: &PathStatus) -> Line<'static> {
 fn draw_content_browse(frame: &mut Frame, app: &App, area: Rect) {
     let mut lines: Vec<Line> = Vec::new();
     let selected_row = app.rows.get(app.selected);
-    if selected_row.map(|r| r.source) == Some(RowSource::DecryptedPlaceholder) {
+    if selected_row.is_some_and(|r| r.elided) {
+        lines.push(Line::from(Span::styled(
+            "Elements hidden by the tree filter",
+            Style::new().fg(Color::DarkGray).bold(),
+        )));
+        lines.push(Line::default());
+        lines.push(Line::from("'/' edits the filter; Esc there clears it and shows the full tree."));
+    } else if selected_row.map(|r| r.source) == Some(RowSource::DecryptedPlaceholder) {
         lines.push(Line::from(Span::styled(
             "Decrypted content not available",
             Style::new().fg(Color::Yellow).bold(),
@@ -2257,6 +2311,7 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
         Mode::EditExtKeyUsage(_) => {
             "↑↓ select  Space toggle  type OID + ⏎ add  ⏎ apply  Esc cancel"
         }
+        Mode::FilterInput => "type to filter (hex/text/int/OID)  ⏎/Tab navigate  Esc clear",
         Mode::Notice(_) => "press any key to dismiss",
     };
     let line = Line::from(vec![
@@ -2655,6 +2710,52 @@ mod tests {
         assert_eq!(cells(&g.right), [Some("───╮"), Some("◄──╯")]);
         // Merged stub keeps the healthy color while any covered edge verifies.
         assert_eq!(g.right[1].as_ref().unwrap().1, REL_SIGNS);
+    }
+
+    #[test]
+    fn tree_filter_renders_bar_and_elision_placeholders() {
+        use crate::input::Container;
+        use ratatui::{backend::TestBackend, Terminal};
+        // SEQUENCE { INTEGER 1234, UTF8String "hello", OID 2.5.4.3 }
+        let doc = [
+            0x30, 0x10, 0x02, 0x02, 0x04, 0xD2, 0x0C, 0x05, 0x68, 0x65, 0x6C, 0x6C, 0x6F,
+            0x06, 0x03, 0x55, 0x04, 0x03,
+        ];
+        let roots = parse_forest(&doc, 0).unwrap();
+        let mut app = App::new_single_file(
+            PathBuf::from("doc.der"),
+            PathBuf::from("/nonexistent/out"),
+            Container::Raw,
+            roots,
+            doc.len(),
+        );
+        app.start_filter();
+        for c in "1234".chars() {
+            app.filter_insert_char(c);
+        }
+        let mut term = Terminal::new(TestBackend::new(160, 30)).unwrap();
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let text = buffer_text(term.backend().buffer());
+        assert!(text.contains("filter / 1234"), "filter bar missing:\n{text}");
+        assert!(text.contains("[...]"), "elision placeholder missing:\n{text}");
+        assert!(text.contains("INTEGER"), "matching row missing");
+        // The UTF8String tree row is hidden (its bytes still appear in the
+        // content pane's hex dump of the selected root, which is fine).
+        assert!(!text.contains("UTF8String"), "non-matching row should be hidden");
+
+        // The bar stays visible after Tab (field unfocused, filter non-empty).
+        app.filter_accept();
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let text = buffer_text(term.backend().buffer());
+        assert!(text.contains("filter / 1234"), "bar should persist while non-empty");
+
+        // Clearing the filter hides the bar again.
+        app.start_filter();
+        app.filter_clear();
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let text = buffer_text(term.backend().buffer());
+        assert!(!text.contains("filter /"), "bar should vanish when the filter is empty");
+        assert!(text.contains("UTF8String"), "full tree restored");
     }
 
     #[test]
