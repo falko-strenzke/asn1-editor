@@ -732,6 +732,8 @@ pub enum MenuAction {
     Rekey,
     /// Open the re-sign dialog (§9c).
     Resign,
+    /// Open the re-sign dialog for a CMS signed message.
+    ResignCms,
 }
 
 /// One entry of a popup menu.
@@ -982,9 +984,12 @@ pub struct ResignState {
     pub detail: String,
     /// Whether a new signature can be created.
     pub ready: bool,
-    /// The new signature to install on confirm; `Some` only when `ready`.
+    /// Node edits to apply on confirm: each `(tree path, new content octets)`.
+    /// Empty unless `ready`. For a certificate/CRL this is just the outer
+    /// `signature` BIT STRING; for a CMS message it is the SignerInfo
+    /// `signature` OCTET STRING plus the recomputed `messageDigest` attribute.
     /// (Public data — no private key material is retained in the dialog.)
-    signature: Option<Vec<u8>>,
+    edits: Vec<(Vec<usize>, Vec<u8>)>,
 }
 
 /// State of the "As Basic Constraints" structured editor. Edits the two fields
@@ -1804,7 +1809,7 @@ impl App {
             issuer_summary: issuer.to_string(),
             detail: detail.to_string(),
             ready: false,
-            signature: None,
+            edits: Vec::new(),
         };
         if !verify::signing_supported(&signable.sig_alg) {
             return not_ready("", "this signature algorithm is not supported for re-signing");
@@ -1827,11 +1832,15 @@ impl App {
                     &signable.tbs,
                     &signature,
                 ) {
+                    // The outer `signature` BIT STRING is the third element of
+                    // a Certificate / CertificateList; its content is one
+                    // unused-bits octet (0) followed by the signature.
+                    let bit_string = std::iter::once(0u8).chain(signature).collect();
                     return ResignState {
                         issuer_summary: candidate.subject_summary.clone(),
                         detail: "the issuer's signing key is available".to_string(),
                         ready: true,
-                        signature: Some(signature),
+                        edits: vec![(vec![0, 2], bit_string)],
                     };
                 }
             }
@@ -1900,19 +1909,20 @@ impl App {
     /// outer signature.
     pub fn submit_resign(&mut self) {
         let Mode::Resign(ref state) = self.mode else { return };
-        let signature = if state.ready { state.signature.clone() } else { None };
+        let edits = if state.ready { state.edits.clone() } else { Vec::new() };
         self.mode = Mode::Browse;
-        let Some(sig) = signature else {
+        if edits.is_empty() {
             self.status = "re-signing is not available".to_string();
             return;
-        };
-        // The outer `signature` BIT STRING is the third element of a
-        // Certificate / CertificateList; its content is one unused-bits octet
-        // (0) followed by the signature.
-        if let Some(node) = node_at_mut(&mut self.roots, &[0, 2]) {
-            node.value = std::iter::once(0u8).chain(sig).collect();
-            node.children.clear();
-            node.encapsulates = false;
+        }
+        // Apply each planned node edit (signature, and for CMS the recomputed
+        // messageDigest) as a primitive content replacement.
+        for (path, content) in &edits {
+            if let Some(node) = node_at_mut(&mut self.roots, path) {
+                node.value = content.clone();
+                node.children.clear();
+                node.encapsulates = false;
+            }
         }
         self.dirty = true;
         self.rebuild();
@@ -1921,6 +1931,111 @@ impl App {
             Ok(_) => format!("new signature created — saved {}", file_name_string(&self.out_path)),
             Err(e) => format!("new signature created — SAVE FAILED ({}); 's' retries", e),
         };
+    }
+
+    /// 'z' → Re-sign on a CMS signed message: regenerate the SignerInfo
+    /// signature with the signer certificate's private key. Reuses the same
+    /// `Mode::Resign` dialog as certificates.
+    pub fn start_resign_cms(&mut self) {
+        if self.single_file {
+            self.status = "re-signing is not available in single-file mode".to_string();
+            return;
+        }
+        let der = ber::encode_forest(&self.roots);
+        let Some(cms) = x509::parse_cms_signed(&self.roots, &der) else {
+            self.status = "not a CMS signed message".to_string();
+            return;
+        };
+        let state = self.resign_cms_state(&cms);
+        self.status = if state.ready {
+            "the signer's signing key is available — ⏎ creates a new signature".to_string()
+        } else {
+            "re-signing is not available (see the dialog)".to_string()
+        };
+        self.mode = Mode::Resign(state);
+    }
+
+    /// Build the re-sign plan for a CMS message: locate the signer certificate
+    /// (by the SignerInfo's issuer + serial), recompute the `messageDigest`
+    /// attribute from the current content so a modified message becomes valid,
+    /// and sign the message RFC 5652 §5.4 prescribes with the signer's key —
+    /// trying every candidate key until one produces a verifying signature,
+    /// exactly like the certificate flow.
+    fn resign_cms_state(&self, cms: &x509::CmsSigned) -> ResignState {
+        let not_ready = |signer: &str, detail: &str| ResignState {
+            issuer_summary: signer.to_string(),
+            detail: detail.to_string(),
+            ready: false,
+            edits: Vec::new(),
+        };
+        if !verify::signing_supported(&cms.sig_alg) {
+            return not_ready("", "this signature algorithm is not supported for re-signing");
+        }
+        // The signer certificate is the one the sid names (issuer + serial).
+        let signer = self.signables.iter().find(|f| {
+            f.signable.kind == Kind::Certificate
+                && f.signable.issuer == cms.issuer
+                && f.signable.serial.as_deref() == Some(cms.serial.as_slice())
+        });
+        let Some(signer) = signer.map(|f| &f.signable) else {
+            return not_ready(
+                "(signer not found)",
+                "the signer's certificate is not in this folder",
+            );
+        };
+        let summary = signer.subject_summary.clone().unwrap_or_default();
+        let (Some(pubkey_alg), Some(pubkey)) = (&signer.pubkey_alg, &signer.pubkey) else {
+            return not_ready(&summary, "the signer certificate has no usable public key");
+        };
+        let Some(id) = x509::public_key_id(pubkey_alg, pubkey) else {
+            return not_ready(&summary, "the signer certificate has no usable public key");
+        };
+
+        // The message the signature covers, and — when the content is bound
+        // indirectly through signed attributes — the recomputed messageDigest.
+        let mut edits = Vec::new();
+        let message: Vec<u8> = match (&cms.signed_attrs, &cms.econtent) {
+            (Some(signed_attrs), econtent) => {
+                let mut set = signed_attrs.clone();
+                if let (Some(md_path), Some(content)) = (&cms.message_digest_path, econtent) {
+                    let Some(digest) = verify::cms_message_digest(&cms.digest_alg, content) else {
+                        return not_ready(&summary, "unsupported content-digest algorithm");
+                    };
+                    edits.push((md_path.clone(), digest.clone()));
+                    match signed_attrs_with_digest(signed_attrs, &digest) {
+                        Some(updated) => set = updated,
+                        None => return not_ready(&summary, "could not update the messageDigest"),
+                    }
+                }
+                set
+            }
+            // No signed attributes: the signature covers the content directly.
+            (None, Some(content)) => content.clone(),
+            (None, None) => {
+                return not_ready(&summary, "detached CMS content cannot be re-signed here")
+            }
+        };
+
+        for material in self.signing_materials_for(&id) {
+            let Ok(signature) = verify::sign(&cms.sig_alg, &material, &message) else {
+                continue;
+            };
+            if verify::verify_signature(&cms.sig_alg, pubkey, &message, &signature) {
+                let mut edits = edits.clone();
+                edits.push((cms.signature_path.clone(), signature));
+                return ResignState {
+                    issuer_summary: summary,
+                    detail: "the signer's signing key is available".to_string(),
+                    ready: true,
+                    edits,
+                };
+            }
+        }
+        not_ready(
+            &summary,
+            "the signer's private key is not available — open its key file and, \
+             if it is encrypted, decrypt it with 'z' first",
+        )
     }
 
     // ---- public-key modification ('e' on subjectPublicKeyInfo) -----------
@@ -3599,22 +3714,32 @@ impl App {
             return;
         }
         let der = ber::encode_forest(&self.roots);
-        let Some(signable) = x509::parse_signable(&self.roots, &der) else {
-            self.status = "not an encrypted key, PKCS#12, certificate or CRL".to_string();
+        let items = if let Some(signable) = x509::parse_signable(&self.roots, &der) {
+            let mut items = vec![MenuItem {
+                action: MenuAction::Resign,
+                label: "Re-sign",
+                desc: "regenerate the signature with the issuer's key",
+            }];
+            if signable.kind == Kind::Certificate {
+                items.push(MenuItem {
+                    action: MenuAction::Rekey,
+                    label: "Re-key",
+                    desc: "new key pair; resign the objects this certificate issued",
+                });
+            }
+            items
+        } else if x509::parse_cms_signed(&self.roots, &der).is_some() {
+            // A CMS signed message: a single re-sign choice, for now.
+            vec![MenuItem {
+                action: MenuAction::ResignCms,
+                label: "Re-sign",
+                desc: "regenerate the signature with the signer certificate's key",
+            }]
+        } else {
+            self.status =
+                "not an encrypted key, PKCS#12, certificate, CRL or CMS message".to_string();
             return;
         };
-        let mut items = vec![MenuItem {
-            action: MenuAction::Resign,
-            label: "Re-sign",
-            desc: "regenerate the signature with the issuer's key",
-        }];
-        if signable.kind == Kind::Certificate {
-            items.push(MenuItem {
-                action: MenuAction::Rekey,
-                label: "Re-key",
-                desc: "new key pair; resign the objects this certificate issued",
-            });
-        }
         self.mode =
             Mode::EditMenu(MenuState { title: " CRYPTOGRAPHIC ADJUSTMENT ", items, selected: 0 });
         self.status = "choose a cryptographic adjustment".to_string();
@@ -3646,6 +3771,7 @@ impl App {
             MenuAction::EditExtKeyUsage => self.start_ext_key_usage(),
             MenuAction::Rekey => self.start_rekey(),
             MenuAction::Resign => self.start_resign(),
+            MenuAction::ResignCms => self.start_resign_cms(),
         }
     }
 
@@ -4472,6 +4598,33 @@ fn read_plaintext_key_pkcs8(path: &Path) -> Option<Vec<u8>> {
     let (der, _) = input::load(&raw).ok()?;
     let roots = ber::parse_forest(&der, 0).ok()?;
     x509::to_pkcs8_der(&roots)
+}
+
+/// PKCS#9 `messageDigest` attribute OID.
+const CMS_MESSAGE_DIGEST_OID: &[u64] = &[1, 2, 840, 113549, 1, 9, 4];
+
+/// Rebuild a CMS `signedAttrs` SET-OF encoding (the `0x31`-tagged form that
+/// the signature covers) with the `messageDigest` attribute's value replaced
+/// by `new_digest`. Used when re-signing a modified message so the content
+/// binding stays consistent. `None` if the input does not decode as expected.
+fn signed_attrs_with_digest(signed_attrs_set: &[u8], new_digest: &[u8]) -> Option<Vec<u8>> {
+    let mut forest = ber::parse_forest(signed_attrs_set, 0).ok()?;
+    let set = forest.first_mut()?;
+    for attr in &mut set.children {
+        let is_md = attr
+            .children
+            .first()
+            .and_then(|o| ber::oid_arcs(&o.value))
+            .is_some_and(|a| a == CMS_MESSAGE_DIGEST_OID);
+        if is_md {
+            if let Some(value) = attr.children.get_mut(1).and_then(|v| v.children.first_mut()) {
+                value.value = new_digest.to_vec();
+                value.children.clear();
+                value.encapsulates = false;
+            }
+        }
+    }
+    Some(ber::encode_node(set))
 }
 
 /// Read a certificate file and return its raw DER (unwrapping a PEM/base64/hex
@@ -6636,6 +6789,64 @@ mod tests {
     fn public_key_id_of_private_key_at(path: &Path) -> Option<x509::PublicKeyId> {
         let (der, _) = input::load(&std::fs::read(path).unwrap()).unwrap();
         x509::public_key_id_of_private_key(&ber::parse_forest(&der, 0).unwrap())
+    }
+
+    #[test]
+    fn z_on_cms_message_offers_a_single_resign_choice() {
+        // A scratch folder so nothing on disk is at risk.
+        let dir = tmp_dir("cms-menu");
+        std::fs::copy("testdata/cms_signed.der", dir.join("cms.der")).unwrap();
+        let mut app = open_real_file(&dir.join("cms.der"));
+        app.start_decrypt(); // 'z'
+        let Mode::EditMenu(ref m) = app.mode else { panic!("crypto menu: {}", app.status) };
+        let actions: Vec<MenuAction> = m.items.iter().map(|i| i.action).collect();
+        assert_eq!(actions, [MenuAction::ResignCms], "a single re-sign choice");
+        assert_eq!(m.items[0].label, "Re-sign");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn resign_a_modified_cms_message_with_the_signers_plaintext_key() {
+        // Scratch copies of the CMS message, its signer certificate and the
+        // signer's plaintext key (re-signing auto-saves — never touch the
+        // committed fixtures). The signer is matched by issuer + serial, so
+        // the filenames are irrelevant.
+        let dir = tmp_dir("resign-cms");
+        std::fs::copy("testdata/cms_signed.der", dir.join("cms.der")).unwrap();
+        std::fs::copy(kl("cert_ec.der"), dir.join("signer.der")).unwrap();
+        std::fs::copy(kl("key_ec_pkcs8.der"), dir.join("key.der")).unwrap();
+
+        let mut app = open_real_file(&dir.join("cms.der"));
+        assert!(
+            matches!(app.sig_status, Some(SignatureStatus::Verified { .. })),
+            "baseline: the committed message verifies"
+        );
+        // Modify the eContent payload — breaks the messageDigest binding.
+        let idx = row_of(&app, &[0, 1, 0, 2, 1, 0]);
+        app.select(idx);
+        let mut v = app.selected_node().unwrap().content_octets();
+        v[0] ^= 0x01;
+        app.mode = Mode::Edit(EditState::hex(EditKind::Content, &v));
+        app.commit_edit();
+        assert!(
+            matches!(app.sig_status, Some(SignatureStatus::Invalid { .. })),
+            "the modification must break the signature"
+        );
+        // 'z' → Re-sign: the signer's key is available.
+        app.start_resign_cms();
+        let Mode::Resign(ref state) = app.mode else { panic!("re-sign dialog: {}", app.status) };
+        assert!(state.ready, "signer key present as plaintext: {}", state.detail);
+        app.submit_resign();
+        assert!(matches!(app.mode, Mode::Browse));
+        assert!(!app.dirty, "the re-signed message is auto-saved");
+        // Re-signing recomputed the messageDigest and the signature, so the
+        // whole (modified) message verifies again — raw and via OpenSSL.
+        assert!(
+            matches!(app.sig_status, Some(SignatureStatus::Verified { .. })),
+            "the re-signed message must verify: {}",
+            app.status
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

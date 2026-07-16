@@ -1063,19 +1063,45 @@ whole operation failing on the first candidate. A self-signed certificate is
 its own issuer, so its own key signs it.
 
 The verified signature is computed when the dialog opens and stored in
-`ResignState` (public data — no private key material is held in the dialog).
-On confirmation (`App::submit_resign`) it is installed into the object's
-outer `signature` BIT STRING (the third element of the
-`Certificate`/`CertificateList` SEQUENCE, at path `[0, 2]`) as a leading
-unused-bits octet followed by the signature — the `tbs` cannot have changed
-while the dialog was open, so the pre-computed signature still matches. The
-document is re-encoded and then **auto-saved** in place (`write_current`, the
-same helper the re-key flow uses), so the freshly signed object lands on disk
-without a separate `s` (the status line reports the save, or a `SAVE FAILED`
-note leaving the document dirty for a manual retry); the intervening
-`recompute_sig_status` shows the signature verifying again. `verify.rs` gains
-signature generation (it already owned `aws-lc-rs` verification), keeping all
-signature crypto in one module.
+`ResignState` as a list of node **edits** — `(tree path, new content octets)`
+pairs — to apply on confirm (public data — no private key material is held in
+the dialog). On confirmation (`App::submit_resign`) each edit replaces the
+target node's content: for a certificate/CRL, the outer `signature` BIT STRING
+(the third element of the SEQUENCE, path `[0, 2]`) as a leading unused-bits
+octet followed by the signature — the `tbs` cannot have changed while the
+dialog was open, so the pre-computed signature still matches. The document is
+re-encoded and then **auto-saved** in place (`write_current`, the same helper
+the re-key flow uses), so the freshly signed object lands on disk without a
+separate `s` (the status line reports the save, or a `SAVE FAILED` note leaving
+the document dirty for a manual retry); the intervening `recompute_sig_status`
+shows the signature verifying again. `verify.rs` gains signature generation (it
+already owned `aws-lc-rs` verification), keeping all signature crypto in one
+module.
+
+### Re-signing a CMS signed message
+
+Pressing **`z`** on a CMS `SignedData` message (§9, "CMS signed messages")
+opens the same cryptographic-adjustment menu, here with a single **Re-sign**
+choice, which reuses the very same `Mode::Resign` dialog. `App::resign_cms_state`
+mirrors the certificate flow with a CMS twist:
+
+* the "issuer" is the **signer certificate**, resolved (like `verify_cms`) by
+  the SignerInfo's `IssuerAndSerialNumber` among the scanned certificates, and
+  its public key drives the same `signing_materials_for` key search;
+* the message signed is what RFC 5652 §5.4 prescribes — the `signedAttrs`
+  re-tagged as a `SET OF`, or the `eContent` when no attributes are signed;
+* because the content is bound to the signature only *indirectly* (through the
+  `messageDigest` signed attribute), re-signing first **recomputes**
+  `messageDigest` from the current `eContent` (`verify::cms_message_digest`,
+  `signed_attrs_with_digest` rebuilds the SET with the new value) so that a
+  modification to the payload becomes valid again — the plan therefore carries
+  two edits, the recomputed `messageDigest` value and the new SignerInfo
+  `signature` (both OCTET STRINGs, whose tree paths `parse_cms_signed` now
+  records). The generic edit-application in `submit_resign` installs both.
+
+The result verifies under both halves of `verify_cms`. Like all §9 signature
+features this needs the directory scan (the signer certificate and its key
+live in other files), so it is unavailable in single-file mode.
 
 ### Retained passwords
 

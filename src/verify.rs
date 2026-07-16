@@ -330,6 +330,14 @@ fn cms_raw_verify(cms: &x509::CmsSigned, signer: &Signable) -> bool {
     true
 }
 
+/// Digest `content` with the CMS `digestAlgorithm` — the recomputed
+/// `messageDigest` attribute value re-signing installs. `None` for an
+/// unsupported digest algorithm.
+pub fn cms_message_digest(digest_alg: &[u64], content: &[u8]) -> Option<Vec<u8>> {
+    let alg = digest_for(digest_alg)?;
+    Some(aws_lc_rs::digest::digest(alg, content).as_ref().to_vec())
+}
+
 /// Map a CMS `digestAlgorithm` OID to the aws-lc-rs digest.
 fn digest_for(oid: &[u64]) -> Option<&'static aws_lc_rs::digest::Algorithm> {
     match oid {

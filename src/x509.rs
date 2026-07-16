@@ -311,6 +311,12 @@ pub struct CmsSigned {
     pub message_digest: Option<Vec<u8>>,
     /// The `eContent` OCTET STRING content octets, when attached.
     pub econtent: Option<Vec<u8>>,
+    /// Tree path (in the parsed forest) of the SignerInfo `signature` OCTET
+    /// STRING — where re-signing installs the new signature.
+    pub signature_path: Vec<usize>,
+    /// Tree path of the `messageDigest` attribute value OCTET STRING, when
+    /// present — where re-signing installs the recomputed content digest.
+    pub message_digest_path: Option<Vec<usize>>,
 }
 
 /// Try to structurally decode `roots` as a CMS `ContentInfo` carrying
@@ -354,13 +360,17 @@ pub fn parse_cms_signed(roots: &[Node], der: &[u8]) -> Option<CmsSigned> {
         }
     });
     // signerInfos is the last child.
-    let signer_infos = sd.children.last()?;
+    let si_set_idx = sd.children.len() - 1;
+    let signer_infos = &sd.children[si_set_idx];
     if !signer_infos.constructed || !signer_infos.is_universal(ber::TAG_SET) {
         return None;
     }
-    // First SignerInfo whose sid is an IssuerAndSerialNumber.
-    for si in &signer_infos.children {
-        if let Some(mut parsed) = try_signer_info(si, der) {
+    // First SignerInfo whose sid is an IssuerAndSerialNumber. Tree paths are
+    // built relative to the fixed prefix root[0] → content[1] → SignedData[0]
+    // → signerInfos → the i-th SignerInfo.
+    for (i, si) in signer_infos.children.iter().enumerate() {
+        let base = vec![0, 1, 0, si_set_idx, i];
+        if let Some(mut parsed) = try_signer_info(si, der, &base) {
             parsed.econtent = econtent;
             return Some(parsed);
         }
@@ -372,7 +382,7 @@ pub fn parse_cms_signed(roots: &[Node], der: &[u8]) -> Option<CmsSigned> {
 /// signedAttrs [0] IMPLICIT OPTIONAL, signatureAlgorithm, signature,
 /// unsignedAttrs [1] IMPLICIT OPTIONAL }` with
 /// `sid = IssuerAndSerialNumber ::= SEQUENCE { issuer Name, serialNumber }`.
-fn try_signer_info(si: &Node, der: &[u8]) -> Option<CmsSigned> {
+fn try_signer_info(si: &Node, der: &[u8], base: &[usize]) -> Option<CmsSigned> {
     if !si.constructed || !si.is_universal(TAG_SEQUENCE) || si.children.len() < 5 {
         return None;
     }
@@ -389,11 +399,13 @@ fn try_signer_info(si: &Node, der: &[u8]) -> Option<CmsSigned> {
         return None;
     }
     let digest_alg = alg_oid(&si.children[2])?;
+    let child_path = |i: usize| -> Vec<usize> { base.iter().copied().chain([i]).collect() };
 
     // Optional signedAttrs [0] IMPLICIT SET OF Attribute.
     let mut idx = 3;
     let mut signed_attrs = None;
     let mut message_digest = None;
+    let mut message_digest_path = None;
     let attrs = &si.children[3];
     if attrs.class == Class::ContextSpecific && attrs.tag == 0 && attrs.constructed {
         // The signature covers the DER with the explicit SET OF tag (0x31)
@@ -404,15 +416,20 @@ fn try_signer_info(si: &Node, der: &[u8]) -> Option<CmsSigned> {
         set.extend_from_slice(&ber::length_octets(content.len()));
         set.extend_from_slice(&content);
         signed_attrs = Some(set);
-        message_digest = attrs.children.iter().find_map(|attr| {
-            let oid = attr.children.first()?;
-            if !oid.is_universal(TAG_OID) || ber::oid_arcs(&oid.value)? != ID_MESSAGE_DIGEST {
-                return None;
+        for (j, attr) in attrs.children.iter().enumerate() {
+            let Some(oid) = attr.children.first() else { continue };
+            if !oid.is_universal(TAG_OID) || ber::oid_arcs(&oid.value).as_deref() != Some(ID_MESSAGE_DIGEST) {
+                continue;
             }
-            let values = attr.children.get(1)?;
-            let os = values.children.first()?;
-            os.is_universal(TAG_OCTET_STRING).then(|| os.content_octets())
-        });
+            let Some(values) = attr.children.get(1) else { continue };
+            let Some(os) = values.children.first() else { continue };
+            if os.is_universal(TAG_OCTET_STRING) {
+                message_digest = Some(os.content_octets());
+                // signedAttrs [0] is child 3; attribute j; value SET child 1;
+                // OCTET STRING child 0.
+                message_digest_path = Some(base.iter().copied().chain([3, j, 1, 0]).collect());
+            }
+        }
         idx = 4;
     }
     if si.children.len() < idx + 2 {
@@ -432,6 +449,8 @@ fn try_signer_info(si: &Node, der: &[u8]) -> Option<CmsSigned> {
         signed_attrs,
         message_digest,
         econtent: None, // filled in by the caller
+        signature_path: child_path(idx + 1),
+        message_digest_path,
     })
 }
 
