@@ -2994,12 +2994,10 @@ impl App {
         };
         let mut trusted = Vec::new();
         let mut untrusted = Vec::new();
+        let mut crls = Vec::new();
         for file in &self.signables {
-            if file.signable.kind != Kind::Certificate {
-                continue;
-            }
             // Prefer the live content for the open document; read the rest.
-            let cert_der = if file.path == self.path {
+            let file_der = if file.path == self.path {
                 der.clone()
             } else {
                 match read_cert_der(&file.path) {
@@ -3007,13 +3005,18 @@ impl App {
                     None => continue,
                 }
             };
-            if self.trusted_certs.contains(&file.path) {
-                trusted.push(cert_der);
-            } else {
-                untrusted.push(cert_der);
+            match file.signable.kind {
+                // Every CRL in the tree is offered for revocation checking;
+                // `pathval` only trusts those signed by a certificate on the
+                // path (RFC-recursive scan already collected them).
+                Kind::Crl => crls.push(file_der),
+                Kind::Certificate if self.trusted_certs.contains(&file.path) => {
+                    trusted.push(file_der)
+                }
+                Kind::Certificate => untrusted.push(file_der),
             }
         }
-        self.path_status = Some(pathval::validate(&target_der, &trusted, &untrusted));
+        self.path_status = Some(pathval::validate(&target_der, &trusted, &untrusted, &crls));
     }
 
     /// `t`: toggle whether the certificate selected in the browser is a trust
@@ -7072,6 +7075,36 @@ mod tests {
         app.toggle_trust();
         assert!(app.trusted_certs.is_empty());
         assert!(matches!(app.path_status, Some(PathStatus::Invalid { .. })));
+    }
+
+    #[test]
+    fn a_revoked_leaf_certificate_shows_a_revoked_path() {
+        // Open the leaf in the revoked-leaf folder and trust the root; the
+        // intermediate's CRL (also in the folder) revokes the leaf.
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("testdata/revoked_leaf");
+        let mut app = open_real_file(&dir.join("leaf.der"));
+        app.trusted_certs.insert(dir.join("root_ca.der"));
+        app.recompute_path_status();
+        assert!(
+            matches!(app.path_status, Some(PathStatus::Revoked { .. })),
+            "{:?}",
+            app.path_status
+        );
+    }
+
+    #[test]
+    fn a_revoked_intermediate_shows_a_revoked_path_for_the_leaf() {
+        // The root's CRL revokes the intermediate; validating the leaf's path
+        // detects the revoked link.
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("testdata/revoked_intermediate");
+        let mut app = open_real_file(&dir.join("leaf.der"));
+        app.trusted_certs.insert(dir.join("root_ca.der"));
+        app.recompute_path_status();
+        assert!(
+            matches!(app.path_status, Some(PathStatus::Revoked { .. })),
+            "{:?}",
+            app.path_status
+        );
     }
 
     #[test]

@@ -1937,6 +1937,10 @@ fn path_status_line(status: &PathStatus) -> Line<'static> {
             format!("valid — path of {} certificate(s) to a trusted anchor", depth),
             Style::new().fg(Color::Green),
         ),
+        PathStatus::Revoked { subject } => (
+            format!("revoked — {} is listed on a CRL from its issuer", subject),
+            Style::new().fg(Color::Red).bold(),
+        ),
         PathStatus::Invalid { reason } => {
             (format!("no valid path — {}", reason), Style::new().fg(Color::Red).bold())
         }

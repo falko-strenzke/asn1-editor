@@ -155,6 +155,11 @@ testdata/  DER samples (EC cert, RSA cert, SEC1 EC key, PKCS#8 key,
            PKCS#8 + PKCS#12) and one RSA pair (cert + PKCS#8), for exercising
            the key↔certificate links; the encrypted/PKCS#12 files use the
            password "asn1editor"
+  revoked_leaf/ and revoked_intermediate/  each a root→intermediate→leaf
+           ECDSA hierarchy plus root and intermediate CRLs, where the
+           intermediate's CRL revokes the leaf (revoked_leaf) or the root's
+           CRL revokes the intermediate (revoked_intermediate) — for the
+           §9d revocation check (no private keys are committed)
 ```
 
 Dependency rule: `ber.rs` and `oid.rs` depend on nothing; `input.rs` and
@@ -1148,6 +1153,20 @@ self-signed roots. The result is `Valid { depth }`, `Invalid { reason }`
 (OpenSSL's verification error string, e.g. "unable to get issuer
 certificate"), or `Error { detail }` (the target isn't a parseable
 certificate).
+
+**Revocation.** Once a path is built, every certificate on it is checked
+against the CRLs found (recursively) in the directory — `pathval::validate`
+takes a fourth argument, the DER of every scanned CRL. Rather than OpenSSL's
+strict `CRL_CHECK_ALL` flag (which *fails* the whole validation when a CRL for
+any link is missing), the check is done manually so a missing CRL simply means
+"not checked": for each certificate on the built chain (`revoked_on_path`,
+walking leaf→anchor), its issuer is the next certificate up, and any CRL whose
+signature `verify`s under that issuer's public key is authoritative for it
+(serial numbers are unique only per issuer) — if such a CRL lists the
+certificate's serial (`X509Crl::get_by_cert` → `CrlStatus::Revoked`), the
+result is `Revoked { subject }`. The trust anchor (no issuer on the path) is
+not checked. This uses the same OpenSSL `openssl` crate as the chain build
+(`X509Crl`, `CrlStatus`).
 
 `App::path_status` holds the result for the open document. The **target**
 certificate whose path is validated depends on what the document is:
