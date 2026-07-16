@@ -61,6 +61,9 @@ pub enum RowSource {
     /// A virtual row of the PKCS#12 reveal: the plaintext of the `usize`-th
     /// decrypted region (see [`Pkcs12Reveal`]).
     Pkcs12Revealed(usize),
+    /// A virtual row of the decrypted CMS `EnvelopedData` plaintext, read-only
+    /// (see [`CmsReveal`]).
+    CmsRevealed,
 }
 
 /// Compiled form of the tree-filter string ('/'). The one entered string is
@@ -734,6 +737,8 @@ pub enum MenuAction {
     Resign,
     /// Open the re-sign dialog for a CMS signed message.
     ResignCms,
+    /// Decrypt an encrypted CMS `EnvelopedData` message.
+    DecryptCms,
 }
 
 /// One entry of a popup menu.
@@ -1310,6 +1315,21 @@ impl Drop for Pkcs12Reveal {
     }
 }
 
+/// A successful decryption of a CMS `EnvelopedData` message ('z' → "Decrypt
+/// message") with the recipient's private key. Read-only: the plaintext is
+/// shown as a virtual subtree below the `encryptedContent` node but cannot be
+/// re-encrypted here (that would need the recipients' certificates). Nesting
+/// falls out naturally — if the plaintext is itself a SignedData (or another
+/// EnvelopedData), it simply parses and displays.
+pub struct CmsReveal {
+    /// Path of the `encryptedContent` ciphertext node this hangs below.
+    pub cipher_path: Vec<usize>,
+    /// Parsed plaintext subtree (read-only).
+    pub roots: Vec<Node>,
+    /// Specification match for the plaintext tree.
+    pub ident: Option<Identification>,
+}
+
 /// Whether a PKCS#12 reveal may be edited, given the container's `MacData`
 /// state: absent or supported MACs keep the file consistent after
 /// re-encryption, an unsupported one cannot be recomputed.
@@ -1428,6 +1448,9 @@ pub struct App {
     /// Read-only virtual plaintext of the open PKCS#12 container's encrypted
     /// regions, once the user has decrypted it with 'z'.
     pub pkcs12: Option<Pkcs12Reveal>,
+    /// Read-only virtual plaintext of a decrypted CMS `EnvelopedData`, once the
+    /// user chose "Decrypt message" ('z').
+    pub cms_reveal: Option<CmsReveal>,
 }
 
 impl App {
@@ -1491,6 +1514,7 @@ impl App {
             retained_passwords: RetainedPasswords::default(),
             decrypted: None,
             pkcs12: None,
+            cms_reveal: None,
         };
         app.rebuild_rows();
         app.recompute_sig_status(); // also refreshes browser_relations
@@ -1543,6 +1567,7 @@ impl App {
             retained_passwords: RetainedPasswords::default(),
             decrypted: None,
             pkcs12: None,
+            cms_reveal: None,
         };
         app.rebuild_rows();
         app.recompute_browser_relations();
@@ -1600,6 +1625,7 @@ impl App {
             retained_passwords: RetainedPasswords::default(),
             decrypted: None,
             pkcs12: None,
+            cms_reveal: None,
         };
         app.rebuild_rows();
         app.recompute_sig_status();
@@ -1722,6 +1748,7 @@ impl App {
         self.file_open = true;
         self.decrypted = None;
         self.pkcs12 = None;
+        self.cms_reveal = None;
         self.rebuild_rows();
         self.identify();
         self.recompute_sig_status();
@@ -1897,6 +1924,75 @@ impl App {
             }
         }
         None
+    }
+
+    /// Every private key currently reachable as PKCS#8 DER: each plaintext key
+    /// file plus each session-unlocked encrypted key / PKCS#12 (re-decrypted
+    /// with its retained password). Used to try recipient keys against an
+    /// encrypted CMS message — the caller lets OpenSSL pick the matching one.
+    fn available_decryption_keys(&self) -> Vec<Vec<u8>> {
+        let mut keys = Vec::new();
+        for key_file in &self.key_files {
+            if let Some(pkcs8) = read_plaintext_key_pkcs8(&key_file.path) {
+                keys.push(pkcs8);
+            }
+        }
+        for (path, id) in &self.unlocked_keys {
+            if let Some(pkcs8) = self.decrypt_key_pkcs8(path, id) {
+                keys.push(pkcs8);
+            }
+        }
+        keys
+    }
+
+    /// 'z' → "Decrypt message": decrypt the open (or nested) CMS
+    /// `EnvelopedData` with an available recipient key and show the plaintext
+    /// as a read-only virtual subtree.
+    pub fn decrypt_cms_message(&mut self) {
+        if self.single_file {
+            self.status = "decryption needs the recipient key from the directory".to_string();
+            return;
+        }
+        let Some(env) = x509::find_enveloped(&self.roots) else {
+            self.status = "not an encrypted CMS message".to_string();
+            return;
+        };
+        let keys = self.available_decryption_keys();
+        if keys.is_empty() {
+            self.status =
+                "no recipient key available — open its key file (decrypt it with 'z' if encrypted)"
+                    .to_string();
+            return;
+        }
+        // Let OpenSSL match each candidate key to a RecipientInfo in turn.
+        let mut plaintext = None;
+        for pkcs8 in &keys {
+            let Ok(pkey) = openssl::pkey::PKey::private_key_from_pkcs8(pkcs8) else { continue };
+            let Ok(cms) = openssl::cms::CmsContentInfo::from_der(&env.content_info_der) else {
+                continue;
+            };
+            if let Ok(bytes) = cms.decrypt_without_cert_check(&pkey) {
+                plaintext = Some(bytes);
+                break;
+            }
+        }
+        let Some(plaintext) = plaintext else {
+            self.status =
+                "no available recipient key could decrypt this message".to_string();
+            return;
+        };
+        // The plaintext is shown as a subtree when it is ASN.1 (a nested CMS
+        // message), otherwise wrapped in a synthetic OCTET STRING so the raw
+        // decrypted bytes are still viewable (hex / text) in the content pane.
+        let roots = match ber::parse_forest(&plaintext, 0) {
+            Ok(forest) if !forest.is_empty() => forest,
+            _ => octet_string_forest(&plaintext),
+        };
+        let ident = spec::identify(&self.spec_db, &roots);
+        self.cms_reveal = Some(CmsReveal { cipher_path: env.cipher_path, roots, ident });
+        self.rebuild_rows();
+        self.recompute_browser_relations();
+        self.status = "decrypted CMS content — shown in the ASN.1 tree".to_string();
     }
 
     pub fn cancel_resign(&mut self) {
@@ -3365,6 +3461,11 @@ impl App {
                 .and_then(|p| p.regions.get(idx))
                 .and_then(|r| r.ident.as_ref())
                 .and_then(|i| i.labels.get(&row.path)),
+            RowSource::CmsRevealed => self
+                .cms_reveal
+                .as_ref()
+                .and_then(|r| r.ident.as_ref())
+                .and_then(|i| i.labels.get(&row.path)),
         }
     }
 
@@ -3385,6 +3486,7 @@ impl App {
             RowSource::Pkcs12Revealed(idx) => {
                 node_at(&self.pkcs12.as_ref()?.regions.get(idx)?.roots, &row.path)
             }
+            RowSource::CmsRevealed => node_at(&self.cms_reveal.as_ref()?.roots, &row.path),
         }
     }
 
@@ -3407,6 +3509,8 @@ impl App {
             RowSource::Pkcs12Revealed(idx) => {
                 node_at_mut(&mut self.pkcs12.as_mut()?.regions.get_mut(idx)?.roots, &row.path)
             }
+            // The CMS reveal is read-only — never yield a mutable node.
+            RowSource::CmsRevealed => None,
         }
     }
 
@@ -3533,6 +3637,19 @@ impl App {
                 }
             }
         }
+        // Splice a decrypted CMS `EnvelopedData` plaintext below its ciphertext.
+        if let Some(reveal) = &self.cms_reveal {
+            if let Some(cipher_row) = rows
+                .iter()
+                .position(|r| r.source == RowSource::Document && r.path == reveal.cipher_path)
+            {
+                let depth = rows[cipher_row].depth + 1;
+                let mut reveal_rows = Vec::new();
+                let labels = reveal.ident.as_ref().map(|i| &i.labels);
+                self.collect_forest(&reveal.roots, depth, RowSource::CmsRevealed, labels, &mut reveal_rows);
+                rows.splice(cipher_row + 1..cipher_row + 1, reveal_rows);
+            }
+        }
         self.rows = rows;
         if self.selected >= self.rows.len() {
             self.selected = self.rows.len().saturating_sub(1);
@@ -3646,17 +3763,19 @@ impl App {
     /// file (the container's MAC cannot be recomputed). Returns `true`
     /// (having set the status) when the edit must be refused.
     fn reject_uneditable_reveal(&mut self) -> bool {
-        if !matches!(
-            self.rows.get(self.selected).map(|r| r.source),
-            Some(RowSource::Pkcs12Revealed(_))
-        ) {
-            return false;
-        }
-        match self.pkcs12.as_ref().map(|p| p.editable.clone()) {
-            Some(Err(reason)) => {
-                self.status = format!("decrypted PKCS#12 content is read-only — {}", reason);
+        match self.rows.get(self.selected).map(|r| r.source) {
+            // The decrypted CMS plaintext is always read-only.
+            Some(RowSource::CmsRevealed) => {
+                self.status = "decrypted CMS content is read-only".to_string();
                 true
             }
+            Some(RowSource::Pkcs12Revealed(_)) => match self.pkcs12.as_ref().map(|p| p.editable.clone()) {
+                Some(Err(reason)) => {
+                    self.status = format!("decrypted PKCS#12 content is read-only — {}", reason);
+                    true
+                }
+                _ => false,
+            },
             _ => false,
         }
     }
@@ -3744,17 +3863,31 @@ impl App {
                 });
             }
             items
-        } else if x509::parse_cms_signed(&self.roots, &der).is_some() {
-            // A CMS signed message: a single re-sign choice, for now.
-            vec![MenuItem {
-                action: MenuAction::ResignCms,
-                label: "Re-sign",
-                desc: "regenerate the signature with the signer certificate's key",
-            }]
         } else {
-            self.status =
-                "not an encrypted key, PKCS#12, certificate, CRL or CMS message".to_string();
-            return;
+            // A CMS message: offer whichever adjustments apply — re-signing a
+            // signed message and/or decrypting an encrypted (EnvelopedData)
+            // one. Both can apply when the two are nested.
+            let mut items = Vec::new();
+            if x509::parse_cms_signed(&self.roots, &der).is_some() {
+                items.push(MenuItem {
+                    action: MenuAction::ResignCms,
+                    label: "Re-sign",
+                    desc: "regenerate the signature with the signer certificate's key",
+                });
+            }
+            if x509::find_enveloped(&self.roots).is_some() {
+                items.push(MenuItem {
+                    action: MenuAction::DecryptCms,
+                    label: "Decrypt message",
+                    desc: "decrypt the content with an available recipient key",
+                });
+            }
+            if items.is_empty() {
+                self.status =
+                    "not an encrypted key, PKCS#12, certificate, CRL or CMS message".to_string();
+                return;
+            }
+            items
         };
         self.mode =
             Mode::EditMenu(MenuState { title: " CRYPTOGRAPHIC ADJUSTMENT ", items, selected: 0 });
@@ -3788,6 +3921,7 @@ impl App {
             MenuAction::Rekey => self.start_rekey(),
             MenuAction::Resign => self.start_resign(),
             MenuAction::ResignCms => self.start_resign_cms(),
+            MenuAction::DecryptCms => self.decrypt_cms_message(),
         }
     }
 
@@ -4084,7 +4218,7 @@ impl App {
                 };
                 &mut region.roots
             }
-            RowSource::DecryptedPlaceholder => return,
+            RowSource::DecryptedPlaceholder | RowSource::CmsRevealed => return,
         };
         let Some(node) = node_at_mut(roots, path) else { return };
         if node.class == class && node.constructed == constructed && node.tag == tag {
@@ -4150,7 +4284,7 @@ impl App {
                 };
                 &mut region.roots
             }
-            RowSource::DecryptedPlaceholder => unreachable!(),
+            RowSource::DecryptedPlaceholder | RowSource::CmsRevealed => unreachable!(),
         };
         let sibling_count = if parent.is_empty() {
             roots.len()
@@ -4224,7 +4358,7 @@ impl App {
                 };
                 &mut region.roots
             }
-            RowSource::DecryptedPlaceholder => unreachable!(),
+            RowSource::DecryptedPlaceholder | RowSource::CmsRevealed => unreachable!(),
         };
         if parent.is_empty() {
             roots.remove(last);
@@ -4342,7 +4476,7 @@ impl App {
                 };
                 &mut region.roots
             }
-            RowSource::DecryptedPlaceholder => return,
+            RowSource::DecryptedPlaceholder | RowSource::CmsRevealed => return,
         };
         if parent.is_empty() {
             roots.insert(index, node);
@@ -4372,6 +4506,11 @@ impl App {
     /// Re-encode the whole tree and re-parse it so that every offset,
     /// length and encapsulation flag is consistent again after an edit.
     pub fn rebuild(&mut self) {
+        // An edit re-encodes the whole document; the read-only CMS reveal was
+        // derived from a specific decryption and would go stale, so drop it
+        // (the user can decrypt again). Navigation uses `rebuild_rows`, which
+        // keeps it.
+        self.cms_reveal = None;
         let selection = self
             .rows
             .get(self.selected)
@@ -4609,6 +4748,15 @@ impl App {
 
 /// Read a plaintext private-key file and return its PKCS#8 form (SEC1 keys
 /// are wrapped), or `None` if it isn't a usable plaintext key.
+/// A one-node forest holding `bytes` as an OCTET STRING — used to display
+/// decrypted CMS content that is not itself ASN.1 (raw application data).
+fn octet_string_forest(bytes: &[u8]) -> Vec<Node> {
+    let mut der = vec![0x04];
+    der.extend_from_slice(&ber::length_octets(bytes.len()));
+    der.extend_from_slice(bytes);
+    ber::parse_forest(&der, 0).unwrap_or_default()
+}
+
 fn read_plaintext_key_pkcs8(path: &Path) -> Option<Vec<u8>> {
     let raw = std::fs::read(path).ok()?;
     let (der, _) = input::load(&raw).ok()?;
@@ -5898,6 +6046,114 @@ mod tests {
         app.filter = "no-such-thing".to_string();
         app.rebuild_rows();
         assert_eq!(doc_rows(&app), [(vec![0], true)]);
+    }
+
+    // ---- CMS EnvelopedData decryption ('z' → "Decrypt message") -----------
+
+    /// A scratch folder holding one encrypted CMS fixture plus the plaintext
+    /// RSA recipient key it is encrypted to, so decryption in directory mode
+    /// finds a usable key. (Decryption is read-only — it never writes.)
+    fn cms_decrypt_app(fixture: &str) -> (App, PathBuf) {
+        let dir = tmp_dir(&format!("cms-dec-{}", fixture.trim_end_matches(".der")));
+        std::fs::copy(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("testdata").join(fixture),
+            dir.join("msg.der"),
+        )
+        .unwrap();
+        std::fs::copy(kl("key_rsa_pkcs8.der"), dir.join("recipient.der")).unwrap();
+        (open_real_file(&dir.join("msg.der")), dir)
+    }
+
+    #[test]
+    fn z_on_an_encrypted_cms_offers_decrypt_message() {
+        let (mut app, dir) = cms_decrypt_app("enveloped.der");
+        app.start_decrypt(); // 'z'
+        let Mode::EditMenu(ref m) = app.mode else { panic!("crypto menu: {}", app.status) };
+        let actions: Vec<MenuAction> = m.items.iter().map(|i| i.action).collect();
+        assert_eq!(actions, [MenuAction::DecryptCms]);
+        assert_eq!(m.items[0].label, "Decrypt message");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn decrypt_a_plain_enveloped_cms_message() {
+        let (mut app, dir) = cms_decrypt_app("enveloped.der");
+        app.decrypt_cms_message();
+        assert!(app.cms_reveal.is_some(), "decrypted: {}", app.status);
+        // The payload is raw data, shown as an OCTET STRING carrying the text.
+        let reveal_row = app.rows.iter().find(|r| r.source == RowSource::CmsRevealed).unwrap();
+        let node = app.node_for_row(reveal_row).unwrap();
+        assert!(
+            String::from_utf8_lossy(&node.content_octets()).contains("enveloped test payload"),
+            "decrypted payload visible"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn decrypt_a_signed_then_encrypted_cms_reveals_the_inner_signeddata() {
+        // EnvelopedData(SignedData): decrypting reveals the nested signed
+        // message, which parses as an ASN.1 subtree.
+        let (mut app, dir) = cms_decrypt_app("signed_then_encrypted.der");
+        // The menu offers only "Decrypt message" (top level is EnvelopedData).
+        app.start_decrypt();
+        let Mode::EditMenu(ref m) = app.mode else { panic!("menu: {}", app.status) };
+        assert_eq!(
+            m.items.iter().map(|i| i.action).collect::<Vec<_>>(),
+            [MenuAction::DecryptCms]
+        );
+        app.decrypt_cms_message();
+        assert!(app.cms_reveal.is_some(), "{}", app.status);
+        // The revealed plaintext is a CMS SignedData ContentInfo.
+        let reveal = app.cms_reveal.as_ref().unwrap();
+        assert!(x509::parse_cms_signed(&reveal.roots, &ber::encode_forest(&reveal.roots)).is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn decrypt_an_encrypted_then_signed_cms_from_the_signed_wrapper() {
+        // SignedData(EnvelopedData): the top level is signed, so the menu
+        // offers both re-signing and decrypting the nested EnvelopedData.
+        let (mut app, dir) = cms_decrypt_app("encrypted_then_signed.der");
+        app.start_decrypt();
+        let Mode::EditMenu(ref m) = app.mode else { panic!("menu: {}", app.status) };
+        let actions: Vec<MenuAction> = m.items.iter().map(|i| i.action).collect();
+        assert!(actions.contains(&MenuAction::ResignCms), "{:?}", actions);
+        assert!(actions.contains(&MenuAction::DecryptCms), "{:?}", actions);
+        app.decrypt_cms_message();
+        assert!(app.cms_reveal.is_some(), "decrypted nested EnvelopedData: {}", app.status);
+        let reveal_row = app.rows.iter().find(|r| r.source == RowSource::CmsRevealed).unwrap();
+        let node = app.node_for_row(reveal_row).unwrap();
+        assert!(String::from_utf8_lossy(&node.content_octets()).contains("enveloped test payload"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn decrypt_reports_when_no_recipient_key_is_available() {
+        // A folder with only the encrypted message — no recipient key.
+        let dir = tmp_dir("cms-dec-nokey");
+        std::fs::copy(
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("testdata/enveloped.der"),
+            dir.join("msg.der"),
+        )
+        .unwrap();
+        let mut app = open_real_file(&dir.join("msg.der"));
+        app.decrypt_cms_message();
+        assert!(app.cms_reveal.is_none());
+        assert!(app.status.contains("no recipient key") || app.status.contains("could decrypt"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn decrypted_cms_content_is_read_only() {
+        let (mut app, dir) = cms_decrypt_app("enveloped.der");
+        app.decrypt_cms_message();
+        let idx = app.rows.iter().position(|r| r.source == RowSource::CmsRevealed).unwrap();
+        app.select(idx);
+        app.delete_selected();
+        assert!(app.status.contains("read-only"), "delete refused: {}", app.status);
+        assert!(app.selected_node_mut().is_none(), "no mutable node for a reveal row");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

@@ -1529,6 +1529,12 @@ fn draw_tree(frame: &mut Frame, app: &mut App, area: Rect) {
                     ));
                 }
             }
+            if row.source == RowSource::CmsRevealed && row.path.len() == 1 {
+                spans.push(Span::styled(
+                    "🔓 decrypted: ",
+                    Style::new().fg(Color::Green).bold(),
+                ));
+            }
             let label = app.label_for_row(row);
             if let Some(field) = label.and_then(|l| l.field.as_deref()) {
                 spans.push(Span::styled(
@@ -2002,6 +2008,9 @@ fn draw_content_browse(frame: &mut Frame, app: &App, area: Rect) {
                         .as_ref()
                         .and_then(|p| p.regions.get(idx))
                         .and_then(|r| r.ident.as_ref()),
+                    RowSource::CmsRevealed => {
+                        app.cms_reveal.as_ref().and_then(|r| r.ident.as_ref())
+                    }
                 }
                 .expect("label implies identification");
                 let field = label.field.as_deref().unwrap_or("-");
@@ -2864,6 +2873,40 @@ mod tests {
             text.contains("Path") && text.contains("valid — path of"),
             "path line missing:\n{text}"
         );
+    }
+
+    #[test]
+    fn decrypted_cms_reveal_renders_below_its_ciphertext() {
+        use crate::input::Container;
+        use ratatui::{backend::TestBackend, Terminal};
+        // A scratch folder with a signed-then-encrypted message and the RSA
+        // recipient key, so decryption succeeds.
+        let dir = std::env::temp_dir().join(format!("ae-cms-reveal-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let td = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("testdata");
+        std::fs::copy(td.join("signed_then_encrypted.der"), dir.join("msg.der")).unwrap();
+        std::fs::copy(td.join("keylink/key_rsa_pkcs8.der"), dir.join("k.der")).unwrap();
+        let der = std::fs::read(dir.join("msg.der")).unwrap();
+        let roots = parse_forest(&der, 0).unwrap();
+        let mut app = App::new(
+            dir.join("msg.der"),
+            dir.join("msg.der"),
+            Container::Raw,
+            roots,
+            der.len(),
+        );
+        app.decrypt_cms_message();
+        assert!(app.cms_reveal.is_some(), "decrypted: {}", app.status);
+        let mut term = Terminal::new(TestBackend::new(150, 40)).unwrap();
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let text = buffer_text(term.backend().buffer());
+        // The reveal's root carries the unlock prefix, and the nested
+        // SignedData structure is visible below the ciphertext. (The emoji is
+        // stored across buffer cells, so match the trailing label text.)
+        assert!(text.contains("decrypted: "), "reveal prefix missing:\n{text}");
+        assert!(text.contains("signedData"), "nested SignedData not shown:\n{text}");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

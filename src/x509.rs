@@ -283,8 +283,90 @@ fn try_crl(
 /// `id-signedData` (RFC 5652): the ContentInfo content type of a CMS
 /// signed message.
 const ID_SIGNED_DATA: &[u64] = &[1, 2, 840, 113549, 1, 7, 2];
+/// `id-envelopedData` (RFC 5652): the ContentInfo content type of an
+/// encrypted (recipient-keyed) CMS message.
+const ID_ENVELOPED_DATA: &[u64] = &[1, 2, 840, 113549, 1, 7, 3];
 /// PKCS#9 `messageDigest` signed-attribute OID.
 const ID_MESSAGE_DIGEST: &[u64] = &[1, 2, 840, 113549, 1, 9, 4];
+
+/// A CMS `EnvelopedData` found in a document, ready to be handed to OpenSSL's
+/// `CMS_decrypt`, plus where its decrypted plaintext should be spliced into
+/// the tree.
+pub struct CmsEnveloped {
+    /// A self-contained `ContentInfo` DER wrapping the `EnvelopedData` (for
+    /// the top-level case this is the document itself; for one nested inside a
+    /// SignedData's `eContent` it is reconstructed around the inner value).
+    pub content_info_der: Vec<u8>,
+    /// Tree path (in the document forest) of the `encryptedContent` ciphertext
+    /// node the decrypted plaintext hangs below.
+    pub cipher_path: Vec<usize>,
+}
+
+/// Locate a CMS `EnvelopedData` to decrypt: the first `ContentInfo` of type
+/// `id-envelopedData` found anywhere in the tree — the document's own
+/// top-level one, or one nested inside a SignedData's encapsulated content
+/// (encrypt-then-sign). Because the parser's encapsulation heuristic already
+/// decoded nested `ContentInfo`s inside their OCTET STRINGs, a plain recursive
+/// walk reaches them. `None` when there is no EnvelopedData.
+pub fn find_enveloped(roots: &[Node]) -> Option<CmsEnveloped> {
+    fn search(nodes: &[Node], path: &mut Vec<usize>) -> Option<CmsEnveloped> {
+        for (i, node) in nodes.iter().enumerate() {
+            path.push(i);
+            if let Some(env) = enveloped_content_info(node, path) {
+                return Some(env);
+            }
+            if let Some(found) = search(&node.children, path) {
+                return Some(found);
+            }
+            path.pop();
+        }
+        None
+    }
+    search(roots, &mut Vec::new())
+}
+
+/// If `node` (at tree path `path`) is a `ContentInfo` of type
+/// `id-envelopedData`, build a [`CmsEnveloped`] pointing OpenSSL at this whole
+/// `ContentInfo` and the reveal at its `encryptedContent` ciphertext.
+fn enveloped_content_info(node: &Node, path: &[usize]) -> Option<CmsEnveloped> {
+    // ContentInfo ::= SEQUENCE { contentType OID, content [0] EXPLICIT ... }
+    if !node.constructed || !node.is_universal(TAG_SEQUENCE) || node.children.len() != 2 {
+        return None;
+    }
+    let ct = &node.children[0];
+    if ct.constructed || !ct.is_universal(TAG_OID) || ber::oid_arcs(&ct.value)? != ID_ENVELOPED_DATA
+    {
+        return None;
+    }
+    let content = &node.children[1]; // content [0] EXPLICIT
+    if !(content.class == Class::ContextSpecific && content.tag == 0 && content.constructed) {
+        return None;
+    }
+    let envdata = content.children.first()?; // EnvelopedData SEQUENCE
+    if !envdata.constructed || !envdata.is_universal(TAG_SEQUENCE) {
+        return None;
+    }
+    // encryptedContentInfo is the SEQUENCE whose first child is the content
+    // type OID; encryptedContent is its `[0]` ciphertext.
+    for (eci_idx, eci) in envdata.children.iter().enumerate() {
+        if !eci.is_universal(TAG_SEQUENCE)
+            || !eci.children.first().is_some_and(|c| c.is_universal(TAG_OID))
+        {
+            continue;
+        }
+        let ec_idx = eci
+            .children
+            .iter()
+            .position(|c| c.class == Class::ContextSpecific && c.tag == 0)?;
+        let mut cipher_path = path.to_vec();
+        cipher_path.extend([1, 0, eci_idx, ec_idx]); // content [0] → EnvelopedData → eci → ec
+        return Some(CmsEnveloped {
+            content_info_der: ber::encode_node(node),
+            cipher_path,
+        });
+    }
+    None
+}
 
 /// Everything needed to verify the (first) signature of a CMS `SignedData`
 /// message, extracted structurally like [`Signable`]. Only signers

@@ -145,7 +145,9 @@ specs/asn1/  ASN.1 specification modules (rfc5280: certificates + CRLs;
 testdata/  DER samples (EC cert, RSA cert, SEC1 EC key, PKCS#8 key,
            encrypted PKCS#8 key [password "asn1editor"], PKCS#12
            [password "asn1editor"], PKCS#7, CRL, CMS signed message
-           [cms_signed.der, signed by keylink/cert_ec.der])
+           [cms_signed.der, signed by keylink/cert_ec.der], and encrypted CMS
+           messages [enveloped.der, signed_then_encrypted.der,
+           encrypted_then_signed.der — all to the keylink RSA recipient])
   chain/   a 3-level ECDSA P-256 hierarchy (root CA -> intermediate CA ->
            TLS server leaf) plus CRLs from the root and intermediate, for
            exercising signature verification (§9) end to end; also
@@ -1120,6 +1122,31 @@ mirrors the certificate flow with a CMS twist:
 The result verifies under both halves of `verify_cms`. Like all §9 signature
 features this needs the directory scan (the signer certificate and its key
 live in other files), so it is unavailable in single-file mode.
+
+### Decrypting an encrypted CMS message (EnvelopedData)
+
+The same `z` menu also offers **Decrypt message** when the document contains a
+CMS `EnvelopedData` (`x509::find_enveloped`, a recursive search for a
+`ContentInfo` of type `id-envelopedData` — the document's own, or one nested
+inside a SignedData's encapsulated content, which the encapsulation heuristic
+already decoded). A message that is both signed and encrypted therefore shows
+*both* choices. Selecting it (`App::decrypt_cms_message`) tries every reachable
+recipient key — the plaintext key files plus session-unlocked encrypted keys /
+PKCS#12s, re-decrypted with their retained password (`available_decryption_keys`)
+— feeding each to OpenSSL's `CmsContentInfo::decrypt_without_cert_check`, which
+matches it to a `RecipientInfo` and returns the content. (Unlike re-signing,
+decryption is recipient-**key** based, not password based, so it needs the
+directory scan and is unavailable in single-file mode.)
+
+The plaintext is exposed as a **read-only** virtual subtree
+(`RowSource::CmsRevealed` / `App::cms_reveal`) spliced below the
+`encryptedContent` ciphertext node — the same reveal pattern as a PKCS#8 or
+PKCS#12 decryption, but never re-encrypted (that would need the recipients'
+certificates). Nesting falls out for free: if the plaintext is itself a CMS
+`SignedData` (sign-then-encrypt) it parses and displays as a subtree; when the
+content is not ASN.1 (raw application data) it is wrapped in a synthetic OCTET
+STRING so the bytes stay viewable. The reveal is dropped on any edit
+(`rebuild`) since it cannot be cheaply re-derived.
 
 ### Retained passwords
 
