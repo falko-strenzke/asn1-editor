@@ -802,17 +802,23 @@ struct BrowserRow {
     timestamp: Option<(String, Color)>,
 }
 
-/// Format a modification time as local `HH:MM:SS` via `libc::localtime_r`
-/// (std alone cannot resolve the local timezone).
+/// Format a modification time as local `HH:MM:SS` via the platform's
+/// `localtime` (std alone cannot resolve the local timezone). POSIX exposes
+/// `localtime_r(time, tm)`; the Windows CRT exposes `localtime_s(tm, time)`
+/// with the arguments reversed.
 fn format_hms(t: std::time::SystemTime) -> String {
     let secs = t
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs())
         .unwrap_or(0) as libc::time_t;
-    // SAFETY: `localtime_r` fills a caller-provided `tm`; both are valid here.
+    // SAFETY: `localtime_r`/`localtime_s` fill a caller-provided `tm`; both
+    // pointers are valid for the duration of the call.
     let mut tm: libc::tm = unsafe { std::mem::zeroed() };
     unsafe {
+        #[cfg(unix)]
         libc::localtime_r(&secs, &mut tm);
+        #[cfg(windows)]
+        libc::localtime_s(&mut tm, &secs);
     }
     format!("{:02}:{:02}:{:02}", tm.tm_hour, tm.tm_min, tm.tm_sec)
 }
