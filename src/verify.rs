@@ -60,6 +60,19 @@ pub enum SignatureStatus {
     UnsupportedAlgorithm(String),
 }
 
+impl SignatureStatus {
+    /// The identified issuer/signer certificate's file, when one was found
+    /// (whether or not the signature verified) — the certificate whose path
+    /// is validated for a CRL or CMS message (§9d).
+    pub fn issuer_path(&self) -> Option<&Path> {
+        match self {
+            SignatureStatus::Verified { issuer_path, .. }
+            | SignatureStatus::Invalid { issuer_path, .. } => Some(issuer_path),
+            SignatureStatus::IssuerNotFound | SignatureStatus::UnsupportedAlgorithm(_) => None,
+        }
+    }
+}
+
 fn algorithm_for(oid: &[u64]) -> Option<&'static dyn signature::VerificationAlgorithm> {
     if oid == SHA1_WITH_RSA {
         Some(&signature::RSA_PKCS1_1024_8192_SHA1_FOR_LEGACY_USE_ONLY)

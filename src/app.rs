@@ -2972,8 +2972,10 @@ impl App {
     pub fn recompute_path_status(&mut self) {
         let der = ber::encode_forest(&self.roots);
         // The certificate whose path is validated: the open document itself
-        // when it is a certificate, or — for a CMS signed message — its signer
-        // certificate (its chain to a trust anchor is what "path" means here).
+        // when it is a certificate, or — for a CRL or CMS signed message — the
+        // certificate that signed it (its chain to a trust anchor is what
+        // "path" means here). That signer/issuer certificate is exactly the one
+        // `sig_status` already resolved.
         let target_der = if !self.file_open {
             None
         } else if x509::parse_signable(&self.roots, &der)
@@ -2981,8 +2983,10 @@ impl App {
         {
             Some(der.clone())
         } else {
-            x509::parse_cms_signed(&self.roots, &der)
-                .and_then(|cms| self.cms_signer_cert_der(&cms))
+            self.sig_status
+                .as_ref()
+                .and_then(|s| s.issuer_path())
+                .and_then(read_cert_der)
         };
         let Some(target_der) = target_der else {
             self.path_status = None;
@@ -3010,18 +3014,6 @@ impl App {
             }
         }
         self.path_status = Some(pathval::validate(&target_der, &trusted, &untrusted));
-    }
-
-    /// The raw DER of the certificate that signed a CMS message (matched by the
-    /// SignerInfo's issuer + serial among the scanned certificates), read from
-    /// disk. `None` when the signer certificate is not in the folder.
-    fn cms_signer_cert_der(&self, cms: &x509::CmsSigned) -> Option<Vec<u8>> {
-        let signer = self.signables.iter().find(|f| {
-            f.signable.kind == Kind::Certificate
-                && f.signable.issuer == cms.issuer
-                && f.signable.serial.as_deref() == Some(cms.serial.as_slice())
-        })?;
-        read_cert_der(&signer.path)
     }
 
     /// `t`: toggle whether the certificate selected in the browser is a trust
@@ -5963,6 +5955,38 @@ mod tests {
     fn cms_path_is_not_validated_in_single_file_mode() {
         // No directory scan → no signer certificate → no path status.
         let app = single_file_app("testdata/cms_signed.der");
+        assert!(app.path_status.is_none());
+    }
+
+    #[test]
+    fn crl_path_is_validated_via_its_issuer_certificate() {
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("testdata/chain");
+        let mut app = App::new_dir(dir.clone());
+        // The intermediate CRL is issued by the intermediate CA, which chains
+        // up to the root.
+        browser_select_by_name(&mut app, "intermediate_crl.der");
+        app.preview_browser_selection();
+        // A "Path" status exists for a CRL (its issuer's chain); no trust
+        // anchor yet → no valid path.
+        assert!(
+            matches!(app.path_status, Some(PathStatus::Invalid { .. })),
+            "{:?}",
+            app.path_status
+        );
+        // Trusting the root makes the issuer's (intermediate → root) path valid.
+        app.trusted_certs.insert(dir.join("root_ca.der"));
+        app.recompute_path_status();
+        assert!(
+            matches!(app.path_status, Some(PathStatus::Valid { .. })),
+            "{:?}",
+            app.path_status
+        );
+    }
+
+    #[test]
+    fn crl_path_is_not_validated_in_single_file_mode() {
+        // No directory scan → no issuer certificate → no path status.
+        let app = single_file_app("testdata/chain/root_crl.der");
         assert!(app.path_status.is_none());
     }
 

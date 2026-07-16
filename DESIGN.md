@@ -1149,16 +1149,27 @@ self-signed roots. The result is `Valid { depth }`, `Invalid { reason }`
 certificate"), or `Error { detail }` (the target isn't a parseable
 certificate).
 
-`App::path_status` holds the result for the open document when it is a
-certificate. It is recomputed by `App::recompute_path_status` — called from
-`recompute_sig_status` (so it refreshes on every selection/preview and after
-edits, using the open document's *live* content as both the target and its
-entry in the pool) and from `toggle_trust` (so changing the trust set
-re-validates the open certificate immediately). The content pane renders it
-on a `Path` line directly below the `Signature` line (§11). Trusted
-certificates are tagged `[trusted]` in the browser. Re-reading the other
-certificate files on each recompute is cheap for the small, few-file trees
-this targets.
+`App::path_status` holds the result for the open document. The **target**
+certificate whose path is validated depends on what the document is:
+
+* a **certificate** — the document itself (its *live*, possibly-unsaved
+  content is used both as the target and as its entry in the pool);
+* a **CRL** or a **CMS signed message** — the certificate that *signed* it,
+  i.e. its issuer / signer certificate. That certificate is exactly the one
+  `sig_status` already resolved, so `recompute_path_status` reads it off
+  `SignatureStatus::issuer_path` and validates *its* DER (read from disk).
+  There is no path when no such certificate was found (a CRL/CMS whose
+  issuer/signer is absent, and always in single-file mode).
+
+`recompute_path_status` is called from `recompute_sig_status` (so it refreshes
+on every selection/preview and after edits — and, for CRL/CMS, always runs
+after `sig_status` is set, so the resolved issuer is current) and from
+`toggle_trust` (so changing the trust set re-validates immediately). The
+content pane renders the result on a `Path` line directly below the
+`Signature` line (§11), identically for certificates, CRLs and CMS messages.
+Trusted certificates are tagged `[trusted]` in the browser. Re-reading the
+other certificate files on each recompute is cheap for the small, few-file
+trees this targets.
 
 ## 9e. Modifying a certificate's public key (`src/keygen.rs`, `src/app.rs`)
 
