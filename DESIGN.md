@@ -60,6 +60,9 @@ Goals:
   FIPS 205 (SLH-DSA) algorithms, alongside the classical RSA/ECDSA/Ed25519
   set — so PQ-signed certificates and CRLs verify, and objects can be
   re-signed or re-keyed with any of them (§9c/§9e).
+* Interpret the X.509 `BasicConstraints` extension in plain language in the
+  content pane, and edit its `cA` / `pathLenConstraint` fields through a
+  structured form (`e` on the extension, or the `E` edit menu) (§9f).
 
 Non-goals (see §14):
 
@@ -118,6 +121,8 @@ src/
   pkcs12.rs  structural decoding + password decryption/re-encryption of
              PKCS#12 (PFX) containers; reuses pkcs8::Pbes2 for the regions
              and the openssl crate for the MacData HMAC (RFC 7292 App. B KDF)
+  basic_constraints.rs  structural decoding, interpretation and re-encoding of
+             the X.509 BasicConstraints extension (structural only, no crypto)
   app.rs     application state: tree, flattened rows, selection, edit logic
   tui.rs     ratatui event loop and rendering (no business logic)
 tests/
@@ -156,9 +161,10 @@ digest primitives); `pathval.rs` depends
 on the `openssl` crate + `ber.rs` (it takes raw DER, not the `Node` tree);
 `keygen.rs` depends on `openssl` + `openssl-sys`/`foreign-types` (raw FFI for
 by-name PQ key generation) + `ber.rs` (`verify::sign` does the actual signing);
+`basic_constraints.rs` depends only on `ber.rs` (structural, no crypto);
 `app.rs` depends on all of the above; `tui.rs` renders `app.rs` and resolves
 OID display names through `oid.rs` and formats file change-times through
-`libc` (`localtime_r`). External dependencies: `ratatui`, `aws-lc-rs`,
+`libc` (POSIX `localtime_r` / Windows `localtime_s`). External dependencies: `ratatui`, `aws-lc-rs`,
 `openssl` (requires a system OpenSSL — 3.5+ for the post-quantum algorithms —
 to link against), `openssl-sys` + `foreign-types` (raw OpenSSL key generation),
 and `libc` (local-time conversion for the browser's change timestamps).
@@ -1147,6 +1153,42 @@ now data-driven: `MenuState` carries a title and a `Vec<MenuItem>`, and each
 `MenuItem` names a `MenuAction` that `menu_confirm` dispatches — so the same
 menu machinery renders the five base edit modes, the optional trailing
 **Re-key this cert**, and the two cryptographic adjustments.
+
+## 9f. Basic Constraints interpretation and structured editing (`src/basic_constraints.rs`)
+
+The X.509 `BasicConstraints` extension (RFC 5280 §4.2.1.9,
+`id-ce-basicConstraints` = 2.5.29.19) gets a dedicated read and edit path so
+the user does not have to reason about the raw `cA` / `pathLenConstraint`
+encoding.
+
+`basic_constraints.rs` walks a `ber::Node` positionally, like `x509.rs`. It
+operates on the **outer `Extension` SEQUENCE** (`{ extnID, critical?,
+extnValue }`) — the node the user selects in the tree — so one node drives
+everything. `value_index` recognises the extension (first child is the
+BasicConstraints OID, last child a primitive OCTET STRING) and returns the
+`extnValue` child index; `parse` decodes `cA`, `pathLenConstraint` (from the
+inner SEQUENCE the encapsulation heuristic already exposed, §5) and the
+enclosing extension's `critical` flag.
+
+* **Interpretation.** When a BasicConstraints extension is selected,
+  `draw_content_browse` inserts a plain-language section (`describe`) between
+  the header information and the raw content octets: whether the extension is
+  critical, whether this is a CA certificate, and what the path-length
+  constraint means (or that it is unlimited / meaningless when `cA` is FALSE).
+
+* **Structured editor.** `Mode::EditBasicConstraints(BcEditState)` is a small
+  form editing the two fields "in a natural way": `cA` as a boolean, and
+  `pathLenConstraint` as a present/absent toggle plus a numeric value. It is
+  reached by **`e`** on the extension's outer SEQUENCE (`edit_selected` routes
+  there before the generic type-specific editor) and by the **As Basic
+  Constraints** entry appended to the `E` edit menu (a new `MenuAction`). On
+  submit, `commit_basic_constraints` re-encodes the value with `encode_der`
+  (DER rules: `cA = FALSE` omitted; `pathLenConstraint` emitted only when `cA`
+  is asserted, per RFC 5280) and replaces the `extnValue` OCTET STRING's
+  content octets — `rebuild` then re-detects the nested encoding and
+  recomputes lengths, exactly like a primitive value edit (§7). The `critical`
+  flag belongs to the Extension, not to BasicConstraints, so it is shown for
+  context but edited elsewhere.
 
 ## 10. Input containers
 

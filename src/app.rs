@@ -20,6 +20,7 @@ use std::path::{Path, PathBuf};
 
 use ratatui::widgets::ListState;
 
+use crate::basic_constraints;
 use crate::ber::{self, Class, Node};
 use crate::browser::FileBrowser;
 use crate::input::{self, Container};
@@ -600,6 +601,8 @@ pub enum MenuAction {
     EditBase64,
     EditRaw,
     EditTypeSpecific,
+    /// Open the structured BasicConstraints editor.
+    EditBasicConstraints,
     /// Open the public-key modification dialog (§9e).
     Rekey,
     /// Open the re-sign dialog (§9c).
@@ -644,6 +647,10 @@ pub enum Mode {
     /// `subjectPublicKeyInfo`): choose an algorithm, optionally generate and
     /// save a new private key, and resign the certificates this one issued.
     EditPubKey(PubKeyState),
+    /// Structured editor for a `BasicConstraints` extension ('e' on the
+    /// extension's outer SEQUENCE, or the "As Basic Constraints" 'E' entry):
+    /// edit the `cA` and `pathLenConstraint` fields directly.
+    EditBasicConstraints(BcEditState),
     /// A dismissible informational popup shown over the panes — used at
     /// start-up to surface specification-load warnings.
     Notice(NoticeState),
@@ -841,6 +848,71 @@ pub struct ResignState {
     /// The new signature to install on confirm; `Some` only when `ready`.
     /// (Public data — no private key material is retained in the dialog.)
     signature: Option<Vec<u8>>,
+}
+
+/// State of the "As Basic Constraints" structured editor. Edits the two fields
+/// of `BasicConstraints ::= SEQUENCE { cA BOOLEAN DEFAULT FALSE,
+/// pathLenConstraint INTEGER (0..MAX) OPTIONAL }`. On submit the new value is
+/// re-encoded into the `extnValue` OCTET STRING at [`Self::value_path`].
+pub struct BcEditState {
+    /// Path (in `roots`) of the `extnValue` OCTET STRING to rewrite on submit.
+    pub value_path: Vec<usize>,
+    /// The enclosing extension's `critical` flag (shown for context; the flag
+    /// itself belongs to the Extension, not to BasicConstraints, so it is not
+    /// edited here).
+    pub critical: bool,
+    /// The `cA` boolean.
+    pub ca: bool,
+    /// Whether `pathLenConstraint` is present.
+    pub path_len_present: bool,
+    /// Decimal digits of `pathLenConstraint` (used when present).
+    pub path_len: String,
+    /// Active field: 0 = cA, 1 = pathLenConstraint present, 2 = its value.
+    pub field: usize,
+}
+
+impl BcEditState {
+    const FIELDS: usize = 3;
+
+    fn move_field(&mut self, delta: isize) {
+        let n = Self::FIELDS as isize;
+        self.field = (self.field as isize + delta).rem_euclid(n) as usize;
+    }
+
+    /// Space toggles the two boolean fields (cA and pathLen-present).
+    fn toggle(&mut self) {
+        match self.field {
+            0 => self.ca = !self.ca,
+            1 => self.path_len_present = !self.path_len_present,
+            _ => {}
+        }
+    }
+
+    fn insert_char(&mut self, c: char) {
+        if self.field == 2 && c.is_ascii_digit() {
+            // Typing a digit implies the constraint is present; cap the length
+            // so the value stays a sane path-length.
+            self.path_len_present = true;
+            if self.path_len.len() < 6 {
+                self.path_len.push(c);
+            }
+        }
+    }
+
+    fn backspace(&mut self) {
+        if self.field == 2 {
+            self.path_len.pop();
+        }
+    }
+
+    /// The `pathLenConstraint` value to encode: `None` unless cA is asserted
+    /// and the constraint is present with a parseable value.
+    fn path_len_value(&self) -> Option<u32> {
+        if !self.ca || !self.path_len_present {
+            return None;
+        }
+        self.path_len.parse().ok()
+    }
 }
 
 /// Private-key passwords entered this session, retained (until the program
@@ -1463,6 +1535,10 @@ impl App {
         if self.open_public_key_editor() {
             return;
         }
+        if self.selection_basic_constraints_path().is_some() {
+            self.start_basic_constraints();
+            return;
+        }
         self.start_edit_type_specific();
     }
 
@@ -1483,6 +1559,97 @@ impl App {
         self.rows
             .get(self.selected)
             .is_some_and(|r| r.source == RowSource::Document && r.path == paths.spki)
+    }
+
+    /// If the current tree selection is the outer SEQUENCE of a
+    /// `BasicConstraints` extension in the document, return its path.
+    fn selection_basic_constraints_path(&self) -> Option<Vec<usize>> {
+        let row = self.rows.get(self.selected)?;
+        if row.source != RowSource::Document {
+            return None;
+        }
+        let node = node_at(&self.roots, &row.path)?;
+        basic_constraints::value_index(node).map(|_| row.path.clone())
+    }
+
+    /// Open the structured BasicConstraints editor for the selected extension
+    /// (reached from its outer SEQUENCE via 'e' or the 'E' edit menu).
+    pub fn start_basic_constraints(&mut self) {
+        let Some(ext_path) = self.selection_basic_constraints_path() else {
+            self.status = "the selected element is not a BasicConstraints extension".to_string();
+            return;
+        };
+        let node = node_at(&self.roots, &ext_path).expect("path just resolved");
+        let value_idx = basic_constraints::value_index(node).expect("checked above");
+        let bc = basic_constraints::parse(node);
+        let mut value_path = ext_path;
+        value_path.push(value_idx);
+        let (ca, critical, path_len) = match bc {
+            Some(bc) => (bc.ca, bc.critical, bc.path_len),
+            None => (false, false, None),
+        };
+        self.mode = Mode::EditBasicConstraints(BcEditState {
+            value_path,
+            critical,
+            ca,
+            path_len_present: path_len.is_some(),
+            path_len: path_len.unwrap_or_default(),
+            field: 0,
+        });
+        self.status =
+            "editing Basic Constraints — ↑↓ field, Space toggles, digits set pathLen, Enter applies"
+                .to_string();
+    }
+
+    pub fn cancel_basic_constraints(&mut self) {
+        self.mode = Mode::Browse;
+        self.status = "edit cancelled".to_string();
+    }
+
+    pub fn bc_move_field(&mut self, delta: isize) {
+        if let Mode::EditBasicConstraints(ref mut s) = self.mode {
+            s.move_field(delta);
+        }
+    }
+
+    pub fn bc_toggle(&mut self) {
+        if let Mode::EditBasicConstraints(ref mut s) = self.mode {
+            s.toggle();
+        }
+    }
+
+    pub fn bc_insert_char(&mut self, c: char) {
+        if let Mode::EditBasicConstraints(ref mut s) = self.mode {
+            s.insert_char(c);
+        }
+    }
+
+    pub fn bc_backspace(&mut self) {
+        if let Mode::EditBasicConstraints(ref mut s) = self.mode {
+            s.backspace();
+        }
+    }
+
+    /// Apply the BasicConstraints edit: re-encode the value and replace the
+    /// `extnValue` OCTET STRING's content, letting [`Self::rebuild`] re-detect
+    /// the nested encoding and recompute lengths.
+    pub fn commit_basic_constraints(&mut self) {
+        let Mode::EditBasicConstraints(ref s) = self.mode else { return };
+        let der = basic_constraints::encode_der(s.ca, s.path_len_value());
+        let value_path = s.value_path.clone();
+        let Some(node) = node_at_mut(&mut self.roots, &value_path) else {
+            self.status = "internal error: extnValue node missing".to_string();
+            return;
+        };
+        // Replace the OCTET STRING content octets; the encapsulation heuristic
+        // re-parses the nested SEQUENCE during rebuild().
+        node.value = der;
+        node.children.clear();
+        node.encapsulates = false;
+        self.mode = Mode::Browse;
+        self.dirty = true;
+        self.rebuild();
+        self.status = "Basic Constraints updated — 's' writes the file".to_string();
     }
 
     /// Open the public-key modification dialog for the open certificate,
@@ -2520,6 +2687,14 @@ impl App {
             .iter()
             .map(|&(action, label, desc)| MenuItem { action, label, desc })
             .collect();
+        // On a BasicConstraints extension, offer the structured editor.
+        if self.selection_basic_constraints_path().is_some() {
+            items.push(MenuItem {
+                action: MenuAction::EditBasicConstraints,
+                label: "As Basic Constraints",
+                desc: "edit the cA and pathLenConstraint fields",
+            });
+        }
         // On a certificate's subjectPublicKeyInfo, offer to re-key the cert.
         if self.selection_is_cert_spki() {
             items.push(MenuItem {
@@ -2579,6 +2754,7 @@ impl App {
             MenuAction::EditBase64 => self.start_edit_base64(),
             MenuAction::EditRaw => self.start_edit_raw(),
             MenuAction::EditTypeSpecific => self.start_edit_type_specific(),
+            MenuAction::EditBasicConstraints => self.start_basic_constraints(),
             MenuAction::Rekey => self.start_rekey(),
             MenuAction::Resign => self.start_resign(),
         }
@@ -3808,6 +3984,103 @@ mod tests {
         assert!(!app.dirty);
         assert!(matches!(app.mode, Mode::Edit(_)));
         assert_eq!(ber::encode_forest(&app.roots), data);
+    }
+
+    /// Build an app over a committed certificate fixture (read-only; the
+    /// BasicConstraints editor never writes to disk on commit).
+    fn cert_app(rel: &str) -> App {
+        let der =
+            std::fs::read(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(rel)).unwrap();
+        test_app(&der)
+    }
+
+    /// Row index of the first BasicConstraints Extension SEQUENCE.
+    fn bc_row(app: &App) -> usize {
+        (0..app.rows.len())
+            .find(|&i| {
+                let row = &app.rows[i];
+                row.source == RowSource::Document
+                    && node_at(&app.roots, &row.path)
+                        .is_some_and(|n| basic_constraints::value_index(n).is_some())
+            })
+            .expect("BasicConstraints extension row")
+    }
+
+    /// Re-decode the current document's BasicConstraints extension.
+    fn current_bc(app: &App) -> basic_constraints::BasicConstraints {
+        fn find(nodes: &[Node]) -> Option<&Node> {
+            for n in nodes {
+                if basic_constraints::value_index(n).is_some() {
+                    return Some(n);
+                }
+                if let Some(f) = find(&n.children) {
+                    return Some(f);
+                }
+            }
+            None
+        }
+        basic_constraints::parse(find(&app.roots).expect("extension")).expect("parse")
+    }
+
+    #[test]
+    fn e_on_basic_constraints_opens_structured_editor() {
+        let mut app = cert_app("testdata/chain/intermediate_ca.der");
+        let idx = bc_row(&app);
+        app.select(idx);
+        app.edit_selected(); // the 'e' action
+        let Mode::EditBasicConstraints(ref s) = app.mode else {
+            panic!("BasicConstraints editor not opened by 'e'");
+        };
+        assert!(s.ca);
+        assert!(s.critical);
+        assert!(s.path_len_present);
+        assert_eq!(s.path_len, "0");
+    }
+
+    #[test]
+    fn edit_menu_offers_basic_constraints_entry() {
+        let mut app = cert_app("testdata/chain/intermediate_ca.der");
+        let idx = bc_row(&app);
+        app.select(idx);
+        app.open_edit_menu();
+        let Mode::EditMenu(ref m) = app.mode else { panic!("menu not open") };
+        assert!(
+            m.items.iter().any(|i| i.action == MenuAction::EditBasicConstraints),
+            "the 'E' menu should offer 'As Basic Constraints'"
+        );
+    }
+
+    #[test]
+    fn basic_constraints_editor_changes_path_len() {
+        let mut app = cert_app("testdata/chain/intermediate_ca.der");
+        let idx = bc_row(&app);
+        app.select(idx);
+        app.start_basic_constraints();
+        app.bc_move_field(2); // 0 -> value field
+        app.bc_backspace(); // drop the current "0"
+        app.bc_insert_char('5');
+        app.commit_basic_constraints();
+        assert!(app.dirty);
+        assert!(matches!(app.mode, Mode::Browse));
+        let bc = current_bc(&app);
+        assert!(bc.ca);
+        assert_eq!(bc.path_len.as_deref(), Some("5"));
+        // The document must still re-parse identically to its encoding.
+        assert!(ber::parse_forest(&ber::encode_forest(&app.roots), 0).is_ok());
+    }
+
+    #[test]
+    fn basic_constraints_editor_clearing_ca_drops_path_len() {
+        let mut app = cert_app("testdata/chain/intermediate_ca.der");
+        let idx = bc_row(&app);
+        app.select(idx);
+        app.start_basic_constraints();
+        app.bc_toggle(); // cA TRUE -> FALSE (field 0)
+        app.commit_basic_constraints();
+        let bc = current_bc(&app);
+        assert!(!bc.ca);
+        // pathLenConstraint must not be emitted when cA is FALSE (RFC 5280).
+        assert_eq!(bc.path_len, None);
     }
 
     #[test]

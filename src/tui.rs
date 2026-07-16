@@ -33,6 +33,7 @@ use crate::app::{
     RowSource, TextEditor, TextFormat, DATE_FIELDS, EDIT_BYTES_PER_LINE, EDIT_DIGITS_PER_LINE,
     PICKER_CLASSES, PICKER_UNIVERSAL,
 };
+use crate::basic_constraints;
 use crate::browser::FileStatus;
 use crate::ber::{
     self, Class, Node, TAG_BIT_STRING, TAG_BOOLEAN, TAG_GENERALIZED_TIME, TAG_INTEGER, TAG_NULL,
@@ -107,6 +108,7 @@ fn event_loop(terminal: &mut DefaultTerminal, app: &mut App) -> io::Result<()> {
             Mode::Password(_) => handle_password_key(app, key),
             Mode::Resign(_) => handle_resign_key(app, key),
             Mode::EditPubKey(_) => handle_pubkey_key(app, key),
+            Mode::EditBasicConstraints(_) => handle_basic_constraints_key(app, key),
             Mode::Notice(_) => app.dismiss_notice(), // any key dismisses
             Mode::Browse => {
                 if key.code != KeyCode::Char('q') {
@@ -225,6 +227,19 @@ fn handle_pubkey_key(app: &mut App, key: KeyEvent) {
     }
 }
 
+fn handle_basic_constraints_key(app: &mut App, key: KeyEvent) {
+    match key.code {
+        KeyCode::Esc => app.cancel_basic_constraints(),
+        KeyCode::Enter => app.commit_basic_constraints(),
+        KeyCode::Up | KeyCode::BackTab => app.bc_move_field(-1),
+        KeyCode::Down | KeyCode::Tab => app.bc_move_field(1),
+        KeyCode::Char(' ') => app.bc_toggle(),
+        KeyCode::Backspace => app.bc_backspace(),
+        KeyCode::Char(c) => app.bc_insert_char(c),
+        _ => {}
+    }
+}
+
 fn handle_picker_key(app: &mut App, key: KeyEvent) {
     match key.code {
         KeyCode::Esc => app.cancel_picker(),
@@ -314,6 +329,9 @@ fn draw(frame: &mut Frame, app: &mut App) {
     }
     if matches!(app.mode, Mode::EditPubKey(_)) {
         draw_edit_pubkey(frame, app, main);
+    }
+    if matches!(app.mode, Mode::EditBasicConstraints(_)) {
+        draw_basic_constraints(frame, app, main);
     }
     if matches!(app.mode, Mode::Notice(_)) {
         draw_notice(frame, app, main);
@@ -598,6 +616,81 @@ fn draw_password(frame: &mut Frame, app: &App, area: Rect) {
         Line::default(),
         Line::from(Span::styled("⏎ decrypt   Esc cancel", Style::new().dim())),
     ];
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+/// Centered popup for the "As Basic Constraints" structured editor: a small
+/// form with the `cA` boolean and the optional `pathLenConstraint`.
+fn draw_basic_constraints(frame: &mut Frame, app: &App, area: Rect) {
+    let Mode::EditBasicConstraints(ref s) = app.mode else { return };
+    let width = 62.min(area.width);
+    let height = 11.min(area.height);
+    let popup = Rect {
+        x: area.x + (area.width.saturating_sub(width)) / 2,
+        y: area.y + (area.height.saturating_sub(height)) / 2,
+        width,
+        height,
+    };
+    frame.render_widget(Clear, popup);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::new().fg(Color::Cyan))
+        .title(" EDIT — Basic Constraints ");
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    // Highlight the active field; dim the pathLen rows when cA = FALSE, where
+    // the constraint has no meaning and is dropped on encoding.
+    let active = |f: usize| {
+        if s.field == f {
+            Style::new().add_modifier(Modifier::REVERSED).bold()
+        } else {
+            Style::new().bold()
+        }
+    };
+    let path_len_dim = if s.ca { Style::new() } else { Style::new().dim() };
+    let checkbox = |on: bool| if on { "[x]" } else { "[ ]" };
+    let present_label = if s.path_len_present { "present" } else { "absent" };
+    let value_text = if s.path_len.is_empty() { " ".to_string() } else { s.path_len.clone() };
+
+    let mut lines = vec![
+        Line::from(vec![
+            Span::styled("cA                 ", Style::new().dim()),
+            Span::styled(
+                format!("{} {}", checkbox(s.ca), if s.ca { "TRUE" } else { "FALSE" }),
+                active(0),
+            ),
+        ]),
+        Line::default(),
+        Line::from(vec![
+            Span::styled("pathLenConstraint  ", path_len_dim),
+            Span::styled(
+                format!("{} {}", checkbox(s.path_len_present), present_label),
+                active(1).patch(path_len_dim),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled("  value            ", path_len_dim),
+            Span::styled(format!("[{}]", value_text), active(2).patch(path_len_dim)),
+        ]),
+    ];
+    if !s.ca {
+        lines.push(Line::from(Span::styled(
+            "pathLenConstraint applies only when cA = TRUE",
+            Style::new().dim().fg(Color::Yellow),
+        )));
+    }
+    lines.push(Line::default());
+    lines.push(Line::from(vec![
+        Span::styled("critical: ", Style::new().dim()),
+        Span::raw(if s.critical { "yes" } else { "no" }),
+        Span::styled("  (a property of the Extension, edited elsewhere)", Style::new().dim()),
+    ]));
+    lines.push(Line::default());
+    lines.push(Line::from(Span::styled(
+        "↑↓ field   Space toggle   digits set value   ⏎ apply   Esc cancel",
+        Style::new().dim(),
+    )));
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
@@ -1667,6 +1760,21 @@ fn draw_content_browse(frame: &mut Frame, app: &App, area: Rect) {
                 ]));
             }
         }
+        // Plain-language interpretation of a BasicConstraints extension, shown
+        // between the header information and the raw content octets.
+        if let Some(bc) = basic_constraints::parse(node) {
+            let inner_w = area.width.saturating_sub(2).max(20) as usize;
+            lines.push(Line::default());
+            lines.push(Line::from(Span::styled(
+                "Basic Constraints (RFC 5280 §4.2.1.9)",
+                Style::new().fg(Color::LightCyan).bold(),
+            )));
+            for text in basic_constraints::describe(&bc) {
+                for chunk in wrap_text(&text, inner_w) {
+                    lines.push(Line::from(Span::raw(chunk)));
+                }
+            }
+        }
         lines.push(Line::default());
         let content = node.content_octets();
         lines.push(Line::from(Span::styled(
@@ -1933,6 +2041,9 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
         Mode::Resign(_) => "⏎ create new signature (if available)  Esc cancel",
         Mode::EditPubKey(_) => {
             "←→ column  ↑↓ move  Space toggle  type name/password  ⏎ apply  Esc cancel"
+        }
+        Mode::EditBasicConstraints(_) => {
+            "↑↓ field  Space toggle  digits set pathLen  ⏎ apply  Esc cancel"
         }
         Mode::Notice(_) => "press any key to dismiss",
     };
@@ -2228,5 +2339,72 @@ mod tests {
         assert!(rows[6].contains("octet 3:  0 1101000"));
         assert!(rows[6].contains("last octet"));
         assert_eq!(rows[7], "tag number = 1000");
+    }
+
+    /// Build an app over a certificate fixture with its BasicConstraints
+    /// extension selected.
+    fn app_on_basic_constraints(rel: &str) -> App {
+        use crate::input::Container;
+        let der =
+            std::fs::read(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(rel)).unwrap();
+        let roots = parse_forest(&der, 0).unwrap();
+        let mut app = App::new(
+            PathBuf::from("/nonexistent/in"),
+            PathBuf::from("/nonexistent/out"),
+            Container::Raw,
+            roots,
+            der.len(),
+        );
+        let n = app.rows.len();
+        let idx = (0..n)
+            .find(|&i| {
+                app.select(i);
+                app.selected_node()
+                    .is_some_and(|node| basic_constraints::value_index(node).is_some())
+            })
+            .expect("BasicConstraints extension row");
+        app.select(idx);
+        app
+    }
+
+    /// Flatten a rendered buffer to text, one line per row.
+    fn buffer_text(buf: &ratatui::buffer::Buffer) -> String {
+        let area = buf.area;
+        let mut out = String::new();
+        for y in 0..area.height {
+            for x in 0..area.width {
+                out.push_str(buf[(x, y)].symbol());
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    #[test]
+    fn content_pane_renders_basic_constraints_interpretation() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let mut app = app_on_basic_constraints("testdata/chain/intermediate_ca.der");
+        let mut term = Terminal::new(TestBackend::new(200, 40)).unwrap();
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let text = buffer_text(term.backend().buffer());
+        assert!(text.contains("Basic Constraints"), "heading missing:\n{text}");
+        assert!(text.contains("cA = TRUE"), "cA interpretation missing:\n{text}");
+        assert!(
+            text.contains("pathLenConstraint = 0"),
+            "pathLen interpretation missing:\n{text}"
+        );
+    }
+
+    #[test]
+    fn basic_constraints_editor_popup_renders_fields() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let mut app = app_on_basic_constraints("testdata/chain/intermediate_ca.der");
+        app.start_basic_constraints();
+        let mut term = Terminal::new(TestBackend::new(200, 40)).unwrap();
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let text = buffer_text(term.backend().buffer());
+        assert!(text.contains("EDIT — Basic Constraints"), "popup title missing:\n{text}");
+        assert!(text.contains("cA"), "cA field missing");
+        assert!(text.contains("pathLenConstraint"), "pathLen field missing");
     }
 }

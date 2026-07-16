@@ -20,6 +20,7 @@
 //! compatibility test).
 
 pub mod app;
+pub mod basic_constraints;
 pub mod ber;
 pub mod browser;
 pub mod dump;
