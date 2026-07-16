@@ -545,7 +545,11 @@ or lose its labels as edits make it conform or not conform to a spec.
 
 * Tree pane: `field: ` prefixes (cyan italic) and ` ·TypeName` suffixes
   (green, shown when the spec name adds information beyond the raw ASN.1
-  type); the identified document type in the pane title.
+  type); the identified document type in the pane title. Value summaries come
+  from `tui::tree_summary`, which is `summary` plus one narrowing: a long
+  INTEGER's decimal value is clipped to 12 digits with an ellipsis (e.g. a
+  20-octet serial number) so it does not crowd the pane — the content pane's
+  `Decoded` line still shows it in full.
 * Content pane: a `Spec` line with the selected element's field and type
   name plus the overall document type and source file.
 

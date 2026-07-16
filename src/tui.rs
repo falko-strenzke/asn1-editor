@@ -1345,6 +1345,21 @@ fn class_style(node: &Node) -> Style {
 }
 
 /// Short one-line preview of a node's value for the tree pane.
+/// Value summary for the tree pane: like [`summary`], but a long INTEGER's
+/// decimal value is clipped to 12 digits with an ellipsis so it does not crowd
+/// the narrow pane. The content pane's `Decoded` line still shows it in full.
+fn tree_summary(node: &Node) -> String {
+    if node.is_universal(TAG_INTEGER) && !node.encapsulates {
+        if let Some(dec) = ber::integer_decimal(&node.value) {
+            let (sign, digits) = dec.strip_prefix('-').map_or(("", dec.as_str()), |r| ("-", r));
+            if digits.len() > 12 {
+                return format!(" {}{}…", sign, &digits[..12]);
+            }
+        }
+    }
+    summary(node)
+}
+
 fn summary(node: &Node) -> String {
     if node.constructed {
         return format!(" ({} elem)", node.children.len());
@@ -1522,7 +1537,7 @@ fn draw_tree(frame: &mut Frame, app: &mut App, area: Rect) {
                 ));
             }
             spans.push(Span::styled(node.type_name(), class_style(node)));
-            spans.push(Span::styled(summary(node), Style::new().dim()));
+            spans.push(Span::styled(tree_summary(node), Style::new().dim()));
             if let Some(l) = label {
                 // Show the spec type name when it adds information beyond
                 // the raw ASN.1 type already printed.
@@ -2565,7 +2580,35 @@ mod tests {
         let mut data = vec![0x02, 0x11, 0x01];
         data.extend([0x00; 16]);
         let forest = parse_forest(&data, 0).unwrap();
+        // The content-pane summary keeps the full value…
         assert_eq!(summary(&forest[0]), " 340282366920938463463374607431768211456");
+        // …while the tree clips it to 12 digits with an ellipsis.
+        assert_eq!(tree_summary(&forest[0]), " 340282366920…");
+    }
+
+    #[test]
+    fn tree_summary_clips_only_over_long_integers() {
+        // Exactly 12 digits: shown in full (no ellipsis).
+        let forest = parse_forest(&ber::encode_node(&ber::univ(
+            TAG_INTEGER,
+            false,
+            ber::encode_integer(123_456_789_012),
+        )), 0)
+        .unwrap();
+        assert_eq!(tree_summary(&forest[0]), " 123456789012");
+
+        // A negative long integer keeps its sign, then 12 digits.
+        let neg = ber::encode_node(&ber::univ(
+            TAG_INTEGER,
+            false,
+            ber::encode_integer(-987_654_321_098_765),
+        ));
+        let forest = parse_forest(&neg, 0).unwrap();
+        assert_eq!(tree_summary(&forest[0]), " -987654321098…");
+
+        // A short integer is untouched.
+        let forest = parse_forest(&[0x02, 0x01, 0x2A], 0).unwrap();
+        assert_eq!(tree_summary(&forest[0]), " 42");
     }
 
     #[test]
