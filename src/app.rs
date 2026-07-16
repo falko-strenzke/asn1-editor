@@ -1949,6 +1949,9 @@ impl App {
     /// `EnvelopedData` with an available recipient key and show the plaintext
     /// as a read-only virtual subtree.
     pub fn decrypt_cms_message(&mut self) {
+        // Reached from the 'z' cryptographic-adjustment menu; close it, whatever
+        // the outcome (matching the key-decryption flow).
+        self.mode = Mode::Browse;
         if self.single_file {
             self.status = "decryption needs the recipient key from the directory".to_string();
             return;
@@ -6113,7 +6116,11 @@ mod tests {
     #[test]
     fn decrypt_a_plain_enveloped_cms_message() {
         let (mut app, dir) = cms_decrypt_app("enveloped.der");
+        app.start_decrypt(); // 'z' opens the menu
+        assert!(matches!(app.mode, Mode::EditMenu(_)));
         app.decrypt_cms_message();
+        // The menu closes automatically, like the key-decryption flow.
+        assert!(matches!(app.mode, Mode::Browse), "menu should close after decrypting");
         assert!(app.cms_reveal.is_some(), "decrypted: {}", app.status);
         // The payload is raw data, shown as an OCTET STRING carrying the text.
         let reveal_row = app.rows.iter().find(|r| r.source == RowSource::CmsRevealed).unwrap();
