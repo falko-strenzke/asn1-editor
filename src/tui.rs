@@ -33,7 +33,7 @@ use crate::app::{
     RowSource, TextEditor, TextFormat, DATE_FIELDS, EDIT_BYTES_PER_LINE, EDIT_DIGITS_PER_LINE,
     PICKER_CLASSES, PICKER_UNIVERSAL,
 };
-use crate::x509::basic_constraints;
+use crate::x509::{basic_constraints, key_usage};
 use crate::browser::FileStatus;
 use crate::ber::{
     self, Class, Node, TAG_BIT_STRING, TAG_BOOLEAN, TAG_GENERALIZED_TIME, TAG_INTEGER, TAG_NULL,
@@ -109,6 +109,7 @@ fn event_loop(terminal: &mut DefaultTerminal, app: &mut App) -> io::Result<()> {
             Mode::Resign(_) => handle_resign_key(app, key),
             Mode::EditPubKey(_) => handle_pubkey_key(app, key),
             Mode::EditBasicConstraints(_) => handle_basic_constraints_key(app, key),
+            Mode::EditKeyUsage(_) => handle_key_usage_key(app, key),
             Mode::Notice(_) => app.dismiss_notice(), // any key dismisses
             Mode::Browse => {
                 if key.code != KeyCode::Char('q') {
@@ -240,6 +241,17 @@ fn handle_basic_constraints_key(app: &mut App, key: KeyEvent) {
     }
 }
 
+fn handle_key_usage_key(app: &mut App, key: KeyEvent) {
+    match key.code {
+        KeyCode::Esc => app.cancel_key_usage(),
+        KeyCode::Enter => app.commit_key_usage(),
+        KeyCode::Up | KeyCode::BackTab => app.ku_move_field(-1),
+        KeyCode::Down | KeyCode::Tab => app.ku_move_field(1),
+        KeyCode::Char(' ') => app.ku_toggle(),
+        _ => {}
+    }
+}
+
 fn handle_picker_key(app: &mut App, key: KeyEvent) {
     match key.code {
         KeyCode::Esc => app.cancel_picker(),
@@ -332,6 +344,9 @@ fn draw(frame: &mut Frame, app: &mut App) {
     }
     if matches!(app.mode, Mode::EditBasicConstraints(_)) {
         draw_basic_constraints(frame, app, main);
+    }
+    if matches!(app.mode, Mode::EditKeyUsage(_)) {
+        draw_key_usage(frame, app, main);
     }
     if matches!(app.mode, Mode::Notice(_)) {
         draw_notice(frame, app, main);
@@ -689,6 +704,52 @@ fn draw_basic_constraints(frame: &mut Frame, app: &App, area: Rect) {
     lines.push(Line::default());
     lines.push(Line::from(Span::styled(
         "↑↓ field   Space toggle   digits set value   ⏎ apply   Esc cancel",
+        Style::new().dim(),
+    )));
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+/// Centered popup for the "As Key Usage" structured editor: one checkbox per
+/// named KeyUsage bit.
+fn draw_key_usage(frame: &mut Frame, app: &App, area: Rect) {
+    let Mode::EditKeyUsage(ref s) = app.mode else { return };
+    let width = 46.min(area.width);
+    let height = (key_usage::NUM_BITS as u16 + 6).min(area.height);
+    let popup = Rect {
+        x: area.x + (area.width.saturating_sub(width)) / 2,
+        y: area.y + (area.height.saturating_sub(height)) / 2,
+        width,
+        height,
+    };
+    frame.render_widget(Clear, popup);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::new().fg(Color::Cyan))
+        .title(" EDIT — Key Usage ");
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    let mut lines: Vec<Line> = Vec::new();
+    for (i, (name, _)) in key_usage::BITS.iter().enumerate() {
+        let checkbox = if s.bits[i] { "[x]" } else { "[ ]" };
+        let style = if s.field == i {
+            Style::new().add_modifier(Modifier::REVERSED).bold()
+        } else {
+            Style::new().bold()
+        };
+        lines.push(Line::from(vec![
+            Span::styled(format!("{checkbox} "), style),
+            Span::styled(format!("({i}) {name}"), style),
+        ]));
+    }
+    lines.push(Line::default());
+    lines.push(Line::from(vec![
+        Span::styled("critical: ", Style::new().dim()),
+        Span::raw(if s.critical { "yes" } else { "no" }),
+        Span::styled("  (a property of the Extension)", Style::new().dim()),
+    ]));
+    lines.push(Line::from(Span::styled(
+        "↑↓ select bit   Space toggle   ⏎ apply   Esc cancel",
         Style::new().dim(),
     )));
     frame.render_widget(Paragraph::new(lines), inner);
@@ -1760,20 +1821,31 @@ fn draw_content_browse(frame: &mut Frame, app: &App, area: Rect) {
                 ]));
             }
         }
-        // Plain-language interpretation of a BasicConstraints extension, shown
+        // Plain-language interpretation of a recognised extension, shown
         // between the header information and the raw content octets.
-        if let Some(bc) = basic_constraints::parse(node) {
+        let extension_section = |heading: &str, body: Vec<String>| {
             let inner_w = area.width.saturating_sub(2).max(20) as usize;
-            lines.push(Line::default());
-            lines.push(Line::from(Span::styled(
-                "Basic Constraints (RFC 5280 §4.2.1.9)",
-                Style::new().fg(Color::LightCyan).bold(),
-            )));
-            for text in basic_constraints::describe(&bc) {
+            let mut out = vec![
+                Line::default(),
+                Line::from(Span::styled(heading.to_string(), Style::new().fg(Color::LightCyan).bold())),
+            ];
+            for text in body {
                 for chunk in wrap_text(&text, inner_w) {
-                    lines.push(Line::from(Span::raw(chunk)));
+                    out.push(Line::from(Span::raw(chunk)));
                 }
             }
+            out
+        };
+        if let Some(bc) = basic_constraints::parse(node) {
+            lines.extend(extension_section(
+                "Basic Constraints (RFC 5280 §4.2.1.9)",
+                basic_constraints::describe(&bc),
+            ));
+        } else if let Some(ku) = key_usage::parse(node) {
+            lines.extend(extension_section(
+                "Key Usage (RFC 5280 §4.2.1.3)",
+                key_usage::describe(&ku),
+            ));
         }
         lines.push(Line::default());
         let content = node.content_octets();
@@ -2045,6 +2117,7 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
         Mode::EditBasicConstraints(_) => {
             "↑↓ field  Space toggle  digits set pathLen  ⏎ apply  Esc cancel"
         }
+        Mode::EditKeyUsage(_) => "↑↓ select bit  Space toggle  ⏎ apply  Esc cancel",
         Mode::Notice(_) => "press any key to dismiss",
     };
     let line = Line::from(vec![
@@ -2341,9 +2414,9 @@ mod tests {
         assert_eq!(rows[7], "tag number = 1000");
     }
 
-    /// Build an app over a certificate fixture with its BasicConstraints
-    /// extension selected.
-    fn app_on_basic_constraints(rel: &str) -> App {
+    /// Build an app over a certificate fixture with the first row matching
+    /// `pred` (applied to the selected node) selected.
+    fn app_selecting(rel: &str, pred: impl Fn(&Node) -> bool) -> App {
         use crate::input::Container;
         let der =
             std::fs::read(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join(rel)).unwrap();
@@ -2359,12 +2432,19 @@ mod tests {
         let idx = (0..n)
             .find(|&i| {
                 app.select(i);
-                app.selected_node()
-                    .is_some_and(|node| basic_constraints::value_index(node).is_some())
+                app.selected_node().is_some_and(&pred)
             })
-            .expect("BasicConstraints extension row");
+            .expect("matching extension row");
         app.select(idx);
         app
+    }
+
+    fn app_on_basic_constraints(rel: &str) -> App {
+        app_selecting(rel, |n| basic_constraints::value_index(n).is_some())
+    }
+
+    fn app_on_key_usage(rel: &str) -> App {
+        app_selecting(rel, |n| key_usage::value_index(n).is_some())
     }
 
     /// Flatten a rendered buffer to text, one line per row.
@@ -2406,5 +2486,31 @@ mod tests {
         assert!(text.contains("EDIT — Basic Constraints"), "popup title missing:\n{text}");
         assert!(text.contains("cA"), "cA field missing");
         assert!(text.contains("pathLenConstraint"), "pathLen field missing");
+    }
+
+    #[test]
+    fn content_pane_renders_key_usage_interpretation() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let mut app = app_on_key_usage("testdata/chain/root_ca.der");
+        let mut term = Terminal::new(TestBackend::new(200, 40)).unwrap();
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let text = buffer_text(term.backend().buffer());
+        assert!(text.contains("Key Usage"), "heading missing:\n{text}");
+        assert!(text.contains("keyCertSign"), "keyCertSign usage missing:\n{text}");
+        assert!(text.contains("cRLSign"), "cRLSign usage missing:\n{text}");
+    }
+
+    #[test]
+    fn key_usage_editor_popup_renders_bits() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let mut app = app_on_key_usage("testdata/chain/server.der");
+        app.start_key_usage();
+        let mut term = Terminal::new(TestBackend::new(200, 40)).unwrap();
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let text = buffer_text(term.backend().buffer());
+        assert!(text.contains("EDIT — Key Usage"), "popup title missing:\n{text}");
+        assert!(text.contains("digitalSignature"), "digitalSignature bit missing");
+        assert!(text.contains("decipherOnly"), "decipherOnly bit missing");
+        assert!(text.contains("[x]"), "the set bit should render checked");
     }
 }

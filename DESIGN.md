@@ -60,9 +60,10 @@ Goals:
   FIPS 205 (SLH-DSA) algorithms, alongside the classical RSA/ECDSA/Ed25519
   set — so PQ-signed certificates and CRLs verify, and objects can be
   re-signed or re-keyed with any of them (§9c/§9e).
-* Interpret the X.509 `BasicConstraints` extension in plain language in the
-  content pane, and edit its `cA` / `pathLenConstraint` fields through a
-  structured form (`e` on the extension, or the `E` edit menu) (§9f).
+* Interpret the X.509 `BasicConstraints` and `KeyUsage` extensions in plain
+  language in the content pane, and edit their fields through a structured form
+  (`e` on the extension, or the `E` edit menu) — `cA` / `pathLenConstraint` for
+  Basic Constraints (§9f), the nine named usage bits for Key Usage (§9g).
 
 Non-goals (see §14):
 
@@ -124,6 +125,8 @@ src/
   x509/basic_constraints.rs  structural decoding, interpretation and
              re-encoding of the X.509 BasicConstraints extension (a submodule
              of x509; structural only, no crypto)
+  x509/key_usage.rs  the same for the X.509 KeyUsage extension (a BIT STRING
+             of nine named bits)
   app.rs     application state: tree, flattened rows, selection, edit logic
   tui.rs     ratatui event loop and rendering (no business logic)
 tests/
@@ -162,7 +165,8 @@ digest primitives); `pathval.rs` depends
 on the `openssl` crate + `ber.rs` (it takes raw DER, not the `Node` tree);
 `keygen.rs` depends on `openssl` + `openssl-sys`/`foreign-types` (raw FFI for
 by-name PQ key generation) + `ber.rs` (`verify::sign` does the actual signing);
-`x509::basic_constraints` depends only on `ber.rs` (structural, no crypto);
+`x509::basic_constraints` and `x509::key_usage` depend only on `ber.rs`
+(structural, no crypto);
 `app.rs` depends on all of the above; `tui.rs` renders `app.rs` and resolves
 OID display names through `oid.rs` and formats file change-times through
 `libc` (POSIX `localtime_r` / Windows `localtime_s`). External dependencies: `ratatui`, `aws-lc-rs`,
@@ -1192,6 +1196,27 @@ enclosing extension's `critical` flag.
   recomputes lengths, exactly like a primitive value edit (§7). The `critical`
   flag belongs to the Extension, not to BasicConstraints, so it is shown for
   context but edited elsewhere.
+
+## 9g. Key Usage interpretation and structured editing (`src/x509/key_usage.rs`)
+
+The `KeyUsage` extension (RFC 5280 §4.2.1.3, `id-ce-keyUsage` = 2.5.29.15) is
+a named `BIT STRING` of nine bits (`digitalSignature` (0) … `decipherOnly`
+(8)). `x509::key_usage` handles it exactly like `x509::basic_constraints`
+(§9f) — same outer-`Extension`-SEQUENCE anchoring, same `value_index` / `parse`
+/ `describe` / `encode_der` shape, and the same write-back path (replace the
+`extnValue` OCTET STRING content, let `rebuild` re-detect the nested encoding).
+The only differences are in the value:
+
+* **Interpretation.** `describe` lists, one line each, the usages the set bits
+  permit (e.g. `keyCertSign: verify signatures on certificates …`), or a note
+  that no bit is set (which RFC 5280 forbids).
+
+* **Structured editor.** `Mode::EditKeyUsage(KuEditState)` is a checkbox list —
+  one row per named bit — navigated with `↑↓` and toggled with `Space`, reached
+  by `e` on the extension or the **As Key Usage** `E`-menu entry. `encode_der`
+  follows the DER rule for named bit strings: trailing zero bits are trimmed,
+  so the encoded length tracks the highest set bit (bit 0 alone → `03 02 07 80`;
+  `keyCertSign`+`cRLSign` → `03 02 01 06`).
 
 ## 10. Input containers
 

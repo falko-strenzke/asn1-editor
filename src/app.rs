@@ -29,7 +29,7 @@ use crate::pkcs12;
 use crate::pkcs8;
 use crate::spec::{self, Identification, Label, SpecDb};
 use crate::verify::{self, FileRelations, SignatureStatus};
-use crate::x509::{self, basic_constraints, CaCandidate, Kind, Signable, SignableFile};
+use crate::x509::{self, basic_constraints, key_usage, CaCandidate, Kind, Signable, SignableFile};
 
 /// Bytes per line in the hex editor; the cursor moves in units of hex digits.
 pub const EDIT_BYTES_PER_LINE: usize = 16;
@@ -602,6 +602,8 @@ pub enum MenuAction {
     EditTypeSpecific,
     /// Open the structured BasicConstraints editor.
     EditBasicConstraints,
+    /// Open the structured KeyUsage editor.
+    EditKeyUsage,
     /// Open the public-key modification dialog (§9e).
     Rekey,
     /// Open the re-sign dialog (§9c).
@@ -650,6 +652,10 @@ pub enum Mode {
     /// extension's outer SEQUENCE, or the "As Basic Constraints" 'E' entry):
     /// edit the `cA` and `pathLenConstraint` fields directly.
     EditBasicConstraints(BcEditState),
+    /// Structured editor for a `KeyUsage` extension ('e' on the extension's
+    /// outer SEQUENCE, or the "As Key Usage" 'E' entry): toggle the nine
+    /// named usage bits directly.
+    EditKeyUsage(KuEditState),
     /// A dismissible informational popup shown over the panes — used at
     /// start-up to surface specification-load warnings.
     Notice(NoticeState),
@@ -916,6 +922,36 @@ impl BcEditState {
             return None;
         }
         Some(self.path_len.parse().unwrap_or(0))
+    }
+}
+
+/// State of the "As Key Usage" structured editor. Toggles the nine named bits
+/// of `KeyUsage ::= BIT STRING { digitalSignature (0) … decipherOnly (8) }`.
+/// On submit the new value is re-encoded into the `extnValue` OCTET STRING at
+/// [`Self::value_path`].
+pub struct KuEditState {
+    /// Path (in `roots`) of the `extnValue` OCTET STRING to rewrite on submit.
+    pub value_path: Vec<usize>,
+    /// The enclosing extension's `critical` flag (shown for context; the flag
+    /// belongs to the Extension, not to KeyUsage, so it is not edited here).
+    pub critical: bool,
+    /// One flag per named bit, in bit-position order (see [`key_usage::BITS`]).
+    pub bits: [bool; key_usage::NUM_BITS],
+    /// Active field: the index of the highlighted bit (0..NUM_BITS).
+    pub field: usize,
+}
+
+impl KuEditState {
+    fn move_field(&mut self, delta: isize) {
+        let n = key_usage::NUM_BITS as isize;
+        self.field = (self.field as isize + delta).rem_euclid(n) as usize;
+    }
+
+    /// Space toggles the highlighted bit.
+    fn toggle(&mut self) {
+        if let Some(b) = self.bits.get_mut(self.field) {
+            *b = !*b;
+        }
     }
 }
 
@@ -1543,6 +1579,10 @@ impl App {
             self.start_basic_constraints();
             return;
         }
+        if self.selection_key_usage_path().is_some() {
+            self.start_key_usage();
+            return;
+        }
         self.start_edit_type_specific();
     }
 
@@ -1655,6 +1695,75 @@ impl App {
         self.dirty = true;
         self.rebuild();
         self.status = "Basic Constraints updated — 's' writes the file".to_string();
+    }
+
+    /// If the current tree selection is the outer SEQUENCE of a `KeyUsage`
+    /// extension in the document, return its path.
+    fn selection_key_usage_path(&self) -> Option<Vec<usize>> {
+        let row = self.rows.get(self.selected)?;
+        if row.source != RowSource::Document {
+            return None;
+        }
+        let node = node_at(&self.roots, &row.path)?;
+        key_usage::value_index(node).map(|_| row.path.clone())
+    }
+
+    /// Open the structured KeyUsage editor for the selected extension (reached
+    /// from its outer SEQUENCE via 'e' or the 'E' edit menu).
+    pub fn start_key_usage(&mut self) {
+        let Some(ext_path) = self.selection_key_usage_path() else {
+            self.status = "the selected element is not a KeyUsage extension".to_string();
+            return;
+        };
+        let node = node_at(&self.roots, &ext_path).expect("path just resolved");
+        let value_idx = key_usage::value_index(node).expect("checked above");
+        let ku = key_usage::parse(node);
+        let mut value_path = ext_path;
+        value_path.push(value_idx);
+        let (bits, critical) = match ku {
+            Some(ku) => (ku.bits, ku.critical),
+            None => ([false; key_usage::NUM_BITS], false),
+        };
+        self.mode = Mode::EditKeyUsage(KuEditState { value_path, critical, bits, field: 0 });
+        self.status =
+            "editing Key Usage — ↑↓ select a bit, Space toggles, Enter applies".to_string();
+    }
+
+    pub fn cancel_key_usage(&mut self) {
+        self.mode = Mode::Browse;
+        self.status = "edit cancelled".to_string();
+    }
+
+    pub fn ku_move_field(&mut self, delta: isize) {
+        if let Mode::EditKeyUsage(ref mut s) = self.mode {
+            s.move_field(delta);
+        }
+    }
+
+    pub fn ku_toggle(&mut self) {
+        if let Mode::EditKeyUsage(ref mut s) = self.mode {
+            s.toggle();
+        }
+    }
+
+    /// Apply the KeyUsage edit: re-encode the BIT STRING and replace the
+    /// `extnValue` OCTET STRING's content, letting [`Self::rebuild`] re-detect
+    /// the nested encoding and recompute lengths.
+    pub fn commit_key_usage(&mut self) {
+        let Mode::EditKeyUsage(ref s) = self.mode else { return };
+        let der = key_usage::encode_der(&s.bits);
+        let value_path = s.value_path.clone();
+        let Some(node) = node_at_mut(&mut self.roots, &value_path) else {
+            self.status = "internal error: extnValue node missing".to_string();
+            return;
+        };
+        node.value = der;
+        node.children.clear();
+        node.encapsulates = false;
+        self.mode = Mode::Browse;
+        self.dirty = true;
+        self.rebuild();
+        self.status = "Key Usage updated — 's' writes the file".to_string();
     }
 
     /// Open the public-key modification dialog for the open certificate,
@@ -2700,6 +2809,14 @@ impl App {
                 desc: "edit the cA and pathLenConstraint fields",
             });
         }
+        // On a KeyUsage extension, offer the structured editor.
+        if self.selection_key_usage_path().is_some() {
+            items.push(MenuItem {
+                action: MenuAction::EditKeyUsage,
+                label: "As Key Usage",
+                desc: "toggle the named key-usage bits",
+            });
+        }
         // On a certificate's subjectPublicKeyInfo, offer to re-key the cert.
         if self.selection_is_cert_spki() {
             items.push(MenuItem {
@@ -2760,6 +2877,7 @@ impl App {
             MenuAction::EditRaw => self.start_edit_raw(),
             MenuAction::EditTypeSpecific => self.start_edit_type_specific(),
             MenuAction::EditBasicConstraints => self.start_basic_constraints(),
+            MenuAction::EditKeyUsage => self.start_key_usage(),
             MenuAction::Rekey => self.start_rekey(),
             MenuAction::Resign => self.start_resign(),
         }
@@ -4107,6 +4225,97 @@ mod tests {
         let bc = current_bc(&app);
         assert!(bc.ca);
         assert_eq!(bc.path_len.as_deref(), Some("0"));
+    }
+
+    /// Row index of the first KeyUsage Extension SEQUENCE.
+    fn ku_row(app: &App) -> usize {
+        (0..app.rows.len())
+            .find(|&i| {
+                let row = &app.rows[i];
+                row.source == RowSource::Document
+                    && node_at(&app.roots, &row.path)
+                        .is_some_and(|n| key_usage::value_index(n).is_some())
+            })
+            .expect("KeyUsage extension row")
+    }
+
+    /// Names of the set bits in the current document's KeyUsage extension.
+    fn current_ku_set(app: &App) -> Vec<&'static str> {
+        fn find(nodes: &[Node]) -> Option<&Node> {
+            for n in nodes {
+                if key_usage::value_index(n).is_some() {
+                    return Some(n);
+                }
+                if let Some(f) = find(&n.children) {
+                    return Some(f);
+                }
+            }
+            None
+        }
+        let ku = key_usage::parse(find(&app.roots).expect("extension")).expect("parse");
+        ku.bits
+            .iter()
+            .enumerate()
+            .filter(|(_, &b)| b)
+            .map(|(i, _)| key_usage::BITS[i].0)
+            .collect()
+    }
+
+    #[test]
+    fn e_on_key_usage_opens_structured_editor() {
+        let mut app = cert_app("testdata/chain/root_ca.der");
+        let idx = ku_row(&app);
+        app.select(idx);
+        app.edit_selected(); // the 'e' action
+        let Mode::EditKeyUsage(ref s) = app.mode else {
+            panic!("KeyUsage editor not opened by 'e'");
+        };
+        assert!(s.critical);
+        assert!(s.bits[5] && s.bits[6], "keyCertSign + cRLSign start set");
+        assert!(!s.bits[0]);
+    }
+
+    #[test]
+    fn edit_menu_offers_key_usage_entry() {
+        let mut app = cert_app("testdata/chain/server.der");
+        let idx = ku_row(&app);
+        app.select(idx);
+        app.open_edit_menu();
+        let Mode::EditMenu(ref m) = app.mode else { panic!("menu not open") };
+        assert!(
+            m.items.iter().any(|i| i.action == MenuAction::EditKeyUsage),
+            "the 'E' menu should offer 'As Key Usage'"
+        );
+    }
+
+    #[test]
+    fn key_usage_editor_toggles_a_bit() {
+        // server.der is digitalSignature only; add keyAgreement (bit 4).
+        let mut app = cert_app("testdata/chain/server.der");
+        let idx = ku_row(&app);
+        app.select(idx);
+        app.start_key_usage();
+        app.ku_move_field(4); // 0 -> keyAgreement
+        app.ku_toggle();
+        app.commit_key_usage();
+        assert!(app.dirty);
+        assert!(matches!(app.mode, Mode::Browse));
+        assert_eq!(current_ku_set(&app), ["digitalSignature", "keyAgreement"]);
+        // The document must still re-parse identically to its encoding.
+        assert!(ber::parse_forest(&ber::encode_forest(&app.roots), 0).is_ok());
+    }
+
+    #[test]
+    fn key_usage_editor_clearing_a_bit_shrinks_the_bit_string() {
+        // root_ca is keyCertSign + cRLSign; clear cRLSign (bit 6).
+        let mut app = cert_app("testdata/chain/root_ca.der");
+        let idx = ku_row(&app);
+        app.select(idx);
+        app.start_key_usage();
+        app.ku_move_field(6); // 0 -> cRLSign
+        app.ku_toggle();
+        app.commit_key_usage();
+        assert_eq!(current_ku_set(&app), ["keyCertSign"]);
     }
 
     #[test]

@@ -23,6 +23,7 @@
 use std::path::{Path, PathBuf};
 
 pub mod basic_constraints;
+pub mod key_usage;
 
 use crate::ber::{
     self, Class, Node, TAG_BIT_STRING, TAG_GENERALIZED_TIME, TAG_INTEGER, TAG_OCTET_STRING,
