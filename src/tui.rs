@@ -157,6 +157,7 @@ fn handle_browser_key(app: &mut App, key: KeyEvent) {
         KeyCode::Enter | KeyCode::Char(' ') => app.activate_browser_entry(),
         KeyCode::Char('z') => app.start_decrypt(),
         KeyCode::Char('t') => app.toggle_trust(),
+        KeyCode::Char('/') => app.start_browser_search(),
         _ => {}
     }
     // Any of the above can move the browser selection; live-preview the
@@ -361,12 +362,25 @@ fn draw(frame: &mut Frame, app: &mut App) {
         draw_tree(frame, app, tree);
         draw_content(frame, app, content);
     } else {
-        let [browser, tree, content] = Layout::horizontal([
-            Constraint::Percentage(20),
-            Constraint::Percentage(34),
-            Constraint::Percentage(46),
-        ])
-        .areas(main);
+        let [left, content] =
+            Layout::horizontal([Constraint::Percentage(54), Constraint::Percentage(46)])
+                .areas(main);
+        // A browser search ('/' in the Files pane) puts its input bar on top,
+        // spanning the browser and tree panes.
+        let global_bar = app.filter_global
+            && (matches!(app.mode, Mode::FilterInput) || !app.filter.is_empty());
+        let left = if global_bar {
+            let [bar, rest] =
+                Layout::vertical([Constraint::Length(1), Constraint::Min(3)]).areas(left);
+            frame.render_widget(Paragraph::new(filter_bar_line(app, " search / ")), bar);
+            rest
+        } else {
+            left
+        };
+        // 20/34 of the full width, expressed within the 54%-wide left half.
+        let [browser, tree] =
+            Layout::horizontal([Constraint::Ratio(20, 54), Constraint::Ratio(34, 54)])
+                .areas(left);
         draw_browser(frame, app, browser);
         draw_tree(frame, app, tree);
         draw_content(frame, app, content);
@@ -1407,39 +1421,47 @@ fn preview_text_or_hex(v: &[u8]) -> String {
     }
 }
 
+/// The tree-filter / browser-search input line: label, the filter text with
+/// a reversed-cell cursor while the field is focused, and a short key hint.
+fn filter_bar_line(app: &App, label: &str) -> Line<'static> {
+    let filter_editing = matches!(app.mode, Mode::FilterInput);
+    let mut spans = vec![Span::styled(label.to_string(), Style::new().fg(Color::Cyan).bold())];
+    if filter_editing {
+        // Show the cursor position: the character under it is reversed
+        // (a reversed space when the cursor sits at the end).
+        let chars: Vec<char> = app.filter.chars().collect();
+        let cur = app.filter_cursor.min(chars.len());
+        let cursor_style = Style::new().add_modifier(Modifier::REVERSED).bold();
+        spans.push(Span::styled(chars[..cur].iter().collect::<String>(), Style::new().bold()));
+        match chars.get(cur) {
+            Some(c) => {
+                spans.push(Span::styled(c.to_string(), cursor_style));
+                spans.push(Span::styled(
+                    chars[cur + 1..].iter().collect::<String>(),
+                    Style::new().bold(),
+                ));
+            }
+            None => spans.push(Span::styled(" ", cursor_style)),
+        }
+        spans.push(Span::styled(
+            "  (←→ move, ⏎/Tab navigate, Esc clears)",
+            Style::new().dim(),
+        ));
+    } else {
+        spans.push(Span::raw(app.filter.clone()));
+    }
+    Line::from(spans)
+}
+
 fn draw_tree(frame: &mut Frame, app: &mut App, area: Rect) {
     // The filter bar sits above the tree while the field has focus or holds
-    // a non-empty filter string.
+    // a non-empty filter string — unless the filter is the browser search,
+    // whose bar spans the browser+tree panes and is drawn by `draw` instead.
     let filter_editing = matches!(app.mode, Mode::FilterInput);
-    let area = if filter_editing || !app.filter.is_empty() {
+    let area = if !app.filter_global && (filter_editing || !app.filter.is_empty()) {
         let [bar, rest] =
             Layout::vertical([Constraint::Length(1), Constraint::Min(3)]).areas(area);
-        let mut spans = vec![Span::styled(" filter / ", Style::new().fg(Color::Cyan).bold())];
-        if filter_editing {
-            // Show the cursor position: the character under it is reversed
-            // (a reversed space when the cursor sits at the end).
-            let chars: Vec<char> = app.filter.chars().collect();
-            let cur = app.filter_cursor.min(chars.len());
-            let cursor_style = Style::new().add_modifier(Modifier::REVERSED).bold();
-            spans.push(Span::styled(chars[..cur].iter().collect::<String>(), Style::new().bold()));
-            match chars.get(cur) {
-                Some(c) => {
-                    spans.push(Span::styled(c.to_string(), cursor_style));
-                    spans.push(Span::styled(
-                        chars[cur + 1..].iter().collect::<String>(),
-                        Style::new().bold(),
-                    ));
-                }
-                None => spans.push(Span::styled(" ", cursor_style)),
-            }
-            spans.push(Span::styled(
-                "  (←→ move, ⏎/Tab navigate, Esc clears)",
-                Style::new().dim(),
-            ));
-        } else {
-            spans.push(Span::raw(app.filter.clone()));
-        }
-        frame.render_widget(Paragraph::new(Line::from(spans)), bar);
+        frame.render_widget(Paragraph::new(filter_bar_line(app, " filter / ")), bar);
         rest
     } else {
         area
@@ -2765,6 +2787,41 @@ mod tests {
         assert_eq!(cells(&g.right), [Some("───╮"), Some("◄──╯")]);
         // Merged stub keeps the healthy color while any covered edge verifies.
         assert_eq!(g.right[1].as_ref().unwrap().1, REL_SIGNS);
+    }
+
+    #[test]
+    fn browser_search_bar_spans_and_narrows_the_file_list() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let dir = std::env::temp_dir()
+            .join(format!("asn1-editor-tui-search-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // match.der contains the UTF8String "hello"; other.der does not.
+        let doc = [
+            0x30, 0x10, 0x02, 0x02, 0x04, 0xD2, 0x0C, 0x05, 0x68, 0x65, 0x6C, 0x6C, 0x6F,
+            0x06, 0x03, 0x55, 0x04, 0x03,
+        ];
+        std::fs::write(dir.join("match.der"), doc).unwrap();
+        std::fs::write(dir.join("other.der"), [0x30, 0x03, 0x02, 0x01, 0x07]).unwrap();
+        let mut app = App::new_dir(dir.clone());
+        app.start_browser_search();
+        for c in "hello".chars() {
+            app.filter_insert_char(c);
+        }
+        let mut term = Terminal::new(TestBackend::new(170, 30)).unwrap();
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let text = buffer_text(term.backend().buffer());
+        assert!(text.contains("search / hello"), "search bar missing:\n{text}");
+        assert!(text.contains("match.der"), "matching file missing");
+        assert!(!text.contains("other.der"), "non-matching file should be hidden:\n{text}");
+        // The bar sits above the Files pane (spanning it), not inside the tree
+        // pane only: it must appear before the Files border on the same rows.
+        let bar_row = text.lines().position(|l| l.contains("search / hello")).unwrap();
+        let files_row = text.lines().position(|l| l.contains("Files")).unwrap();
+        assert!(bar_row < files_row, "the bar spans above the Files pane");
+        // The tree pane must not additionally show its own filter bar.
+        assert_eq!(text.matches("filter /").count(), 0);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

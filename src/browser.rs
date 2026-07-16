@@ -25,7 +25,7 @@
 //! change while the program runs (e.g. a key file it just wrote) show up
 //! immediately, annotated in the pane.
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::{Path, PathBuf};
 use std::time::SystemTime;
 
@@ -81,6 +81,9 @@ pub struct FileBrowser {
     /// Modification times of every file/directory present under `root` at
     /// startup — the reference every later `refresh` classifies against.
     baseline: HashMap<PathBuf, SystemTime>,
+    /// Content-search filter (§11): when set, only the listed files — and the
+    /// directories containing at least one of them — produce rows.
+    filter: Option<BTreeSet<PathBuf>>,
 }
 
 impl FileBrowser {
@@ -95,6 +98,7 @@ impl FileBrowser {
             selected: 0,
             list_state: ListState::default(),
             baseline,
+            filter: None,
         };
         browser.rebuild_rows();
         browser
@@ -110,6 +114,7 @@ impl FileBrowser {
             selected: 0,
             list_state: ListState::default(),
             baseline: HashMap::new(),
+            filter: None,
         }
     }
 
@@ -141,10 +146,28 @@ impl FileBrowser {
     fn rebuild_rows(&mut self) {
         let mut rows = Vec::new();
         for (i, e) in self.entries.iter().enumerate() {
-            collect_rows(e, vec![i], &mut rows);
+            collect_rows(e, vec![i], self.filter.as_ref(), &mut rows);
         }
         self.rows = rows;
         self.select(self.selected);
+    }
+
+    /// Install (or clear, with `None`) the content-search filter: only the
+    /// listed files and the directories containing at least one of them stay
+    /// visible. The selection is preserved by path where possible.
+    pub fn set_filter(&mut self, filter: Option<BTreeSet<PathBuf>>) {
+        let selected_path = self.selected_entry().map(|e| e.path.clone());
+        self.filter = filter;
+        self.rebuild_rows();
+        if let Some(path) = selected_path {
+            if let Some(i) = self
+                .rows
+                .iter()
+                .position(|r| entry_at(&self.entries, &r.path).map(|e| &e.path) == Some(&path))
+            {
+                self.select(i);
+            }
+        }
     }
 
     pub fn select(&mut self, index: usize) {
@@ -253,13 +276,30 @@ impl FileBrowser {
     }
 }
 
-fn collect_rows(entry: &Entry, path: Vec<usize>, rows: &mut Vec<Row>) {
+fn collect_rows(
+    entry: &Entry,
+    path: Vec<usize>,
+    filter: Option<&BTreeSet<PathBuf>>,
+    rows: &mut Vec<Row>,
+) {
+    // Under a content-search filter, a file is visible when it matched and a
+    // directory when some matched file lives underneath it.
+    if let Some(set) = filter {
+        let visible = if entry.is_dir {
+            set.iter().any(|p| p.starts_with(&entry.path))
+        } else {
+            set.contains(&entry.path)
+        };
+        if !visible {
+            return;
+        }
+    }
     rows.push(Row { depth: path.len() - 1, path: path.clone() });
     if entry.is_dir && entry.expanded {
         for (i, child) in entry.children.iter().enumerate() {
             let mut child_path = path.clone();
             child_path.push(i);
-            collect_rows(child, child_path, rows);
+            collect_rows(child, child_path, filter, rows);
         }
     }
 }

@@ -1456,7 +1456,7 @@ document pane.
 | `s` | save (re-encode + re-wrap container) |
 | `z` | context action: decrypt an `EncryptedPrivateKeyInfo` (§9a) or PKCS#12 (§9b, prompts for a password), or — on a certificate/CRL — open the *Cryptographic adjustment* menu (re-sign §9c / re-key §9e) |
 | `t` | (browser) mark/unmark the selected certificate as a path-validation trust anchor (§9d) |
-| `/` | (tree) focus the tree-filter field; `⏎`/`Tab` there returns to navigating the filtered tree, `Esc` clears the filter |
+| `/` | (tree) focus the tree-filter field; (browser) recursive file content search across every parseable file. `⏎`/`Tab` returns to navigating, `Esc` clears |
 | `[` / `]` | scroll content pane |
 | `q` | quit (`q q` to discard unsaved changes) |
 
@@ -1499,6 +1499,35 @@ black-on-yellow; `hex_match_marks` + the mark-aware `hex_dump_lines`) — so
 after filtering by raw bytes, selecting a matched node shows exactly where
 inside it the bytes sit. The highlight follows the filter: it persists while
 the field is unfocused and disappears when the filter is cleared.
+
+### Browser content search (`/` in the Files pane)
+
+Pressing `/` in the **file browser** starts a **recursive content search**
+over the whole browser tree: the input bar then sits at the top **spanning
+the browser and tree panes** (labelled `search /` and drawn by `draw`, while
+the tree pane's own `filter /` bar is suppressed). The same filter string and
+key handling are shared with the tree filter (`App::filter` +
+`filter_global` scope flag; the same `Mode::FilterInput`); the search applies
+the per-file matcher to **every file that parses successfully**:
+
+* `start_browser_search` builds a **search index** (`SearchEntry`): a
+  recursive scan (same 32-level depth and 1 MiB size caps as the §9 scans)
+  that parses each file (`input::load` + `ber::parse_forest`) and identifies
+  it against the loaded specs — so field-name matches work exactly as in the
+  tree filter. Per-keystroke re-matching (`apply_browser_filter` +
+  `forest_contains_match`) then runs purely in memory; the filesystem poll
+  rebuilds the index when files change.
+* The browser lists **only files with at least one match** plus the
+  directories containing them (`FileBrowser::set_filter`, a
+  `BTreeSet<PathBuf>` respected by the browser's row builder; expanding such
+  a directory shows only its matching children). Non-parseable and oversized
+  files never match.
+* `⏎`/`Tab` returns focus to the narrowed file list; `Tab` from there reaches
+  the tree, which — since the tree already filters on `App::filter` — is
+  **filtered exactly as if the string had been entered in the tree filter**,
+  hex highlighting included. `Esc` in the field clears both the search and
+  the file narrowing; `/` in the tree keeps the string but collapses the
+  scope to a tree-only filter (the browser shows all files again).
 
 ## 12. Verification against dumpasn1
 

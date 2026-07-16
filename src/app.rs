@@ -140,6 +140,44 @@ impl FilterMatcher {
     }
 }
 
+/// One parseable file in the browser-search snapshot: its parsed forest and
+/// (when a specification matched) the identification providing field names —
+/// so browser-search matching behaves exactly like the per-file tree filter.
+struct SearchEntry {
+    path: PathBuf,
+    roots: Vec<Node>,
+    ident: Option<Identification>,
+}
+
+/// Whether any node of `forest` matches the filter, labels included — the
+/// same test the tree filter applies, reduced to a yes/no per file.
+fn forest_contains_match(
+    matcher: &FilterMatcher,
+    forest: &[Node],
+    labels: Option<&std::collections::HashMap<Vec<usize>, Label>>,
+) -> bool {
+    fn rec(
+        node: &Node,
+        path: &mut Vec<usize>,
+        matcher: &FilterMatcher,
+        labels: Option<&std::collections::HashMap<Vec<usize>, Label>>,
+    ) -> bool {
+        if matcher.matches(node, labels.and_then(|m| m.get(path.as_slice()))) {
+            return true;
+        }
+        for (i, child) in node.children.iter().enumerate() {
+            path.push(i);
+            let hit = rec(child, path, matcher, labels);
+            path.pop();
+            if hit {
+                return true;
+            }
+        }
+        false
+    }
+    forest.iter().enumerate().any(|(i, node)| rec(node, &mut vec![i], matcher, labels))
+}
+
 /// What the hex editor is operating on.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum EditKind {
@@ -1310,6 +1348,14 @@ pub struct App {
     pub filter: String,
     /// Cursor position inside the filter field, in characters.
     pub filter_cursor: usize,
+    /// True when the filter was entered via the browser's recursive content
+    /// search ('/' in the Files pane): the same string then also decides
+    /// which files the browser lists, and the bar spans both panes.
+    pub filter_global: bool,
+    /// Parsed snapshot of every parseable file under the browser root, built
+    /// when the browser search opens — so re-matching per keystroke needs no
+    /// filesystem access. Refreshed when the filesystem poll sees changes.
+    search_index: Vec<SearchEntry>,
     /// Loaded ASN.1 specifications (may be empty).
     pub spec_db: SpecDb,
     /// Result of matching the document against the specifications.
@@ -1414,6 +1460,8 @@ impl App {
             content_scroll: 0,
             filter: String::new(),
             filter_cursor: 0,
+            filter_global: false,
+            search_index: Vec::new(),
             spec_db: SpecDb::default(),
             ident: None,
             browser,
@@ -1462,6 +1510,8 @@ impl App {
             content_scroll: 0,
             filter: String::new(),
             filter_cursor: 0,
+            filter_global: false,
+            search_index: Vec::new(),
             spec_db: SpecDb::default(),
             ident: None,
             browser,
@@ -1516,6 +1566,8 @@ impl App {
             content_scroll: 0,
             filter: String::new(),
             filter_cursor: 0,
+            filter_global: false,
+            search_index: Vec::new(),
             spec_db: SpecDb::default(),
             ident: None,
             browser: FileBrowser::empty(dir),
@@ -1576,6 +1628,12 @@ impl App {
             // over its on-disk copy, and recomputes sig/path status + the
             // browser relation arrows.
             self.recompute_sig_status();
+            // An active browser search matches against a parsed snapshot;
+            // rebuild it so new/changed files join the search.
+            if self.filter_global {
+                self.build_search_index();
+                self.apply_browser_filter();
+            }
         }
         changed
     }
@@ -2947,11 +3005,92 @@ impl App {
             self.status = "no file open — nothing to filter".to_string();
             return;
         }
+        // '/' in the tree narrows the scope to the open document: a browser
+        // search in progress collapses to a plain tree filter.
+        if self.filter_global {
+            self.filter_global = false;
+            self.browser.set_filter(None);
+        }
         self.mode = Mode::FilterInput;
         self.filter_cursor = self.filter.chars().count();
         self.status =
             "type to filter — hex / text / integer / OID readings; ⏎ or Tab navigates, Esc clears"
                 .to_string();
+    }
+
+    /// '/' in the file browser: recursive content search. The same filter
+    /// string is matched (with the per-file semantics of the tree filter)
+    /// against every parseable file under the browser root; the browser then
+    /// lists only the files with at least one match, and the open document's
+    /// tree is filtered by the same string.
+    pub fn start_browser_search(&mut self) {
+        if self.single_file {
+            return; // no browser pane in single-file mode
+        }
+        self.mode = Mode::FilterInput;
+        self.filter_global = true;
+        self.filter_cursor = self.filter.chars().count();
+        self.build_search_index();
+        self.apply_browser_filter();
+        self.status =
+            "type to search all files — hex / text / integer / OID readings; ⏎ or Tab navigates, Esc clears"
+                .to_string();
+    }
+
+    /// Parse every file under the browser root (recursively, with the same
+    /// depth/size caps as the certificate scan) and identify it against the
+    /// loaded specifications, so per-keystroke matching stays in memory.
+    fn build_search_index(&mut self) {
+        fn scan(dir: &Path, depth: usize, db: &SpecDb, out: &mut Vec<SearchEntry>) {
+            const MAX_DEPTH: usize = 32;
+            const MAX_FILE_SIZE: u64 = 1024 * 1024;
+            if depth > MAX_DEPTH {
+                return;
+            }
+            let Ok(rd) = std::fs::read_dir(dir) else { return };
+            for entry in rd.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    scan(&path, depth + 1, db, out);
+                    continue;
+                }
+                let Ok(meta) = entry.metadata() else { continue };
+                if meta.len() > MAX_FILE_SIZE {
+                    continue;
+                }
+                let Ok(raw) = std::fs::read(&path) else { continue };
+                let Ok((der, _)) = input::load(&raw) else { continue };
+                let Ok(roots) = ber::parse_forest(&der, 0) else { continue };
+                let ident = spec::identify(db, &roots);
+                out.push(SearchEntry { path, roots, ident });
+            }
+        }
+        let mut index = Vec::new();
+        scan(&self.browser.root.clone(), 0, &self.spec_db, &mut index);
+        self.search_index = index;
+    }
+
+    /// Re-match the browser-search index against the current filter and
+    /// narrow the browser's file list accordingly. A no-op for the tree-only
+    /// filter scope; an empty filter shows all files again.
+    fn apply_browser_filter(&mut self) {
+        if !self.filter_global {
+            return;
+        }
+        if self.filter.is_empty() {
+            self.browser.set_filter(None);
+            return;
+        }
+        let matcher = FilterMatcher::new(&self.filter);
+        let matches: std::collections::BTreeSet<PathBuf> = self
+            .search_index
+            .iter()
+            .filter(|e| {
+                forest_contains_match(&matcher, &e.roots, e.ident.as_ref().map(|i| &i.labels))
+            })
+            .map(|e| e.path.clone())
+            .collect();
+        self.browser.set_filter(Some(matches));
     }
 
     /// Byte offset of the character position `char_idx` in the filter string.
@@ -2969,6 +3108,7 @@ impl App {
             self.filter.insert(at, c);
             self.filter_cursor += 1;
             self.rebuild_rows();
+            self.apply_browser_filter();
         }
     }
 
@@ -2978,6 +3118,7 @@ impl App {
             let at = self.filter_byte_idx(self.filter_cursor);
             self.filter.remove(at);
             self.rebuild_rows();
+            self.apply_browser_filter();
         }
     }
 
@@ -2989,6 +3130,7 @@ impl App {
             let at = self.filter_byte_idx(self.filter_cursor);
             self.filter.remove(at);
             self.rebuild_rows();
+            self.apply_browser_filter();
         }
     }
 
@@ -3007,22 +3149,31 @@ impl App {
         }
     }
 
-    /// Enter/Tab in the filter field: keep the filter and navigate the
-    /// (filtered) tree.
+    /// Enter/Tab in the filter field: keep the filter and navigate. A tree
+    /// filter returns focus to the tree; a browser search returns it to the
+    /// (narrowed) file list — Tab from there reaches the equally filtered
+    /// tree as usual.
     pub fn filter_accept(&mut self) {
         self.mode = Mode::Browse;
-        self.focus = Focus::Document;
+        self.focus = if self.filter_global { Focus::Browser } else { Focus::Document };
         self.status = if self.filter.is_empty() {
             "filter cleared".to_string()
+        } else if self.filter_global {
+            format!("files searched for \"{}\" — '/' edits the search", self.filter)
         } else {
             format!("tree filtered by \"{}\" — '/' edits the filter", self.filter)
         };
     }
 
-    /// Esc in the filter field: clear the filter and show the full tree again.
+    /// Esc in the filter field: clear the filter and show the full tree —
+    /// and, for a browser search, the full file list — again.
     pub fn filter_clear(&mut self) {
         self.filter.clear();
         self.filter_cursor = 0;
+        if self.filter_global {
+            self.filter_global = false;
+            self.browser.set_filter(None);
+        }
         self.mode = Mode::Browse;
         self.rebuild_rows();
         self.status = "filter cleared".to_string();
@@ -5449,6 +5600,107 @@ mod tests {
         app.filter_accept();
         app.start_filter();
         assert_eq!(app.filter_cursor, 3);
+    }
+
+    // ---- browser content search ('/' in the Files pane) --------------------
+
+    fn browser_names(app: &App) -> Vec<String> {
+        app.browser
+            .rows
+            .iter()
+            .filter_map(|r| app.browser.entry_at(&r.path).map(|e| e.name.clone()))
+            .collect()
+    }
+
+    /// A tmp directory with `match.der` (contains "hello"), `other.der`
+    /// (no match) and `sub/inner.der` (contains "hello").
+    fn search_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir()
+            .join(format!("asn1-editor-search-test-{}-{}", name, std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(dir.join("sub")).unwrap();
+        std::fs::write(dir.join("match.der"), FILTER_DOC).unwrap();
+        std::fs::write(dir.join("other.der"), [0x30, 0x03, 0x02, 0x01, 0x07]).unwrap();
+        std::fs::write(dir.join("sub/inner.der"), FILTER_DOC).unwrap();
+        dir
+    }
+
+    #[test]
+    fn browser_search_lists_only_files_with_matches() {
+        let dir = search_dir("list");
+        let mut app = App::new_dir(dir.clone());
+        assert_eq!(browser_names(&app), ["sub", "match.der", "other.der"]);
+        app.start_browser_search();
+        assert!(app.filter_global);
+        for c in "hello".chars() {
+            app.filter_insert_char(c);
+        }
+        // other.der has no match; sub stays because sub/inner.der matches.
+        assert_eq!(browser_names(&app), ["sub", "match.der"]);
+        // Expanding sub reveals the matching file inside.
+        app.browser.select(0);
+        app.browser.toggle_expand();
+        assert_eq!(browser_names(&app), ["sub", "inner.der", "match.der"]);
+        // Enter/Tab returns focus to the narrowed file list.
+        app.filter_accept();
+        assert!(matches!(app.focus, Focus::Browser));
+        assert!(matches!(app.mode, Mode::Browse));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn browser_search_filters_the_open_tree_identically() {
+        let dir = search_dir("tree");
+        let mut app = App::new_dir(dir.clone());
+        app.start_browser_search();
+        for c in "hello".chars() {
+            app.filter_insert_char(c);
+        }
+        app.filter_accept();
+        // Open the matching file from the browser: its tree is filtered just
+        // like a tree filter with the same string would.
+        browser_select_by_name(&mut app, "match.der");
+        app.preview_browser_selection();
+        assert_eq!(
+            doc_rows(&app),
+            [(vec![0], false), (vec![0, 0], true), (vec![0, 1], false), (vec![0, 2], true)]
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn browser_search_esc_restores_all_files() {
+        let dir = search_dir("clear");
+        let mut app = App::new_dir(dir.clone());
+        app.start_browser_search();
+        for c in "hello".chars() {
+            app.filter_insert_char(c);
+        }
+        assert_eq!(browser_names(&app), ["sub", "match.der"]);
+        app.filter_clear();
+        assert!(!app.filter_global);
+        assert!(app.filter.is_empty());
+        assert_eq!(browser_names(&app), ["sub", "match.der", "other.der"]);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn tree_slash_narrows_a_browser_search_to_the_tree_scope() {
+        let dir = search_dir("scope");
+        let mut app = App::new_dir(dir.clone());
+        app.start_browser_search();
+        for c in "hello".chars() {
+            app.filter_insert_char(c);
+        }
+        app.filter_accept();
+        browser_select_by_name(&mut app, "match.der");
+        app.preview_browser_selection();
+        // '/' in the tree keeps the string but drops the browser narrowing.
+        app.start_filter();
+        assert!(!app.filter_global);
+        assert_eq!(app.filter, "hello");
+        assert_eq!(browser_names(&app), ["sub", "match.der", "other.der"]);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
