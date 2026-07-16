@@ -14,6 +14,12 @@ env:
   CARGO_TERM_COLOR: always
   LINUX_TARGET: x86_64-unknown-linux-gnu
   WINDOWS_TARGET: x86_64-pc-windows-msvc
+  # The `openssl` crate is used for the post-quantum algorithms (ML-DSA /
+  # SLH-DSA), which need OpenSSL 3.5+. Runner system OpenSSL is older (and the
+  # `openssl-sys` vendored build only bundles the 3.0 LTS), so a static 3.5 is
+  # built from source and linked in — this also makes the artifacts
+  # self-contained (no external libssl at runtime).
+  OPENSSL_VERSION: '3.5.6'
 
 jobs:
   appimage:
@@ -29,8 +35,37 @@ jobs:
         with:
           targets: ${{ env.LINUX_TARGET }}
 
+      - name: Cache static OpenSSL
+        id: cache-openssl
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}/openssl
+          key: openssl-${{ env.OPENSSL_VERSION }}-linux-x86_64-static
+
+      - name: Build static OpenSSL 3.5 (ML-DSA / SLH-DSA)
+        if: steps.cache-openssl.outputs.cache-hit != 'true'
+        run: |
+          prefix="$RUNNER_TEMP/openssl"
+          src="$RUNNER_TEMP/openssl-src"
+          mkdir -p "$src"
+          curl --fail --location --retry 3 \
+            "https://github.com/openssl/openssl/releases/download/openssl-${OPENSSL_VERSION}/openssl-${OPENSSL_VERSION}.tar.gz" \
+            | tar -xz -C "$src" --strip-components=1
+          cd "$src"
+          ./Configure --prefix="$prefix" --libdir=lib no-shared no-docs linux-x86_64
+          make -j"$(nproc)"
+          make install_sw
+          make install_ssldirs   # openssl.cnf, needed by the `openssl req` CLI tests
+
+      - name: Use static OpenSSL 3.5
+        run: |
+          echo "OPENSSL_DIR=$RUNNER_TEMP/openssl" >> "$GITHUB_ENV"
+          echo "OPENSSL_STATIC=1" >> "$GITHUB_ENV"
+          echo "$RUNNER_TEMP/openssl/bin" >> "$GITHUB_PATH"
+
       - name: Build and test
         run: |
+          openssl version   # the freshly built 3.5, used by the openssl-CLI tests
           cargo test --locked --target "$LINUX_TARGET"
           cargo build --locked --release --target "$LINUX_TARGET"
 
@@ -93,6 +128,46 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ env.WINDOWS_TARGET }}
+
+      - name: Set up MSVC developer environment
+        uses: ilammy/msvc-dev-cmd@v1
+        with:
+          arch: x64
+
+      - name: Cache static OpenSSL
+        id: cache-openssl
+        uses: actions/cache@v4
+        with:
+          path: ${{ runner.temp }}\openssl
+          key: openssl-${{ env.OPENSSL_VERSION }}-windows-x86_64-static
+
+      - name: Build static OpenSSL 3.5 (ML-DSA / SLH-DSA)
+        if: steps.cache-openssl.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          $version = $env:OPENSSL_VERSION
+          $prefix = Join-Path $env:RUNNER_TEMP "openssl"
+          $src = Join-Path $env:RUNNER_TEMP "openssl-src"
+          New-Item -ItemType Directory -Force -Path $src | Out-Null
+          curl.exe --fail --location --retry 3 -o "$env:RUNNER_TEMP\openssl.tar.gz" `
+            "https://github.com/openssl/openssl/releases/download/openssl-$version/openssl-$version.tar.gz"
+          tar -xzf "$env:RUNNER_TEMP\openssl.tar.gz" -C $src --strip-components=1
+          Push-Location $src
+          # no-asm avoids a NASM dependency; no-shared links OpenSSL statically
+          # into our binary so the portable app carries no libssl DLLs.
+          perl Configure VC-WIN64A no-shared no-asm no-docs "--prefix=$prefix" "--openssldir=$prefix"
+          nmake
+          nmake install_sw
+          nmake install_ssldirs   # openssl.cnf, needed by any `openssl` CLI use
+          Pop-Location
+
+      - name: Use static OpenSSL 3.5
+        shell: pwsh
+        run: |
+          $prefix = Join-Path $env:RUNNER_TEMP "openssl"
+          "OPENSSL_DIR=$prefix" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "OPENSSL_STATIC=1" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+          "$prefix\bin" | Out-File -FilePath $env:GITHUB_PATH -Encoding utf8 -Append
 
       - name: Build and test
         run: |
