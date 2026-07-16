@@ -1733,15 +1733,37 @@ impl App {
             .is_some_and(|r| r.source == RowSource::Document && r.path == paths.spki)
     }
 
-    /// If the current tree selection is the outer SEQUENCE of a
-    /// `BasicConstraints` extension in the document, return its path.
-    fn selection_basic_constraints_path(&self) -> Option<Vec<usize>> {
+    /// If the current tree selection lies inside an extension whose outer
+    /// `Extension` SEQUENCE is recognised by `is_extension` — the outer SEQUENCE
+    /// itself or any descendant of it — return the path of that outer SEQUENCE.
+    /// This lets the extension-specific editor be reached from anywhere within
+    /// the extension, not only from its top node.
+    fn selection_extension_path(
+        &self,
+        is_extension: impl Fn(&Node) -> Option<usize>,
+    ) -> Option<Vec<usize>> {
         let row = self.rows.get(self.selected)?;
         if row.source != RowSource::Document {
             return None;
         }
-        let node = node_at(&self.roots, &row.path)?;
-        basic_constraints::value_index(node).map(|_| row.path.clone())
+        // Walk from the selected node up towards the root; the nearest
+        // ancestor-or-self that matches is the enclosing Extension SEQUENCE.
+        let mut path = row.path.as_slice();
+        loop {
+            if node_at(&self.roots, path).is_some_and(|n| is_extension(n).is_some()) {
+                return Some(path.to_vec());
+            }
+            if path.is_empty() {
+                return None;
+            }
+            path = &path[..path.len() - 1];
+        }
+    }
+
+    /// If the current tree selection lies within a `BasicConstraints`
+    /// extension in the document, return the path of its outer SEQUENCE.
+    fn selection_basic_constraints_path(&self) -> Option<Vec<usize>> {
+        self.selection_extension_path(basic_constraints::value_index)
     }
 
     /// Open the structured BasicConstraints editor for the selected extension
@@ -1825,15 +1847,10 @@ impl App {
         self.status = "Basic Constraints updated — 's' writes the file".to_string();
     }
 
-    /// If the current tree selection is the outer SEQUENCE of a `KeyUsage`
-    /// extension in the document, return its path.
+    /// If the current tree selection lies within a `KeyUsage` extension in the
+    /// document, return the path of its outer SEQUENCE.
     fn selection_key_usage_path(&self) -> Option<Vec<usize>> {
-        let row = self.rows.get(self.selected)?;
-        if row.source != RowSource::Document {
-            return None;
-        }
-        let node = node_at(&self.roots, &row.path)?;
-        key_usage::value_index(node).map(|_| row.path.clone())
+        self.selection_extension_path(key_usage::value_index)
     }
 
     /// Open the structured KeyUsage editor for the selected extension (reached
@@ -1894,15 +1911,10 @@ impl App {
         self.status = "Key Usage updated — 's' writes the file".to_string();
     }
 
-    /// If the current tree selection is the outer SEQUENCE of an
-    /// `ExtendedKeyUsage` extension in the document, return its path.
+    /// If the current tree selection lies within an `ExtendedKeyUsage`
+    /// extension in the document, return the path of its outer SEQUENCE.
     fn selection_ext_key_usage_path(&self) -> Option<Vec<usize>> {
-        let row = self.rows.get(self.selected)?;
-        if row.source != RowSource::Document {
-            return None;
-        }
-        let node = node_at(&self.roots, &row.path)?;
-        extended_key_usage::value_index(node).map(|_| row.path.clone())
+        self.selection_extension_path(extended_key_usage::value_index)
     }
 
     /// Open the structured ExtendedKeyUsage editor for the selected extension
@@ -4714,6 +4726,84 @@ mod tests {
         app.eku_enter(); // apply attempt with an empty list
         assert!(matches!(app.mode, Mode::EditExtKeyUsage(_)), "an empty list keeps the dialog open");
         assert!(!app.dirty);
+    }
+
+    /// First document row strictly *inside* the extension at `ext_path`.
+    fn child_row_of(app: &App, ext_path: &[usize]) -> usize {
+        (0..app.rows.len())
+            .find(|&i| {
+                let row = &app.rows[i];
+                row.source == RowSource::Document
+                    && row.path.len() > ext_path.len()
+                    && row.path.starts_with(ext_path)
+            })
+            .expect("a descendant row of the extension")
+    }
+
+    #[test]
+    fn e_inside_basic_constraints_opens_editor_from_a_child() {
+        let mut app = cert_app("testdata/chain/intermediate_ca.der");
+        let ext_path = app.rows[bc_row(&app)].path.clone();
+        let child = child_row_of(&app, &ext_path);
+        // The child is a descendant (e.g. the extnID OID), not the outer node.
+        assert!(app.rows[child].path.len() > ext_path.len());
+        app.select(child);
+        app.edit_selected(); // 'e' from within the extension
+        let Mode::EditBasicConstraints(ref s) = app.mode else {
+            panic!("'e' inside the extension did not open the BasicConstraints editor");
+        };
+        assert!(s.value_path.starts_with(&ext_path));
+        assert!(s.ca);
+    }
+
+    #[test]
+    fn edit_menu_inside_key_usage_offers_entry_from_a_child() {
+        let mut app = cert_app("testdata/chain/root_ca.der");
+        let ext_path = app.rows[ku_row(&app)].path.clone();
+        let child = child_row_of(&app, &ext_path);
+        app.select(child);
+        app.open_edit_menu(); // 'E' from within the extension
+        let Mode::EditMenu(ref m) = app.mode else { panic!("menu not open") };
+        assert!(
+            m.items.iter().any(|i| i.action == MenuAction::EditKeyUsage),
+            "the 'E' menu should offer 'As Key Usage' from within the extension"
+        );
+    }
+
+    #[test]
+    fn e_inside_ext_key_usage_opens_editor_from_a_child() {
+        let mut app = cert_app("testdata/chain/server.der");
+        let ext_path = app.rows[eku_row(&app)].path.clone();
+        let child = child_row_of(&app, &ext_path);
+        app.select(child);
+        app.edit_selected();
+        let Mode::EditExtKeyUsage(ref s) = app.mode else {
+            panic!("'e' inside the extension did not open the ExtendedKeyUsage editor");
+        };
+        assert!(s.value_path.starts_with(&ext_path));
+        assert!(s.predefined[1], "serverAuth still detected from a child selection");
+    }
+
+    #[test]
+    fn e_on_extensions_container_does_not_open_an_extension_editor() {
+        // Selecting the SEQUENCE OF Extension (above any single extension) must
+        // not trigger a specific extension editor.
+        let mut app = cert_app("testdata/chain/server.der");
+        let ext_path = app.rows[eku_row(&app)].path.clone();
+        // The parent of an Extension SEQUENCE is the extensions container.
+        let container = &ext_path[..ext_path.len() - 1];
+        let idx = (0..app.rows.len())
+            .find(|&i| app.rows[i].source == RowSource::Document && app.rows[i].path == container)
+            .expect("extensions container row");
+        app.select(idx);
+        app.edit_selected();
+        assert!(
+            !matches!(
+                app.mode,
+                Mode::EditBasicConstraints(_) | Mode::EditKeyUsage(_) | Mode::EditExtKeyUsage(_)
+            ),
+            "the extensions container must not open an extension-specific editor"
+        );
     }
 
     #[test]

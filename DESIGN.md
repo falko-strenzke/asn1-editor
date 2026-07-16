@@ -1190,9 +1190,14 @@ enclosing extension's `critical` flag.
   form editing the two fields "in a natural way": `cA` as a boolean, and
   `pathLenConstraint` as a present/absent toggle plus a plain integer field
   (which defaults to `0` when the constraint is currently absent). It is
-  reached by **`e`** on the extension's outer SEQUENCE (`edit_selected` routes
-  there before the generic type-specific editor) and by the **As Basic
-  Constraints** entry appended to the `E` edit menu (a new `MenuAction`). On
+  reached by **`e`** anywhere inside the extension (`edit_selected` routes there
+  before the generic type-specific editor) and by the **As Basic Constraints**
+  entry appended to the `E` edit menu (a new `MenuAction`). "Inside the
+  extension" is resolved by `selection_extension_path`, a shared helper that
+  walks from the selected node up towards the root and returns the nearest
+  enclosing `Extension` SEQUENCE the extension's `value_index` recognises — so
+  the editor opens from the outer node or any descendant (the OID, the
+  `critical` flag, the `extnValue`, or the parsed inner value). On
   submit, `commit_basic_constraints` re-encodes the value with `encode_der`
   (DER rules: `cA = FALSE` omitted; `pathLenConstraint` emitted only when `cA`
   is asserted, per RFC 5280) and replaces the `extnValue` OCTET STRING's
@@ -1217,7 +1222,8 @@ The only differences are in the value:
 
 * **Structured editor.** `Mode::EditKeyUsage(KuEditState)` is a checkbox list —
   one row per named bit — navigated with `↑↓` and toggled with `Space`, reached
-  by `e` on the extension or the **As Key Usage** `E`-menu entry. `encode_der`
+  by `e` anywhere inside the extension (via the shared `selection_extension_path`,
+  §9f) or the **As Key Usage** `E`-menu entry. `encode_der`
   follows the DER rule for named bit strings: trailing zero bits are trimmed,
   so the encoded length tracks the highest set bit (bit 0 alone → `03 02 07 80`;
   `keyCertSign`+`cRLSign` → `03 02 01 06`).
@@ -1248,8 +1254,9 @@ editor is richer:
   applies the whole dialog. `encode_der` emits a `SEQUENCE OF` the enabled OIDs
   (well-known in table order, then customs). RFC 5280 requires at least one
   `KeyPurposeId`, so applying an empty list is refused and keeps the dialog
-  open. Reached by `e` on the extension or the **As Extended Key Usage**
-  `E`-menu entry.
+  open. Reached by `e` anywhere inside the extension (via the shared
+  `selection_extension_path`, §9f) or the **As Extended Key Usage** `E`-menu
+  entry.
 
 ## 10. Input containers
 
