@@ -56,6 +56,21 @@ fn is_pq(sig_alg: &[u64]) -> bool {
     matches!(sig_alg, [2, 16, 840, 1, 101, 3, 4, 3, arc] if PQ_SIG_ARCS.contains(arc))
 }
 
+/// Whether `sig_alg` is the XMSS OID, handled by the Botan backend
+/// (`xmss.rs`) — the only backend implementing the stateful hash-based
+/// schemes.
+fn is_xmss(sig_alg: &[u64]) -> bool {
+    crate::xmss::is_xmss_oid(sig_alg)
+}
+
+/// Whether signing with `sig_alg` mutates the private key — the caller must
+/// persist the updated key [`sign_stateful`] returns. True for XMSS (each
+/// signature consumes a one-time-signature index); false for every stateless
+/// algorithm.
+pub fn is_stateful(sig_alg: &[u64]) -> bool {
+    is_xmss(sig_alg)
+}
+
 #[derive(Debug)]
 pub enum SignatureStatus {
     Verified { issuer_path: PathBuf, issuer_summary: String, self_signed: bool },
@@ -124,6 +139,9 @@ pub fn private_key_usable(pkcs8_key: &[u8]) -> bool {
         // A post-quantum key (ML-DSA/SLH-DSA) loads via OpenSSL, not aws-lc-rs.
         || (pkcs8_is_pq(pkcs8_key)
             && openssl::pkey::PKey::private_key_from_pkcs8(pkcs8_key).is_ok())
+        // An XMSS key loads via the Botan backend.
+        || (pkcs8_alg_arcs(pkcs8_key).as_deref().is_some_and(is_xmss)
+            && crate::xmss::key_usable(pkcs8_key))
 }
 
 /// Whether `pkcs8_key` is a consistent RSA private key according to OpenSSL
@@ -137,7 +155,7 @@ fn rsa_private_key_usable(pkcs8_key: &[u8]) -> bool {
 }
 
 /// The `privateKeyAlgorithm` OID arcs of a PKCS#8 `PrivateKeyInfo`.
-fn pkcs8_alg_arcs(pkcs8_key: &[u8]) -> Option<Vec<u64>> {
+pub(crate) fn pkcs8_alg_arcs(pkcs8_key: &[u8]) -> Option<Vec<u64>> {
     let roots = ber::parse_forest(pkcs8_key, 0).ok()?;
     roots
         .first()
@@ -154,6 +172,12 @@ fn pkcs8_is_pq(pkcs8_key: &[u8]) -> bool {
     pkcs8_alg_arcs(pkcs8_key).as_deref().is_some_and(is_pq)
 }
 
+/// Whether a PKCS#8 `PrivateKeyInfo`'s `privateKeyAlgorithm` is the XMSS OID,
+/// so it must go through the Botan backend rather than OpenSSL/`aws-lc-rs`.
+pub fn pkcs8_is_xmss(pkcs8_key: &[u8]) -> bool {
+    pkcs8_alg_arcs(pkcs8_key).as_deref().is_some_and(is_xmss)
+}
+
 /// Whether `signature` is a valid `sig_alg` signature over `tbs` under the
 /// public key `pubkey` (a `subjectPublicKey`, unused-bits octet stripped).
 /// Used by re-signing to confirm a freshly generated signature actually
@@ -161,6 +185,9 @@ fn pkcs8_is_pq(pkcs8_key: &[u8]) -> bool {
 pub fn verify_signature(sig_alg: &[u64], pubkey: &[u8], tbs: &[u8], signature: &[u8]) -> bool {
     if is_pq(sig_alg) {
         return pq_verify(sig_alg, pubkey, tbs, signature);
+    }
+    if is_xmss(sig_alg) {
+        return crate::xmss::verify(pubkey, tbs, signature);
     }
     let ok = match algorithm_for(sig_alg) {
         Some(alg) => signature::UnparsedPublicKey::new(alg, pubkey).verify(tbs, signature).is_ok(),
@@ -257,6 +284,7 @@ fn spki_der(sig_alg: &[u64], pubkey: &[u8]) -> Option<Vec<u8>> {
 /// with the legacy SHA-1 RSA algorithm.)
 pub fn signing_supported(sig_alg: &[u64]) -> bool {
     is_pq(sig_alg)
+        || is_xmss(sig_alg)
         || [
             SHA256_WITH_RSA,
             SHA384_WITH_RSA,
@@ -275,6 +303,29 @@ pub fn signing_supported(sig_alg: &[u64]) -> bool {
 /// unused-bits octet). Errors if the key and algorithm disagree (e.g. an RSA
 /// key for an ECDSA algorithm) or the algorithm is unsupported for signing.
 pub fn sign(sig_alg: &[u64], pkcs8_key: &[u8], tbs: &[u8]) -> Result<Vec<u8>, String> {
+    sign_stateful(sig_alg, pkcs8_key, tbs).map(|(sig, _)| sig)
+}
+
+/// Like [`sign`], but for a stateful algorithm (XMSS) also returns the
+/// updated private key, which the caller should persist: each XMSS signature
+/// consumes a one-time-signature index. (Within one process Botan's index
+/// registry prevents reuse even from stale bytes, so callers that cannot
+/// persist — e.g. the speculative signing in the re-sign dialog — may drop
+/// it; the serialized index is what protects across program runs.) For the
+/// stateless algorithms the second component is `None`.
+pub fn sign_stateful(
+    sig_alg: &[u64],
+    pkcs8_key: &[u8],
+    tbs: &[u8],
+) -> Result<(Vec<u8>, Option<Vec<u8>>), String> {
+    if is_xmss(sig_alg) {
+        let (sig, updated) = crate::xmss::sign(pkcs8_key, tbs)?;
+        return Ok((sig, Some(updated)));
+    }
+    sign_stateless(sig_alg, pkcs8_key, tbs).map(|sig| (sig, None))
+}
+
+fn sign_stateless(sig_alg: &[u64], pkcs8_key: &[u8], tbs: &[u8]) -> Result<Vec<u8>, String> {
     if is_pq(sig_alg) {
         return pq_sign(pkcs8_key, tbs);
     }
@@ -372,7 +423,7 @@ pub fn verify_cms(files: &[SignableFile], cms: &x509::CmsSigned, cms_der: &[u8])
         return SignatureStatus::IssuerNotFound;
     };
     let summary = signer.signable.subject_summary.clone().unwrap_or_default();
-    if !is_pq(&cms.sig_alg) && algorithm_for(&cms.sig_alg).is_none() {
+    if !is_pq(&cms.sig_alg) && !is_xmss(&cms.sig_alg) && algorithm_for(&cms.sig_alg).is_none() {
         return SignatureStatus::UnsupportedAlgorithm(oid_string(&cms.sig_alg));
     }
     let raw_ok = cms_raw_verify(cms, &signer.signable);
@@ -462,7 +513,10 @@ pub fn verify_against(index: &[CaCandidate], signable: &Signable) -> SignatureSt
     let Some(first) = candidates.first() else {
         return SignatureStatus::IssuerNotFound;
     };
-    if !is_pq(&signable.sig_alg) && algorithm_for(&signable.sig_alg).is_none() {
+    if !is_pq(&signable.sig_alg)
+        && !is_xmss(&signable.sig_alg)
+        && algorithm_for(&signable.sig_alg).is_none()
+    {
         return SignatureStatus::UnsupportedAlgorithm(oid_string(&signable.sig_alg));
     }
     for candidate in &candidates {

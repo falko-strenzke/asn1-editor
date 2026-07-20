@@ -134,6 +134,25 @@ jobs:
         with:
           arch: x64
 
+      - name: Set up Python (Botan configure.py)
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Provide python3 and GNU make for the vendored Botan build
+        shell: pwsh
+        run: |
+          # The XMSS backend links Botan, compiled from source by the `botan`
+          # crate's `vendored` feature. botan-src's build script invokes
+          # `python3` and GNU `make` unconditionally (even under MSVC), but
+          # Windows CPython ships only `python.exe` and the runner has no GNU
+          # make. Create a `python3` shim next to python.exe (both its dir and
+          # Chocolatey's bin are already on PATH) and install make. cl.exe
+          # comes from the MSVC step above; Botan's Makefile drives it.
+          $python = (Get-Command python).Source
+          Copy-Item $python (Join-Path (Split-Path $python) "python3.exe") -Force
+          choco install make --no-progress --yes
+
       - name: Cache static OpenSSL
         id: cache-openssl
         uses: actions/cache@v4

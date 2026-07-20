@@ -20,3 +20,4 @@ openssl = "0.10"
 openssl-sys = "0.9"
 foreign-types = "0.3"
 libc = "0.2"
+botan = { version = "0.13.0", features = ["vendored"] }

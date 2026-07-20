@@ -18,6 +18,12 @@ cargo build --release        # binary in target/release/asn1-editor
 cargo test                   # includes the dumpasn1 comparison if installed
 ```
 
+The XMSS backend links Botan, built from bundled source via the `botan`
+crate's `vendored` feature, so the resulting binary is self-contained (no
+system Botan or shared library at runtime). Building it needs a C++17
+compiler, GNU `make`, and Python 3 on `PATH` — Botan's `configure.py`. The
+first build spends a few minutes compiling Botan; later builds are cached.
+
 The only dependency is `ratatui`.
 
 ## Usage

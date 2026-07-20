@@ -33,3 +33,4 @@ pub mod spec;
 pub mod tui;
 pub mod verify;
 pub mod x509;
+pub mod xmss;

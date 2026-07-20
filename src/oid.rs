@@ -60,6 +60,25 @@ macro_rules! nist_sig {
 /// Register; the remaining entries come from the applicable PKCS, CMS,
 /// X.500/X.509, SEC/ANSI, NIST, and IETF specifications.
 pub static OIDS: &[OidEntry] = &[
+    // XMSS (RFC 8391) — the ETSI/BSI id-alg-xmss-hashsig assignment Botan
+    // uses for both the SubjectPublicKeyInfo and the X.509 signatureAlgorithm.
+    oid!(
+        "0.4.0.127.0.15.1.1.13.0",
+        [0, 4, 0, 127, 0, 15, 1, 1, 13, 0],
+        "id-alg-xmss-hashsig",
+        [
+            "itu-t",
+            "identified-organization",
+            "etsi",
+            "reserved",
+            "etsi-identified-organization",
+            "bsi-de",
+            "algorithms",
+            "sigAlgs",
+            "xmss",
+            "id-alg-xmss-hashsig"
+        ]
+    ),
     // ANSI X9.62 / SEC elliptic-curve algorithms and named curves.
     oid!(
         "1.2.840.10045.2.1",

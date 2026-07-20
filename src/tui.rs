@@ -2859,7 +2859,7 @@ mod tests {
         // A 257-octet INTEGER (an RSA-2048 modulus with its leading 0x00):
         // its ~617-digit decimal expansion far exceeds one hex-dump line.
         let mut der = vec![0x02, 0x82, 0x01, 0x01, 0x00];
-        der.extend(std::iter::repeat(0xAB).take(256));
+        der.extend(std::iter::repeat_n(0xAB, 256));
         let roots = parse_forest(&der, 0).unwrap();
         let lines = decoded_lines(&roots[0]);
         assert!(lines.len() > 1, "a long modulus needs several lines");

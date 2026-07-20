@@ -2644,6 +2644,47 @@ impl App {
         out
     }
 
+    /// Determine how to write a stateful key's advanced state back to an
+    /// existing key file at `path`: a raw-DER plaintext key rewrites plainly;
+    /// a raw-DER encrypted key re-encrypts with its retained password; a PEM
+    /// key or a PKCS#12 container cannot round-trip here, so it is marked not
+    /// persistable and the re-key warns the user not to reuse the key.
+    fn stateful_writeback_target(&self, path: &Path) -> StatefulKeyTarget {
+        let not_persistable = |password: Vec<u8>| StatefulKeyTarget {
+            path: path.to_path_buf(),
+            password,
+            persistable: false,
+        };
+        let Ok(raw) = std::fs::read(path) else { return not_persistable(Vec::new()) };
+        // Only a raw-DER file round-trips cleanly through `write` (which emits
+        // DER); a PEM key would need its wrapper reconstructed.
+        match input::load(&raw) {
+            Ok((_, input::Container::Raw)) => {}
+            _ => return not_persistable(Vec::new()),
+        }
+        match self.unlocked_source_kind(path) {
+            // A session-unlocked encrypted key: re-encrypt with its password.
+            UnlockedKind::EncryptedKey => {
+                match self.retained_passwords.get(path) {
+                    Some(password) => StatefulKeyTarget {
+                        path: path.to_path_buf(),
+                        password: password.to_vec(),
+                        persistable: true,
+                    },
+                    None => not_persistable(Vec::new()),
+                }
+            }
+            // A PKCS#12 container: writing a bare key back would drop the rest.
+            UnlockedKind::Pkcs12 => not_persistable(Vec::new()),
+            // Not an encrypted container → a plaintext key file: rewrite plain.
+            UnlockedKind::Unknown => StatefulKeyTarget {
+                path: path.to_path_buf(),
+                password: Vec::new(),
+                persistable: true,
+            },
+        }
+    }
+
     /// Classify a session-unlocked key file by its container type.
     fn unlocked_source_kind(&self, path: &Path) -> UnlockedKind {
         let Ok(raw) = std::fs::read(path) else { return UnlockedKind::Unknown };
@@ -2789,7 +2830,12 @@ impl App {
 
         // Obtain the key material (PKCS#8 + SPKI), a description for the status
         // line, and — only for a freshly generated key — the file to register.
-        let (pkcs8, spki, key_part, written): (Vec<u8>, Vec<u8>, String, Option<PathBuf>) =
+        // Where a stateful (XMSS) key's advanced state is written back after
+        // signing; `None` for stateless algorithms, which never change.
+        let stateful = verify::is_stateful(alg.sig_alg_oid());
+        let mut state_target: Option<StatefulKeyTarget> = None;
+
+        let (mut pkcs8, spki, key_part, written): (Vec<u8>, Vec<u8>, String, Option<PathBuf>) =
             if use_existing {
                 let Some((path, id, label)) = chosen else {
                     self.status = "select an existing key that fits the chosen algorithm".to_string();
@@ -2803,6 +2849,9 @@ impl App {
                     self.status = "could not derive the public key from the selected key".to_string();
                     return;
                 };
+                if stateful {
+                    state_target = Some(self.stateful_writeback_target(&path));
+                }
                 (pkcs8, spki, format!("re-keyed to existing key {}", label), None)
             } else {
                 if let keygen::KeyAlgorithm::RsaCustom(bits) = alg {
@@ -2846,6 +2895,15 @@ impl App {
                     self.status = format!("could not write {}: {}", filename, e);
                     return;
                 }
+                if stateful {
+                    // Rewrite this file with the final state once signing is
+                    // done (raw DER, re-encrypted if a password was set).
+                    state_target = Some(StatefulKeyTarget {
+                        path: key_path.clone(),
+                        password: password.clone().into_bytes(),
+                        persistable: true,
+                    });
+                }
                 let part = format!("wrote {} key {}", alg.short_name(), filename);
                 (key.pkcs8, key.spki, part, Some(key_path.clone()))
             };
@@ -2856,19 +2914,34 @@ impl App {
             matches!(self.sig_status, Some(SignatureStatus::Verified { self_signed: true, .. }));
 
         // Replace the certificate's subjectPublicKeyInfo with the new key.
-        if let Err(e) = self.install_new_public_key(&spki, &pkcs8, alg, self_signed) {
+        // `pkcs8` may be advanced in place for a stateful (XMSS) key.
+        if let Err(e) = self.install_new_public_key(&spki, &mut pkcs8, alg, self_signed) {
             self.mode = Mode::Browse;
             self.status = format!("could not modify the public key: {}", e);
             return;
         }
 
-        // Resign each selected issued object with the key.
+        // Resign each selected issued object with the key, threading a
+        // stateful key's advancing state from one signature to the next.
         let mut resigned = 0usize;
         let mut failures = Vec::new();
         for path in &selected_issued {
             match resign_issued_file(path, alg, &pkcs8) {
-                Ok(()) => resigned += 1,
+                Ok(updated) => {
+                    if let Some(updated) = updated {
+                        pkcs8 = updated;
+                    }
+                    resigned += 1;
+                }
                 Err(e) => failures.push(format!("{}: {}", file_name_string(path), e)),
+            }
+        }
+
+        // Persist the stateful key's final state so a later session cannot
+        // reuse a one-time-signature index. `pkcs8` now holds the last state.
+        if let Some(target) = &state_target {
+            if let Err(e) = target.write(&pkcs8) {
+                failures.push(format!("key state not saved ({}): {}", target.describe(), e));
             }
         }
 
@@ -2892,10 +2965,14 @@ impl App {
     /// Splice the `SubjectPublicKeyInfo` `spki` into the open certificate,
     /// re-signing the certificate itself with `pkcs8` when it is self-signed (so
     /// it stays valid under the new key). Leaves the document dirty for `save`.
+    ///
+    /// `pkcs8` is `&mut` because signing may advance a stateful (XMSS) key's
+    /// one-time-signature index: on return it holds the updated key, which
+    /// the caller persists.
     fn install_new_public_key(
         &mut self,
         spki: &[u8],
-        pkcs8: &[u8],
+        pkcs8: &mut Vec<u8>,
         alg: keygen::KeyAlgorithm,
         self_signed: bool,
     ) -> Result<(), String> {
@@ -2925,7 +3002,10 @@ impl App {
             let der = ber::encode_forest(&self.roots);
             let signable =
                 x509::parse_signable(&self.roots, &der).ok_or("re-encoded document is not a certificate")?;
-            let sig = verify::sign(alg.sig_alg_oid(), pkcs8, &signable.tbs)?;
+            let (sig, updated) = verify::sign_stateful(alg.sig_alg_oid(), pkcs8, &signable.tbs)?;
+            if let Some(updated) = updated {
+                *pkcs8 = updated;
+            }
             let sig_node = node_at_mut(&mut self.roots, &paths.outer_sig).ok_or("signature node missing")?;
             sig_node.value = std::iter::once(0u8).chain(sig).collect();
             sig_node.children.clear();
@@ -4940,7 +5020,45 @@ fn normalize_file_path(path: &Path) -> (PathBuf, PathBuf) {
 /// and install the new signature. The file's original container (DER/PEM/…) is
 /// preserved. Errors — a bad file, a key/algorithm mismatch — leave the file
 /// untouched.
-fn resign_issued_file(path: &Path, alg: keygen::KeyAlgorithm, key_pkcs8: &[u8]) -> Result<(), String> {
+/// Where the advanced state of a stateful (XMSS) key is written back after a
+/// re-key signs with it, so a later session cannot reuse a one-time-signature
+/// index. The key is always a raw-DER key file (plaintext, or PBES2-encrypted
+/// when `password` is non-empty); PEM or PKCS#12 sources set `persistable`
+/// false and the caller warns instead.
+struct StatefulKeyTarget {
+    path: PathBuf,
+    /// Re-encryption password; empty means write the plaintext PKCS#8.
+    password: Vec<u8>,
+    persistable: bool,
+}
+
+impl StatefulKeyTarget {
+    /// Write `pkcs8` (the key's final state) to the target file, re-encrypting
+    /// under `password` when set. Errors if the source cannot hold the state
+    /// (see `persistable`).
+    fn write(&self, pkcs8: &[u8]) -> Result<(), String> {
+        if !self.persistable {
+            return Err("its container cannot store the updated state — do not reuse this key"
+                .to_string());
+        }
+        let der = keygen::encrypt_key_file_der(pkcs8, &self.password)?;
+        std::fs::write(&self.path, der).map_err(|e| e.to_string())
+    }
+
+    fn describe(&self) -> String {
+        file_name_string(&self.path)
+    }
+}
+
+/// Re-sign the certificate/CRL at `path` with `key_pkcs8` under `alg`,
+/// writing it back in place. Returns the key's updated bytes when signing
+/// advanced a stateful (XMSS) key's state (else `None`), so the caller can
+/// thread the state into the next signature.
+fn resign_issued_file(
+    path: &Path,
+    alg: keygen::KeyAlgorithm,
+    key_pkcs8: &[u8],
+) -> Result<Option<Vec<u8>>, String> {
     let raw = std::fs::read(path).map_err(|e| e.to_string())?;
     let (der, container) = input::load(&raw).map_err(|e| e.to_string())?;
     let mut roots = ber::parse_forest(&der, 0).map_err(|e| e.to_string())?;
@@ -4959,7 +5077,7 @@ fn resign_issued_file(path: &Path, alg: keygen::KeyAlgorithm, key_pkcs8: &[u8]) 
     let updated = ber::encode_forest(&roots);
     let mut roots = ber::parse_forest(&updated, 0).map_err(|e| e.to_string())?;
     let signable = x509::parse_signable(&roots, &updated).ok_or("not a signed object after edit")?;
-    let sig = verify::sign(alg.sig_alg_oid(), key_pkcs8, &signable.tbs)?;
+    let (sig, updated_key) = verify::sign_stateful(alg.sig_alg_oid(), key_pkcs8, &signable.tbs)?;
     let sig_node = node_at_mut(&mut roots, &outer_sig).ok_or("signature node missing")?;
     sig_node.value = std::iter::once(0u8).chain(sig).collect();
     sig_node.children.clear();
@@ -4967,7 +5085,8 @@ fn resign_issued_file(path: &Path, alg: keygen::KeyAlgorithm, key_pkcs8: &[u8]) 
 
     let final_der = ber::encode_forest(&roots);
     let out = input::wrap(&final_der, &container);
-    std::fs::write(path, out).map_err(|e| e.to_string())
+    std::fs::write(path, out).map_err(|e| e.to_string())?;
+    Ok(updated_key)
 }
 
 /// The public-key identity of the plaintext private key in `roots`. Tries the
@@ -5194,10 +5313,14 @@ const OID_ECDSA_SHA256: &[u64] = &[1, 2, 840, 10045, 4, 3, 2];
 const OID_ECDSA_SHA384: &[u64] = &[1, 2, 840, 10045, 4, 3, 3];
 const OID_SHA256_RSA: &[u64] = &[1, 2, 840, 113549, 1, 1, 11];
 
-/// Derive the `SubjectPublicKeyInfo` DER of a private key given as PKCS#8,
-/// using OpenSSL (works for every supported algorithm, including keys whose
-/// public part is not embedded in the private key).
+/// Derive the `SubjectPublicKeyInfo` DER of a private key given as PKCS#8.
+/// Uses OpenSSL for every algorithm it supports (including keys whose public
+/// part is not embedded in the private key); an XMSS key, which OpenSSL
+/// cannot load, is derived through the Botan backend instead.
 fn spki_der_from_pkcs8(pkcs8: &[u8]) -> Option<Vec<u8>> {
+    if verify::pkcs8_is_xmss(pkcs8) {
+        return crate::xmss::spki_from_pkcs8(pkcs8);
+    }
     openssl::pkey::PKey::private_key_from_pkcs8(pkcs8).ok()?.public_key_to_der().ok()
 }
 
@@ -5206,6 +5329,11 @@ fn spki_der_from_pkcs8(pkcs8: &[u8]) -> Option<Vec<u8>> {
 /// (and, for EC, the named curve) to a signature algorithm — the value the
 /// dialog matches against the chosen algorithm's `sig_alg_oid`.
 fn spki_signature_alg_of_pkcs8(pkcs8: &[u8]) -> Option<Vec<u64>> {
+    // XMSS: the signature algorithm is the key OID itself (OpenSSL can't
+    // load the key to derive it).
+    if verify::pkcs8_is_xmss(pkcs8) {
+        return Some(crate::xmss::XMSS_OID.to_vec());
+    }
     let pkey = openssl::pkey::PKey::private_key_from_pkcs8(pkcs8).ok()?;
     let spki = pkey.public_key_to_der().ok()?;
     let roots = ber::parse_forest(&spki, 0).ok()?;
@@ -8024,6 +8152,57 @@ mod tests {
         assert!(
             cert_verifies_under(&dir.join("intermediate_ca.der"), s.pubkey.as_ref().unwrap()),
             "intermediate verifies under the new 512-bit RSA root key"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rekeying_to_xmss_signs_verifies_and_persists_the_advanced_state() {
+        // Re-key the self-signed root to XMSS (Botan backend). The height-10
+        // parameter set generates in well under a second.
+        let dir = copy_chain("pk-xmss");
+        let mut app = open_real_file(&dir.join("root_ca.der"));
+        app.start_rekey();
+        let xmss = keygen::KeyAlgorithm::Xmss(0); // XMSS-SHA2_10_256
+        assert_eq!(xmss.sig_alg_oid(), crate::xmss::XMSS_OID);
+        if let Mode::EditPubKey(ref mut s) = app.mode {
+            s.select_algorithm(xmss);
+            s.filename = "root_xmss.key".to_string();
+            s.filename_auto = false;
+        }
+        app.submit_pubkey();
+        assert!(matches!(app.mode, Mode::Browse), "status: {}", app.status);
+
+        // The rekeyed self-signed root uses the XMSS signature algorithm and
+        // verifies under its own new key.
+        let der = ber::encode_forest(&app.roots);
+        let s = x509::parse_signable(&app.roots, &der).unwrap();
+        assert_eq!(s.sig_alg, crate::xmss::XMSS_OID);
+        assert!(verify::verify_signature(&s.sig_alg, s.pubkey.as_ref().unwrap(), &s.tbs, &s.signature));
+
+        // The issued intermediate was resigned on disk under the XMSS key.
+        assert!(
+            cert_verifies_under(&dir.join("intermediate_ca.der"), s.pubkey.as_ref().unwrap()),
+            "intermediate verifies under the new XMSS root key"
+        );
+
+        // The written key file holds the ADVANCED state: the re-key signed the
+        // self-signed cert plus two issued objects (intermediate + CRL), so the
+        // on-disk key's next index is past those. Signing once more from the
+        // file must not collide with the certificate's signature — i.e. its
+        // leaf index differs. The XMSS signature's first 4 bytes are the OTS
+        // leaf index (big-endian), which is what state advancement changes.
+        let key_path = dir.join("root_xmss.key");
+        let file_pkcs8 = read_plaintext_key_pkcs8(&key_path).expect("XMSS key file is plaintext");
+        assert!(verify::pkcs8_is_xmss(&file_pkcs8));
+        let (fresh_sig, _) = crate::xmss::sign(&file_pkcs8, &s.tbs).unwrap();
+        let cert_leaf = u32::from_be_bytes(s.signature[..4].try_into().unwrap());
+        let file_leaf = u32::from_be_bytes(fresh_sig[..4].try_into().unwrap());
+        assert!(
+            file_leaf > cert_leaf,
+            "persisted key state must be past the re-key's signatures: file index {} vs cert index {}",
+            file_leaf,
+            cert_leaf
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
