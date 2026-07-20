@@ -46,6 +46,10 @@ use crate::verify::{FileRelations, SignatureStatus};
 
 /// Bytes of hex shown in the browse-mode content pane before truncating.
 const CONTENT_HEX_LIMIT: usize = 4096;
+/// Total width of one [`hex_dump_lines`] line: the offset column (8 hex
+/// digits + 2 spaces), the hex column (47 chars padded + 2 spaces) and the
+/// `|…|` ASCII gutter (1 + 16 + 1). Long `Decoded` values wrap to this width.
+const HEX_DUMP_LINE_WIDTH: usize = 10 + 47 + 2 + 1 + 16 + 1;
 const DECRYPTED_LOCKED_LABEL: &str = "🔒 decrypted content not available";
 const DECRYPTED_UNLOCKED_PREFIX: &str = "🔓 decrypted: ";
 
@@ -1424,6 +1428,38 @@ fn summary(node: &Node) -> String {
     if text.is_empty() { text } else { format!(" {}", text) }
 }
 
+/// The content pane's `Decoded` line(s) for a node, empty when there is
+/// nothing to decode (constructed nodes, empty values). A long INTEGER's
+/// decimal value (e.g. an RSA modulus) is wrapped to the width of the hex
+/// dump below it, with continuation lines indented to align under the value;
+/// every other value stays on a single line.
+fn decoded_lines(node: &Node) -> Vec<Line<'static>> {
+    const LABEL: &str = "Decoded ";
+    let decoded = summary(node);
+    let text = decoded.trim();
+    if text.is_empty() || node.constructed {
+        return Vec::new();
+    }
+    let value_w = HEX_DUMP_LINE_WIDTH - LABEL.len();
+    if !node.is_universal(TAG_INTEGER) || text.chars().count() <= value_w {
+        return vec![Line::from(vec![
+            Span::styled(LABEL, Style::new().dim()),
+            Span::raw(text.to_string()),
+        ])];
+    }
+    wrap_text(text, value_w)
+        .into_iter()
+        .enumerate()
+        .map(|(i, chunk)| {
+            if i == 0 {
+                Line::from(vec![Span::styled(LABEL, Style::new().dim()), Span::raw(chunk)])
+            } else {
+                Line::from(Span::raw(format!("{}{}", " ".repeat(LABEL.len()), chunk)))
+            }
+        })
+        .collect()
+}
+
 /// Dot notation and, when known, the full textual resolution for an OID node.
 fn oid_details(node: &Node) -> Option<(String, Option<String>)> {
     if !node.is_universal(TAG_OID) {
@@ -2106,13 +2142,7 @@ fn draw_content_browse(frame: &mut Frame, app: &App, area: Rect) {
                 Style::new().fg(Color::Yellow),
             )));
         }
-        let decoded = summary(node);
-        if !decoded.trim().is_empty() && !node.constructed {
-            lines.push(Line::from(vec![
-                Span::styled("Decoded ", Style::new().dim()),
-                Span::raw(decoded.trim().to_string()),
-            ]));
-        }
+        lines.extend(decoded_lines(node));
         if let Some((dotted, long_name)) = oid_details(node) {
             lines.push(Line::from(vec![
                 Span::styled("OID     ", Style::new().dim()),
@@ -2822,6 +2852,53 @@ mod tests {
                 app.browser.selected_entry().map(|e| e.name.clone())
             );
         }
+    }
+
+    #[test]
+    fn long_integer_decoded_value_wraps_to_the_hex_dump_width() {
+        // A 257-octet INTEGER (an RSA-2048 modulus with its leading 0x00):
+        // its ~617-digit decimal expansion far exceeds one hex-dump line.
+        let mut der = vec![0x02, 0x82, 0x01, 0x01, 0x00];
+        der.extend(std::iter::repeat(0xAB).take(256));
+        let roots = parse_forest(&der, 0).unwrap();
+        let lines = decoded_lines(&roots[0]);
+        assert!(lines.len() > 1, "a long modulus needs several lines");
+        let flat: Vec<String> = lines
+            .iter()
+            .map(|l| l.spans.iter().map(|s| s.content.as_ref()).collect::<String>())
+            .collect();
+        assert!(flat[0].starts_with("Decoded "));
+        for (i, line) in flat.iter().enumerate() {
+            assert!(
+                line.chars().count() <= HEX_DUMP_LINE_WIDTH,
+                "line {} wider than the hex dump: {} chars",
+                i,
+                line.chars().count()
+            );
+            if i > 0 {
+                assert!(
+                    line.starts_with("        ") && !line[8..].starts_with(' '),
+                    "continuation lines align under the value: {:?}",
+                    line
+                );
+            }
+        }
+        // Full lines are exactly the hex dump's width, and reassembling the
+        // chunks yields the whole decimal value — nothing is lost.
+        assert_eq!(flat[0].chars().count(), HEX_DUMP_LINE_WIDTH);
+        // Every line carries an 8-char prefix: the "Decoded " label or the
+        // matching indent.
+        let digits: String = flat.iter().map(|l| &l[8..]).collect();
+        assert_eq!(digits, crate::ber::integer_decimal(&roots[0].value).unwrap());
+    }
+
+    #[test]
+    fn short_decoded_integers_stay_on_one_line() {
+        let roots = parse_forest(&[0x02, 0x01, 0x2A], 0).unwrap();
+        let lines = decoded_lines(&roots[0]);
+        assert_eq!(lines.len(), 1);
+        let text: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(text, "Decoded 42");
     }
 
     #[test]
