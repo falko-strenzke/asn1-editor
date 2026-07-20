@@ -7828,7 +7828,20 @@ mod tests {
     }
 
     fn tmp_dir(name: &str) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("asn1-editor-app-test-{}-{}", name, std::process::id()));
+        // A per-call counter keeps the directory unique even when several
+        // tests pass the same `name` (e.g. the CMS tests all use the
+        // "enveloped.der" fixture). Without it those tests share one path and,
+        // run in parallel, clobber each other's files — an intermittent
+        // failure that only reproduces under multi-threaded `cargo test`.
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let unique = COUNTER.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "asn1-editor-app-test-{}-{}-{}",
+            name,
+            std::process::id(),
+            unique
+        ));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         dir
