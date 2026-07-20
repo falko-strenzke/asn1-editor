@@ -29,6 +29,7 @@ use crate::cost;
 use crate::input::{self, Container};
 use crate::keygen;
 use crate::pathval::{self, PathStatus};
+use crate::pathval_botan;
 use crate::pkcs12;
 use crate::pkcs8;
 use crate::spec::{self, Identification, Label, SpecDb};
@@ -1524,6 +1525,10 @@ pub struct App {
     /// document, if it is a certificate. Recomputed on selection and whenever
     /// the trust set changes.
     pub path_status: Option<PathStatus>,
+    /// The same path validation as [`Self::path_status`] but via the Botan
+    /// library — a second, independent opinion shown alongside it. Computed
+    /// from the same inputs at the same time.
+    pub path_status_botan: Option<pathval_botan::BotanPathStatus>,
     /// All signed objects (certs + CRLs) found in the browser tree on
     /// startup — the source for both `ca_index` and the browser relation
     /// graph. Static snapshot of the on-disk state.
@@ -1615,6 +1620,7 @@ impl App {
             sig_status: None,
             trusted_certs: BTreeSet::new(),
             path_status: None,
+            path_status_botan: None,
             signables,
             cms_files,
             browser_relations: FileRelations::default(),
@@ -1668,6 +1674,7 @@ impl App {
             sig_status: None,
             trusted_certs: BTreeSet::new(),
             path_status: None,
+            path_status_botan: None,
             signables,
             cms_files,
             browser_relations: FileRelations::default(),
@@ -1726,6 +1733,7 @@ impl App {
             sig_status: None,
             trusted_certs: BTreeSet::new(),
             path_status: None,
+            path_status_botan: None,
             signables: Vec::new(),
             cms_files: Vec::new(),
             browser_relations: FileRelations::default(),
@@ -3269,6 +3277,7 @@ impl App {
         };
         let Some(target_der) = target_der else {
             self.path_status = None;
+            self.path_status_botan = None;
             return;
         };
         let mut trusted = Vec::new();
@@ -3296,6 +3305,8 @@ impl App {
             }
         }
         self.path_status = Some(pathval::validate(&target_der, &trusted, &untrusted, &crls));
+        self.path_status_botan =
+            Some(pathval_botan::validate(&target_der, &trusted, &untrusted, &crls));
     }
 
     /// `t`: toggle whether the certificate selected in the browser is a trust
@@ -7768,6 +7779,24 @@ mod tests {
     }
 
     #[test]
+    fn botan_path_validation_runs_alongside_openssl() {
+        use crate::pathval_botan::BotanPathStatus;
+        let mut app = open_real_file(&chain("server.der"));
+        // No anchor: both backends report an invalid path.
+        assert!(matches!(app.path_status, Some(PathStatus::Invalid { .. })));
+        assert!(matches!(app.path_status_botan, Some(BotanPathStatus::Invalid { .. })));
+        // Trust the root: both backends now accept the chain.
+        browser_select_by_name(&mut app, "root_ca.der");
+        app.toggle_trust();
+        assert!(matches!(app.path_status, Some(PathStatus::Valid { .. })));
+        assert_eq!(
+            app.path_status_botan,
+            Some(BotanPathStatus::Valid),
+            "Botan should also validate the SLH-DSA chain"
+        );
+    }
+
+    #[test]
     fn a_revoked_leaf_certificate_shows_a_revoked_path() {
         // Open the leaf in the revoked-leaf folder and trust the root; the
         // intermediate's CRL (also in the folder) revokes the leaf.
@@ -8378,14 +8407,22 @@ mod tests {
         await_rekey(&mut app);
         assert!(matches!(app.mode, Mode::Browse), "status: {}", app.status);
 
-        // The rekeyed self-signed root uses the XMSS signature algorithm and
-        // verifies under its own new key.
+        // The rekeyed self-signed root uses the RFC 9802 XMSS OID in both its
+        // signatureAlgorithm and its subjectPublicKeyInfo, and verifies under
+        // its own new key.
         let der = ber::encode_forest(&app.roots);
         let s = x509::parse_signable(&app.roots, &der).unwrap();
-        assert_eq!(s.sig_alg, crate::xmss::XMSS_OID);
+        assert_eq!(s.sig_alg, &[1, 3, 6, 1, 5, 5, 7, 6, 34], "RFC 9802 signatureAlgorithm");
+        assert_eq!(s.pubkey_alg.as_deref(), Some([1, 3, 6, 1, 5, 5, 7, 6, 34].as_slice()), "RFC 9802 SPKI");
         assert!(verify::verify_signature(&s.sig_alg, s.pubkey.as_ref().unwrap(), &s.tbs, &s.signature));
 
-        // The issued intermediate was resigned on disk under the XMSS key.
+        // The issued intermediate was resigned on disk under the XMSS key, and
+        // it too carries the RFC 9802 signatureAlgorithm OID.
+        let (inter_der, _) =
+            input::load(&std::fs::read(dir.join("intermediate_ca.der")).unwrap()).unwrap();
+        let inter_roots = ber::parse_forest(&inter_der, 0).unwrap();
+        let inter = x509::parse_signable(&inter_roots, &inter_der).unwrap();
+        assert_eq!(inter.sig_alg, &[1, 3, 6, 1, 5, 5, 7, 6, 34], "issued cert uses RFC 9802 OID");
         assert!(
             cert_verifies_under(&dir.join("intermediate_ca.der"), s.pubkey.as_ref().unwrap()),
             "intermediate verifies under the new XMSS root key"

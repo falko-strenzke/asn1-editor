@@ -19,10 +19,20 @@
 //!
 //! Botan serializes XMSS keys in standard containers: the private key as a
 //! PKCS#8 `PrivateKeyInfo` and the public key as a `SubjectPublicKeyInfo`,
-//! both under the ETSI/BSI `id-alg-xmss-hashsig` OID [`XMSS_OID`] with the
-//! raw RFC 8391 key bytes inside. That lets XMSS keys flow through the same
-//! `(pkcs8, spki)` plumbing as every other algorithm; only the code paths
-//! that hand keys to OpenSSL or `aws-lc-rs` need to branch here instead.
+//! both carrying the raw RFC 8391 key bytes. That lets XMSS keys flow through
+//! the same `(pkcs8, spki)` plumbing as every other algorithm; only the code
+//! paths that hand keys to OpenSSL or `aws-lc-rs` need to branch here instead.
+//!
+//! **OID translation.** Botan uses the ETSI/ISARA `id-alg-xmss-hashsig` OID
+//! ([`XMSS_OID_BOTAN`]) in the keys it produces, but RFC 9802 assigns XMSS a
+//! *different* OID for X.509 use ([`XMSS_OID`], `1.3.6.1.5.5.7.6.34`). So the
+//! public keys this module hands back for splicing into certificates — from
+//! [`generate`] and [`spki_from_pkcs8`] — are re-encoded under the RFC 9802
+//! OID, and the certificate/CRL `signatureAlgorithm` uses it too (via
+//! `keygen`). Private-key *files* keep Botan's native OID so Botan can load
+//! them, and [`verify`] rebuilds the SPKI it feeds Botan under that native OID.
+//! Only the algorithm OID changes across the boundary; the public-key bytes,
+//! and hence the key↔certificate identity, are unaffected.
 //!
 //! **State.** XMSS is stateful: each signature consumes a one-time-signature
 //! index, and reusing an index is catastrophic (two different messages under
@@ -36,16 +46,32 @@
 
 use crate::ber;
 
-/// The XMSS signature/key algorithm OID used by Botan in both PKCS#8 and
-/// `SubjectPublicKeyInfo`: `0.4.0.127.0.15.1.1.13.0`, `id-alg-xmss-hashsig`
-/// from the ETSI/BSI arc (draft-vangeest-x509-hash-sigs). As with Ed25519
-/// and the NIST PQ algorithms, the same OID doubles as the X.509
-/// `signatureAlgorithm`.
-pub const XMSS_OID: &[u64] = &[0, 4, 0, 127, 0, 15, 1, 1, 13, 0];
+/// The XMSS algorithm OID this tool puts into X.509 objects — the
+/// `id-alg-xmss-hashsig` of **RFC 9802** (June 2025), `1.3.6.1.5.5.7.6.34`
+/// under the PKIX `algorithms` arc. It is used, with the parameters field
+/// absent, both in a certificate's `SubjectPublicKeyInfo` AlgorithmIdentifier
+/// and in the certificate/CRL `signatureAlgorithm` (as with Ed25519 and the
+/// NIST PQ algorithms, the same OID serves both).
+///
+/// Botan, however, encodes XMSS keys under a *different* OID (see
+/// [`XMSS_OID_BOTAN`]); the two are translated at the boundary — see the
+/// module docs.
+pub const XMSS_OID: &[u64] = &[1, 3, 6, 1, 5, 5, 7, 6, 34];
 
-/// Whether `arcs` is the XMSS algorithm OID.
+/// The XMSS OID Botan emits and understands: `0.4.0.127.0.15.1.1.13.0`,
+/// `id-alg-xmss-hashsig` from the ETSI/ISARA arc (draft-vangeest-x509-hash-sigs).
+/// Botan can only load keys carrying this OID, so private-key files stay in
+/// this native encoding while the X.509 objects use the RFC 9802 [`XMSS_OID`].
+/// The two SPKIs differ only in the algorithm OID; the public-key BIT STRING
+/// is identical.
+pub const XMSS_OID_BOTAN: &[u64] = &[0, 4, 0, 127, 0, 15, 1, 1, 13, 0];
+
+/// Whether `arcs` is an XMSS algorithm OID — the RFC 9802 OID this tool writes
+/// or the Botan-native OID a private-key file (or a Botan-produced object)
+/// carries. Accepting both keeps signing, verification and key loading working
+/// across the translation boundary.
 pub fn is_xmss_oid(arcs: &[u64]) -> bool {
-    arcs == XMSS_OID
+    arcs == XMSS_OID || arcs == XMSS_OID_BOTAN
 }
 
 fn rng() -> Result<botan::RandomNumberGenerator, String> {
@@ -63,7 +89,9 @@ fn load_privkey(pkcs8: &[u8]) -> Result<botan::Privkey, String> {
 
 /// Generate an XMSS key pair for a Botan parameter-set name (e.g.
 /// `"XMSS-SHA2_10_256"`). Returns `(pkcs8, spki)` DER like the OpenSSL
-/// generation paths in `keygen.rs`.
+/// generation paths in `keygen.rs`: the private key keeps Botan's native OID
+/// (so Botan can load it), while the public key is re-encoded under the RFC
+/// 9802 [`XMSS_OID`] for use in X.509 certificates.
 pub fn generate(params: &str) -> Result<(Vec<u8>, Vec<u8>), String> {
     let mut rng = rng()?;
     let key = botan::Privkey::create("XMSS", params, &mut rng)
@@ -71,10 +99,11 @@ pub fn generate(params: &str) -> Result<(Vec<u8>, Vec<u8>), String> {
     let pkcs8 = key
         .der_encode()
         .map_err(|e| format!("XMSS private-key encoding failed: {:?}", e))?;
-    let spki = key
+    let botan_spki = key
         .pubkey()
         .and_then(|p| p.der_encode())
         .map_err(|e| format!("XMSS public-key encoding failed: {:?}", e))?;
+    let spki = spki_rfc9802(&botan_spki).ok_or("XMSS public key has an unexpected shape")?;
     Ok((pkcs8, spki))
 }
 
@@ -94,20 +123,22 @@ pub fn sign(pkcs8: &[u8], msg: &[u8]) -> Result<(Vec<u8>, Vec<u8>), String> {
 
 /// Verify an XMSS signature over `msg` under the raw `subjectPublicKey`
 /// bytes (unused-bits octet already stripped). The `SubjectPublicKeyInfo`
-/// is rebuilt around them because Botan parses a whole SPKI.
+/// is rebuilt around them — under Botan's native OID, since Botan parses the
+/// whole SPKI and only recognizes its own OID.
 pub fn verify(pubkey_bits: &[u8], msg: &[u8], sig: &[u8]) -> bool {
-    let Some(spki) = spki_der(pubkey_bits) else { return false };
+    let Some(spki) = spki_der(XMSS_OID_BOTAN, pubkey_bits) else { return false };
     let Ok(key) = botan::Pubkey::load_der(&spki) else { return false };
     let Ok(mut verifier) = botan::Verifier::new(&key, "") else { return false };
     verifier.update(msg).is_ok() && verifier.finish(sig).unwrap_or(false)
 }
 
-/// Build the `SubjectPublicKeyInfo` DER — `SEQUENCE { SEQUENCE { OID },
-/// subjectPublicKey BIT STRING }` — around raw XMSS public-key bytes.
-fn spki_der(pubkey_bits: &[u8]) -> Option<Vec<u8>> {
-    let dotted = XMSS_OID.iter().map(|a| a.to_string()).collect::<Vec<_>>().join(".");
-    let oid = ber::univ(ber::TAG_OID, false, ber::encode_oid(&dotted).ok()?);
-    let alg_id = ber::univ_seq(vec![oid]);
+/// Build a `SubjectPublicKeyInfo` DER — `SEQUENCE { SEQUENCE { OID },
+/// subjectPublicKey BIT STRING }` — around raw XMSS public-key bytes, under
+/// `oid` (the parameters field absent, as RFC 9802 requires).
+fn spki_der(oid: &[u64], pubkey_bits: &[u8]) -> Option<Vec<u8>> {
+    let dotted = oid.iter().map(|a| a.to_string()).collect::<Vec<_>>().join(".");
+    let oid_node = ber::univ(ber::TAG_OID, false, ber::encode_oid(&dotted).ok()?);
+    let alg_id = ber::univ_seq(vec![oid_node]);
     let mut bit_value = Vec::with_capacity(pubkey_bits.len() + 1);
     bit_value.push(0); // unused-bits octet
     bit_value.extend_from_slice(pubkey_bits);
@@ -115,15 +146,35 @@ fn spki_der(pubkey_bits: &[u8]) -> Option<Vec<u8>> {
     Some(ber::encode_node(&ber::univ_seq(vec![alg_id, bit_string])))
 }
 
+/// The raw `subjectPublicKey` bytes (unused-bits octet stripped) of a
+/// `SubjectPublicKeyInfo` DER, regardless of its algorithm OID.
+fn pubkey_bits_of_spki(spki: &[u8]) -> Option<Vec<u8>> {
+    let roots = ber::parse_forest(spki, 0).ok()?;
+    let bit = roots.first()?.children.last()?;
+    if !bit.is_universal(ber::TAG_BIT_STRING) || bit.value.is_empty() {
+        return None;
+    }
+    Some(bit.value[1..].to_vec()) // strip the unused-bits octet
+}
+
+/// Re-encode a Botan `SubjectPublicKeyInfo` under the RFC 9802 [`XMSS_OID`],
+/// for splicing into an X.509 certificate. Only the algorithm OID changes.
+fn spki_rfc9802(botan_spki: &[u8]) -> Option<Vec<u8>> {
+    spki_der(XMSS_OID, &pubkey_bits_of_spki(botan_spki)?)
+}
+
 /// Whether `pkcs8` is a Botan-loadable XMSS private key.
 pub fn key_usable(pkcs8: &[u8]) -> bool {
     load_privkey(pkcs8).is_ok()
 }
 
-/// The `SubjectPublicKeyInfo` DER of an XMSS private key (PKCS#8), for the
-/// code paths that derive public keys with OpenSSL (which cannot load XMSS).
+/// The `SubjectPublicKeyInfo` DER of an XMSS private key (PKCS#8), under the
+/// RFC 9802 [`XMSS_OID`], for the code paths that derive public keys to splice
+/// into certificates (and which use OpenSSL for other algorithms — OpenSSL
+/// cannot load XMSS).
 pub fn spki_from_pkcs8(pkcs8: &[u8]) -> Option<Vec<u8>> {
-    load_privkey(pkcs8).ok()?.pubkey().and_then(|p| p.der_encode()).ok()
+    let botan_spki = load_privkey(pkcs8).ok()?.pubkey().and_then(|p| p.der_encode()).ok()?;
+    spki_rfc9802(&botan_spki)
 }
 
 /// Encrypt an XMSS PKCS#8 key under `password` as a standard PBES2
@@ -158,11 +209,14 @@ mod tests {
     #[test]
     fn generate_sign_verify_roundtrip_with_standard_encodings() {
         let (pkcs8, spki) = generate(FAST).unwrap();
-        // Both encodings are standard containers carrying the XMSS OID.
-        assert_eq!(pkcs8_alg_oid(&pkcs8), XMSS_OID);
+        // The private key keeps Botan's native OID (so Botan can load it)…
+        assert_eq!(pkcs8_alg_oid(&pkcs8), XMSS_OID_BOTAN);
+        // …while the public key for X.509 use carries the RFC 9802 OID, with
+        // the parameters field absent (AlgorithmIdentifier is a lone OID).
         let spki_roots = ber::parse_forest(&spki, 0).unwrap();
-        let spki_oid = ber::oid_arcs(&spki_roots[0].children[0].children[0].value).unwrap();
-        assert_eq!(spki_oid, XMSS_OID);
+        let alg_id = &spki_roots[0].children[0];
+        assert_eq!(alg_id.children.len(), 1, "parameters must be absent");
+        assert_eq!(ber::oid_arcs(&alg_id.children[0].value).unwrap(), XMSS_OID);
 
         let msg = b"a tbsCertificate stand-in";
         let (sig, _updated) = sign(&pkcs8, msg).unwrap();
@@ -170,7 +224,17 @@ mod tests {
         assert!(verify(&bits, msg, &sig));
         assert!(!verify(&bits, b"tampered", &sig), "a tampered message must not verify");
         assert!(key_usable(&pkcs8));
+        // The SPKI derived from the private key matches the generated one
+        // (same RFC 9802 OID, same public-key bytes).
         assert_eq!(spki_from_pkcs8(&pkcs8).unwrap(), spki);
+    }
+
+    #[test]
+    fn rfc9802_and_botan_oids_are_both_recognized_but_distinct() {
+        assert_eq!(XMSS_OID, &[1, 3, 6, 1, 5, 5, 7, 6, 34]);
+        assert_ne!(XMSS_OID, XMSS_OID_BOTAN);
+        assert!(is_xmss_oid(XMSS_OID) && is_xmss_oid(XMSS_OID_BOTAN));
+        assert!(!is_xmss_oid(&[1, 3, 6, 1, 5, 5, 7, 6, 35])); // XMSS^MT, not XMSS
     }
 
     #[test]

@@ -28,6 +28,7 @@ pub mod input;
 pub mod keygen;
 pub mod oid;
 pub mod pathval;
+pub mod pathval_botan;
 pub mod pkcs12;
 pub mod pkcs8;
 pub mod spec;

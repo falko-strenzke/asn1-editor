@@ -43,6 +43,7 @@ use crate::ber::{
 use crate::keygen;
 use crate::oid;
 use crate::pathval::PathStatus;
+use crate::pathval_botan::BotanPathStatus;
 use crate::verify::{FileRelations, SignatureStatus};
 
 /// Bytes of hex shown in the browse-mode content pane before truncating.
@@ -1613,6 +1614,80 @@ fn decoded_lines(node: &Node) -> Vec<Line<'static>> {
         .collect()
 }
 
+/// Render a labeled header field — a dim `label` followed by the styled
+/// `value` spans — wrapped so no line exceeds `width` display columns (the
+/// hex-dump width). The label sits on the first line; continuation lines are
+/// padded to the label width so the value stays in one column. Each span's
+/// style is preserved across wraps; wrapping breaks at spaces where possible
+/// and hard-breaks over-long tokens.
+fn header_field(label: &str, value: Vec<Span<'static>>, width: usize) -> Vec<Line<'static>> {
+    let label_w = label.chars().count();
+    let avail = width.saturating_sub(label_w).max(1);
+    let chars: Vec<(char, Style)> = value
+        .iter()
+        .flat_map(|s| {
+            let style = s.style;
+            s.content.chars().map(move |c| (c, style))
+        })
+        .collect();
+    wrap_styled_chars(&chars, avail)
+        .into_iter()
+        .enumerate()
+        .map(|(i, row)| {
+            let mut spans = Vec::with_capacity(row.len() + 1);
+            spans.push(if i == 0 {
+                Span::styled(label.to_string(), Style::new().dim())
+            } else {
+                Span::raw(" ".repeat(label_w))
+            });
+            // Coalesce runs of equal style back into spans.
+            let mut j = 0;
+            while j < row.len() {
+                let style = row[j].1;
+                let mut text = String::new();
+                while j < row.len() && row[j].1 == style {
+                    text.push(row[j].0);
+                    j += 1;
+                }
+                spans.push(Span::styled(text, style));
+            }
+            Line::from(spans)
+        })
+        .collect()
+}
+
+/// Greedy word-wrap a run of styled characters into rows of at most `width`
+/// columns, breaking at the last space when one fits and hard-breaking an
+/// over-long token otherwise. Styles ride along with their characters.
+fn wrap_styled_chars(chars: &[(char, Style)], width: usize) -> Vec<Vec<(char, Style)>> {
+    let width = width.max(1);
+    let mut rows: Vec<Vec<(char, Style)>> = Vec::new();
+    let mut cur: Vec<(char, Style)> = Vec::new();
+    for &(c, style) in chars {
+        if cur.len() >= width {
+            match cur.iter().rposition(|(ch, _)| *ch == ' ') {
+                // Break after the last space (dropped as the line break), but
+                // only if it leaves a non-empty first line.
+                Some(idx) if idx > 0 => {
+                    let mut tail = cur.split_off(idx);
+                    tail.remove(0); // the break space itself
+                    rows.push(std::mem::take(&mut cur));
+                    cur = tail;
+                }
+                _ => rows.push(std::mem::take(&mut cur)),
+            }
+        }
+        cur.push((c, style));
+    }
+    if !cur.is_empty() {
+        rows.push(cur);
+    }
+    if rows.is_empty() {
+        rows.push(Vec::new());
+    }
+    rows
+}
+
 /// Dot notation and, when known, the full textual resolution for an OID node.
 fn oid_details(node: &Node) -> Option<(String, Option<String>)> {
     if !node.is_universal(TAG_OID) {
@@ -2125,7 +2200,7 @@ pub fn length_layout_strings(node: &Node) -> Vec<String> {
 /// The signature verification result for the whole open document — shown
 /// once in the content pane header, right below "Spec", regardless of
 /// which node is currently selected.
-fn signature_status_line(status: &SignatureStatus) -> Line<'static> {
+fn signature_status_lines(status: &SignatureStatus, width: usize) -> Vec<Line<'static>> {
     let (text, style) = match status {
         SignatureStatus::Verified { issuer_path, issuer_summary, self_signed } => (
             if *self_signed {
@@ -2152,13 +2227,11 @@ fn signature_status_line(status: &SignatureStatus) -> Line<'static> {
             Style::new().fg(Color::Yellow),
         ),
     };
-    Line::from(vec![
-        Span::styled("Signature ", Style::new().dim()),
-        Span::styled(text, style),
-    ])
+    header_field("Signature ", vec![Span::styled(text, style)], width)
 }
 
-fn path_status_line(status: &PathStatus) -> Line<'static> {
+/// The OpenSSL path-validation field ([`PathStatus`]), under the given label.
+fn path_status_lines(label: &str, status: &PathStatus, width: usize) -> Vec<Line<'static>> {
     let (text, style) = match status {
         PathStatus::Valid { depth } => (
             format!("valid — path of {} certificate(s) to a trusted anchor", depth),
@@ -2175,10 +2248,32 @@ fn path_status_line(status: &PathStatus) -> Line<'static> {
             (format!("could not validate — {}", detail), Style::new().fg(Color::Yellow))
         }
     };
-    Line::from(vec![
-        Span::styled("Path      ", Style::new().dim()),
-        Span::styled(text, style),
-    ])
+    header_field(label, vec![Span::styled(text, style)], width)
+}
+
+/// The Botan path-validation field ([`BotanPathStatus`]), under the given
+/// label. Botan returns no chain depth, so a valid path is reported without one.
+fn botan_path_status_lines(
+    label: &str,
+    status: &BotanPathStatus,
+    width: usize,
+) -> Vec<Line<'static>> {
+    let (text, style) = match status {
+        BotanPathStatus::Valid => {
+            ("valid — path to a trusted anchor".to_string(), Style::new().fg(Color::Green))
+        }
+        BotanPathStatus::Revoked => (
+            "revoked — a certificate on the path is on a CRL".to_string(),
+            Style::new().fg(Color::Red).bold(),
+        ),
+        BotanPathStatus::Invalid { reason } => {
+            (format!("no valid path — {}", reason), Style::new().fg(Color::Red).bold())
+        }
+        BotanPathStatus::Error { detail } => {
+            (format!("could not validate — {}", detail), Style::new().fg(Color::Yellow))
+        }
+    };
+    header_field(label, vec![Span::styled(text, style)], width)
 }
 
 fn draw_content_browse(frame: &mut Frame, app: &App, area: Rect) {
@@ -2206,10 +2301,12 @@ fn draw_content_browse(frame: &mut Frame, app: &App, area: Rect) {
         };
         lines.push(Line::from(hint));
     } else if let Some(node) = app.selected_node() {
-        lines.push(Line::from(vec![
-            Span::styled("Type    ", Style::new().dim()),
-            Span::styled(node.type_name(), class_style(node)),
-        ]));
+        let w = HEX_DUMP_LINE_WIDTH;
+        lines.extend(header_field(
+            "Type    ",
+            vec![Span::styled(node.type_name(), class_style(node))],
+            w,
+        ));
         if let Some(row) = selected_row {
             if let Some(label) = app.label_for_row(row) {
                 let ident = match row.source {
@@ -2227,33 +2324,40 @@ fn draw_content_browse(frame: &mut Frame, app: &App, area: Rect) {
                 }
                 .expect("label implies identification");
                 let field = label.field.as_deref().unwrap_or("-");
-                lines.push(Line::from(vec![
-                    Span::styled("Spec    ", Style::new().dim()),
-                    Span::styled(field.to_string(), Style::new().fg(Color::LightCyan)),
-                    Span::raw(" : "),
-                    Span::styled(label.type_name.clone(), Style::new().fg(Color::LightGreen)),
-                    Span::styled(
-                        format!("   (document: {}, {})", ident.type_name, ident.source),
-                        Style::new().dim(),
-                    ),
-                ]));
+                lines.extend(header_field(
+                    "Spec    ",
+                    vec![
+                        Span::styled(field.to_string(), Style::new().fg(Color::LightCyan)),
+                        Span::raw(" : "),
+                        Span::styled(label.type_name.clone(), Style::new().fg(Color::LightGreen)),
+                        Span::styled(
+                            format!("   (document: {}, {})", ident.type_name, ident.source),
+                            Style::new().dim(),
+                        ),
+                    ],
+                    w,
+                ));
             }
         }
         if let Some(status) = &app.sig_status {
-            lines.push(signature_status_line(status));
+            lines.extend(signature_status_lines(status, w));
         }
         if let Some(status) = &app.path_status {
-            lines.push(path_status_line(status));
+            lines.extend(path_status_lines("Path/OpenSSL ", status, w));
+        }
+        if let Some(status) = &app.path_status_botan {
+            lines.extend(botan_path_status_lines("Path/Botan   ", status, w));
         }
         let ids = ber::identifier_octets(node.class, node.tag, node.constructed);
-        lines.push(Line::from(vec![
-            Span::styled("Tag     ", Style::new().dim()),
-            Span::raw(format!(
+        lines.extend(header_field(
+            "Tag     ",
+            vec![Span::raw(format!(
                 "identifier octet{}: {}",
                 if ids.len() == 1 { "" } else { "s" },
                 ber::hex_pairs(&ids)
-            )),
-        ]));
+            ))],
+            w,
+        ));
         // Bit values (row 1) and decoded meaning (row 3) stand out;
         // borders and labels stay dim.
         let diagram_style = |i: usize| match i {
@@ -2266,20 +2370,21 @@ fn draw_content_browse(frame: &mut Frame, app: &App, area: Rect) {
         }
         let plural = |n: usize| if n == 1 { "" } else { "s" };
         let len_octets = node_length_octets(node);
-        lines.push(Line::from(vec![
-            Span::styled("Length  ", Style::new().dim()),
-            Span::raw(format!(
+        lines.extend(header_field(
+            "Length  ",
+            vec![Span::raw(format!(
                 "length octet{}: {}",
                 plural(len_octets.len()),
                 ber::hex_pairs(&len_octets)
-            )),
-        ]));
+            ))],
+            w,
+        ));
         for (i, text) in length_layout_strings(node).into_iter().enumerate() {
             lines.push(Line::from(Span::styled(text, diagram_style(i))));
         }
-        lines.push(Line::from(vec![
-            Span::styled("Offset  ", Style::new().dim()),
-            Span::raw(format!(
+        lines.extend(header_field(
+            "Offset  ",
+            vec![Span::raw(format!(
                 "{}   header: {} byte{}   content: {} byte{}{}",
                 node.offset,
                 node.header_len,
@@ -2287,31 +2392,33 @@ fn draw_content_browse(frame: &mut Frame, app: &App, area: Rect) {
                 node.content_len,
                 plural(node.content_len),
                 if node.indefinite { "   (indefinite length)" } else { "" }
-            )),
-        ]));
+            ))],
+            w,
+        ));
         if node.encapsulates {
-            lines.push(Line::from(Span::styled(
-                "Encapsulates nested ASN.1 (shown as children in the tree)",
-                Style::new().fg(Color::Yellow),
-            )));
+            lines.extend(header_field(
+                "",
+                vec![Span::styled(
+                    "Encapsulates nested ASN.1 (shown as children in the tree)",
+                    Style::new().fg(Color::Yellow),
+                )],
+                w,
+            ));
         }
         lines.extend(decoded_lines(node));
         if let Some((dotted, long_name)) = oid_details(node) {
-            lines.push(Line::from(vec![
-                Span::styled("OID     ", Style::new().dim()),
-                Span::raw(dotted),
-            ]));
+            lines.extend(header_field("OID     ", vec![Span::raw(dotted)], w));
             if let Some(long_name) = long_name {
-                lines.push(Line::from(vec![
-                    Span::styled("Name    ", Style::new().dim()),
-                    Span::raw(long_name),
-                ]));
+                lines.extend(header_field("Name    ", vec![Span::raw(long_name)], w));
             }
         }
         // Plain-language interpretation of a recognised extension, shown
         // between the header information and the raw content octets.
         let extension_section = |heading: &str, body: Vec<String>| {
-            let inner_w = area.width.saturating_sub(2).max(20) as usize;
+            // Cap at the hex-dump width so these sections, like the header
+            // fields above, never run wider than the content below them.
+            let inner_w =
+                (area.width.saturating_sub(2) as usize).min(HEX_DUMP_LINE_WIDTH).max(20);
             let mut out = vec![
                 Line::default(),
                 Line::from(Span::styled(heading.to_string(), Style::new().fg(Color::LightCyan).bold())),
@@ -3060,6 +3167,51 @@ mod tests {
     }
 
     #[test]
+    fn header_field_wraps_within_width_and_preserves_label_and_styles() {
+        // A long multi-span value forces wrapping.
+        let value = vec![
+            Span::styled("commonName", Style::new().fg(Color::LightCyan)),
+            Span::raw(" : "),
+            Span::styled(
+                "a rather long resolved value that certainly exceeds the hex dump width by a fair margin",
+                Style::new().fg(Color::LightGreen),
+            ),
+        ];
+        let lines = header_field("Spec    ", value, HEX_DUMP_LINE_WIDTH);
+        assert!(lines.len() > 1, "the long value must wrap");
+        for (i, line) in lines.iter().enumerate() {
+            let text = line_text(line);
+            assert!(
+                text.chars().count() <= HEX_DUMP_LINE_WIDTH,
+                "line {} exceeds the hex width: {:?}",
+                i,
+                text
+            );
+            if i == 0 {
+                assert!(text.starts_with("Spec    "), "label on the first line");
+            } else {
+                // Continuation lines are padded to the label width, not labeled.
+                assert!(text.starts_with("        "), "continuation indent: {:?}", text);
+                assert!(!text.starts_with("Spec"), "no repeated label");
+            }
+        }
+        // The cyan/green styling survives wrapping (both colors still present).
+        let styles: Vec<Color> = lines
+            .iter()
+            .flat_map(|l| l.spans.iter())
+            .filter_map(|s| s.style.fg)
+            .collect();
+        assert!(styles.contains(&Color::LightCyan) && styles.contains(&Color::LightGreen));
+    }
+
+    #[test]
+    fn header_field_keeps_a_short_value_on_one_line() {
+        let lines = header_field("Type    ", vec![Span::raw("SEQUENCE")], HEX_DUMP_LINE_WIDTH);
+        assert_eq!(lines.len(), 1);
+        assert_eq!(line_text(&lines[0]), "Type    SEQUENCE");
+    }
+
+    #[test]
     fn rekey_dialog_shows_time_estimate_for_xmss_but_not_ecdsa() {
         use crate::input::Container;
         use ratatui::{backend::TestBackend, Terminal};
@@ -3093,6 +3245,27 @@ mod tests {
             buffer_text(term.backend().buffer()).contains('🕐'),
             "clock estimate should show for XMSS"
         );
+    }
+
+    #[test]
+    fn content_pane_shows_both_path_validation_fields() {
+        use crate::input::Container;
+        use ratatui::{backend::TestBackend, Terminal};
+        let chain = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("testdata/chain");
+        let path = chain.join("server.der");
+        let raw = std::fs::read(&path).unwrap();
+        let (der, _) = crate::input::load(&raw).unwrap();
+        let roots = parse_forest(&der, 0).unwrap();
+        let mut app =
+            App::new(path.clone(), path.clone(), Container::Raw, roots, der.len());
+        app.trusted_certs.insert(chain.join("root_ca.der"));
+        app.recompute_path_status();
+        app.select(0); // a node must be selected for the header to render
+        let mut term = Terminal::new(TestBackend::new(90, 40)).unwrap();
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let text = buffer_text(term.backend().buffer());
+        assert!(text.contains("Path/OpenSSL"), "OpenSSL path field:\n{text}");
+        assert!(text.contains("Path/Botan"), "Botan path field:\n{text}");
     }
 
     #[test]
@@ -3213,9 +3386,10 @@ mod tests {
         // the content-pane header, exactly like for a certificate.
         assert!(text.contains("Signature verified"), "signature line missing:\n{text}");
         assert!(
-            text.contains("Path") && text.contains("valid — path of"),
-            "path line missing:\n{text}"
+            text.contains("Path/OpenSSL") && text.contains("valid — path of"),
+            "OpenSSL path line missing:\n{text}"
         );
+        assert!(text.contains("Path/Botan"), "Botan path line missing:\n{text}");
     }
 
     #[test]

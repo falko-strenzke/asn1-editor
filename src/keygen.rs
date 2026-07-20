@@ -152,7 +152,7 @@ struct XmssDesc {
 
 /// The XMSS parameter sets, indexed by `KeyAlgorithm::Xmss(i)`, in the dialog
 /// display order: 192-bit, then 256-bit, then 512-bit. All share the single
-/// `id-alg-xmss-hashsig` X.509 OID (the concrete parameter set is carried in
+/// RFC 9802 `id-alg-xmss-hashsig` X.509 OID (the concrete parameter set is carried in
 /// the key bytes), so adding one needs no OID plumbing. The 192-bit sets are
 /// NIST SP 800-208's truncated-hash additions (SHA-256/192 and SHAKE256/192);
 /// the 256-bit and 512-bit (n=64, ~256-bit-security) sets are RFC 8391.
@@ -557,7 +557,8 @@ pub fn encrypt_key_file_der(pkcs8: &[u8], password: &[u8]) -> Result<Vec<u8>, St
     if password.is_empty() {
         return Ok(pkcs8.to_vec());
     }
-    if crate::verify::pkcs8_alg_arcs(pkcs8).as_deref() == Some(crate::xmss::XMSS_OID) {
+    // An XMSS key file carries Botan's native OID; recognize either XMSS OID.
+    if crate::verify::pkcs8_alg_arcs(pkcs8).as_deref().is_some_and(crate::xmss::is_xmss_oid) {
         let password = std::str::from_utf8(password)
             .map_err(|_| "the password is not valid UTF-8".to_string())?;
         return crate::xmss::encrypt_pkcs8(pkcs8, password);
