@@ -280,6 +280,53 @@ fn ec_private_key_is_identified() {
 }
 
 #[test]
+fn rsa_pkcs1_private_key_is_identified() {
+    // testdata/rsa_key_pkcs1.der is a bare PKCS#1 / RFC 8017 RSAPrivateKey
+    // ("RSA PRIVATE KEY" PEM body), not the PKCS#8 wrapping.
+    let db = rfc5280_db();
+    assert!(db.resolve("RSAPrivateKey").is_some());
+
+    let data = std::fs::read(manifest("testdata/rsa_key_pkcs1.der")).unwrap();
+    let roots = ber::parse_forest(&data, 0).unwrap();
+    let ident = spec::identify(&db, &roots).expect("RSA private key identified");
+
+    assert_eq!(ident.type_name, "RSAPrivateKey");
+    assert_eq!(ident.source, "rfc8017");
+
+    let label = |path: &[usize]| ident.labels.get(path).unwrap();
+    assert_eq!(label(&[0]).type_name, "RSAPrivateKey");
+    assert_eq!(label(&[0, 0]).field.as_deref(), Some("version"));
+    assert_eq!(label(&[0, 1]).field.as_deref(), Some("modulus"));
+    assert_eq!(label(&[0, 2]).field.as_deref(), Some("publicExponent"));
+    assert_eq!(label(&[0, 3]).field.as_deref(), Some("privateExponent"));
+    assert_eq!(label(&[0, 4]).field.as_deref(), Some("prime1"));
+    assert_eq!(label(&[0, 5]).field.as_deref(), Some("prime2"));
+    assert_eq!(label(&[0, 6]).field.as_deref(), Some("exponent1"));
+    assert_eq!(label(&[0, 7]).field.as_deref(), Some("exponent2"));
+    assert_eq!(label(&[0, 8]).field.as_deref(), Some("coefficient"));
+}
+
+#[test]
+fn pkcs8_rsa_key_labels_the_embedded_pkcs1_key() {
+    // A PKCS#8-wrapped RSA key: the RFC 8017 RSAPrivateKey inside the
+    // privateKey OCTET STRING is labeled through the encapsulation pass,
+    // like the EC key in pkcs8_private_key_is_identified.
+    let db = rfc5280_db();
+    let data = std::fs::read(manifest("testdata/keylink/key_rsa_pkcs8.der")).unwrap();
+    let roots = ber::parse_forest(&data, 0).unwrap();
+    let ident = spec::identify(&db, &roots).expect("PKCS#8 RSA key identified");
+    assert_eq!(ident.type_name, "OneAsymmetricKey");
+
+    let label = |path: &[usize]| ident.labels.get(path).unwrap();
+    assert_eq!(label(&[0, 2]).field.as_deref(), Some("privateKey"));
+    assert_eq!(label(&[0, 2, 0]).type_name, "RSAPrivateKey");
+    assert_eq!(label(&[0, 2, 0, 0]).field.as_deref(), Some("version"));
+    assert_eq!(label(&[0, 2, 0, 1]).field.as_deref(), Some("modulus"));
+    assert_eq!(label(&[0, 2, 0, 3]).field.as_deref(), Some("privateExponent"));
+    assert_eq!(label(&[0, 2, 0, 8]).field.as_deref(), Some("coefficient"));
+}
+
+#[test]
 fn unrelated_structure_is_not_misidentified_as_certificate() {
     // A PKCS#7 SignedData bundle is not a certificate or CRL.
     let db = rfc5280_db();

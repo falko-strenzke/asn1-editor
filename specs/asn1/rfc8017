@@ -1,0 +1,51 @@
+-- ASN.1 for the RSA private-key structure of RFC 8017 (November 2016),
+-- "PKCS #1: RSA Cryptography Specifications Version 2.2", Appendix A.1.2 /
+-- Appendix C — the PKCS#1 RSAPrivateKey ("RSA PRIVATE KEY" PEM), which is
+-- also what a PKCS#8 privateKey OCTET STRING carries for an RSA key.
+-- Source: https://www.rfc-editor.org/rfc/rfc8017.txt
+--
+-- Adaptations for this tool's subset parser and matching heuristic:
+--   * only the private-key types are reproduced. The rest of the Appendix C
+--     module (the OAEP/PSS algorithm-identifier machinery and its
+--     information object classes, which the parser does not implement, and
+--     the OID value assignments) is omitted.
+--   * RSAPublicKey is omitted deliberately: structurally it is just
+--     SEQUENCE { INTEGER, INTEGER }, which is indistinguishable from other
+--     encapsulated two-integer SEQUENCEs — most notably an ECDSA signature
+--     inside a certificate's signature BIT STRING — and bundling it would
+--     mislabel those.
+--   * Version drops its "(CONSTRAINED BY {...})" clause (the version must
+--     be multi(1) iff otherPrimeInfos is present), which the parser does
+--     not implement and which does not affect the DER structure.
+
+PKCS-1 { iso(1) member-body(2) us(840) rsadsi(113549) pkcs(1) pkcs-1(1)
+  modules(0) pkcs-1(3) }
+
+DEFINITIONS EXPLICIT TAGS ::=
+
+BEGIN
+
+RSAPrivateKey ::= SEQUENCE {
+    version           Version,
+    modulus           INTEGER,  -- n
+    publicExponent    INTEGER,  -- e
+    privateExponent   INTEGER,  -- d
+    prime1            INTEGER,  -- p
+    prime2            INTEGER,  -- q
+    exponent1         INTEGER,  -- d mod (p-1)
+    exponent2         INTEGER,  -- d mod (q-1)
+    coefficient       INTEGER,  -- (inverse of q) mod p
+    otherPrimeInfos   OtherPrimeInfos OPTIONAL
+}
+
+Version ::= INTEGER { two-prime(0), multi(1) }
+
+OtherPrimeInfos ::= SEQUENCE SIZE(1..MAX) OF OtherPrimeInfo
+
+OtherPrimeInfo ::= SEQUENCE {
+    prime             INTEGER,  -- ri
+    exponent          INTEGER,  -- di
+    coefficient       INTEGER   -- ti
+}
+
+END
