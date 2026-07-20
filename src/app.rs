@@ -17,11 +17,15 @@
 
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
+use std::sync::mpsc;
+use std::thread;
+use std::time::{Duration, Instant};
 
 use ratatui::widgets::ListState;
 
 use crate::ber::{self, Class, Node};
 use crate::browser::FileBrowser;
+use crate::cost;
 use crate::input::{self, Container};
 use crate::keygen;
 use crate::pathval::{self, PathStatus};
@@ -798,6 +802,30 @@ pub enum Mode {
     /// A dismissible informational popup shown over the panes — used at
     /// start-up to surface specification-load warnings.
     Notice(NoticeState),
+    /// A modal progress window shown while a slow re-key (XMSS / SLH-DSA) runs
+    /// on a background thread: key generation plus one signature per re-signed
+    /// object. Displays elapsed and estimated time until the worker finishes.
+    Progress(ProgressState),
+}
+
+/// State of the [`Mode::Progress`] window: the running background re-key, its
+/// start time and time estimate, and the channel the worker reports its
+/// outcome on. The re-key applies (mutating the document) once the outcome
+/// arrives — see [`App::poll_rekey_progress`].
+pub struct ProgressState {
+    /// One-line description of the running operation.
+    pub title: String,
+    /// When the operation started, for the elapsed-time display.
+    pub start: Instant,
+    /// Estimated total wall-clock, when available (the same estimate the
+    /// dialog showed).
+    pub estimate: Option<Duration>,
+    /// Whether the certificate is self-signed, needed to apply the outcome.
+    self_signed: bool,
+    /// Receives the worker's single result.
+    rx: mpsc::Receiver<Result<RekeyOk, String>>,
+    /// Kept so the worker thread is joined (and panics surfaced) on drop.
+    _handle: thread::JoinHandle<()>,
 }
 
 /// Content of a [`Mode::Notice`] popup: a title and the message lines.
@@ -891,6 +919,17 @@ impl PubKeyState {
         } else {
             self.family().members[self.param_idx]
         }
+    }
+
+    /// The currently selected algorithm — the public view of [`Self::alg`] for
+    /// the dialog renderer's time estimate.
+    pub fn dialog_algorithm(&self) -> keygen::KeyAlgorithm {
+        self.alg()
+    }
+
+    /// How many issued objects are checked for re-signing.
+    pub fn selected_issued_count(&self) -> usize {
+        self.issued.iter().filter(|c| c.selected).count()
     }
 
     /// Select `alg` by locating its family and parameter indices (used by
@@ -2824,132 +2863,159 @@ impl App {
             .map(|c| (c.path.clone(), c.id.clone(), c.label.clone()));
         let selected_issued: Vec<PathBuf> =
             state.issued.iter().filter(|c| c.selected).map(|c| c.path.clone()).collect();
+        let issued_count = selected_issued.len();
 
         let dir = self.path.parent().map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
         let key_path = dir.join(&filename);
-
-        // Obtain the key material (PKCS#8 + SPKI), a description for the status
-        // line, and — only for a freshly generated key — the file to register.
-        // Where a stateful (XMSS) key's advanced state is written back after
-        // signing; `None` for stateless algorithms, which never change.
         let stateful = verify::is_stateful(alg.sig_alg_oid());
-        let mut state_target: Option<StatefulKeyTarget> = None;
-
-        let (mut pkcs8, spki, key_part, written): (Vec<u8>, Vec<u8>, String, Option<PathBuf>) =
-            if use_existing {
-                let Some((path, id, label)) = chosen else {
-                    self.status = "select an existing key that fits the chosen algorithm".to_string();
-                    return; // stay in the dialog
-                };
-                let Some(pkcs8) = self.signing_materials_for(&id).into_iter().next() else {
-                    self.status = format!("could not load key {}", file_name_string(&path));
-                    return;
-                };
-                let Some(spki) = spki_der_from_pkcs8(&pkcs8) else {
-                    self.status = "could not derive the public key from the selected key".to_string();
-                    return;
-                };
-                if stateful {
-                    state_target = Some(self.stateful_writeback_target(&path));
-                }
-                (pkcs8, spki, format!("re-keyed to existing key {}", label), None)
-            } else {
-                if let keygen::KeyAlgorithm::RsaCustom(bits) = alg {
-                    if !(keygen::RSA_CUSTOM_BITS_MIN..=keygen::RSA_CUSTOM_BITS_MAX)
-                        .contains(&bits)
-                    {
-                        self.status = format!(
-                            "enter a custom RSA modulus size between {} and {} bits",
-                            keygen::RSA_CUSTOM_BITS_MIN,
-                            keygen::RSA_CUSTOM_BITS_MAX
-                        );
-                        return; // stay in the dialog
-                    }
-                }
-                if filename.trim().is_empty() {
-                    self.status = "enter a file name for the new private key".to_string();
-                    return; // stay in the dialog
-                }
-                if key_path.exists() {
-                    self.status = format!("{} already exists — choose another name", filename);
-                    return; // stay in the dialog
-                }
-                let key = match keygen::generate(alg) {
-                    Ok(k) => k,
-                    Err(e) => {
-                        self.mode = Mode::Browse;
-                        self.status = e;
-                        return;
-                    }
-                };
-                let der = match key.key_file_der(password.as_bytes()) {
-                    Ok(der) => der,
-                    Err(e) => {
-                        self.mode = Mode::Browse;
-                        self.status = e;
-                        return;
-                    }
-                };
-                if let Err(e) = std::fs::write(&key_path, &der) {
-                    self.mode = Mode::Browse;
-                    self.status = format!("could not write {}: {}", filename, e);
-                    return;
-                }
-                if stateful {
-                    // Rewrite this file with the final state once signing is
-                    // done (raw DER, re-encrypted if a password was set).
-                    state_target = Some(StatefulKeyTarget {
-                        path: key_path.clone(),
-                        password: password.clone().into_bytes(),
-                        persistable: true,
-                    });
-                }
-                let part = format!("wrote {} key {}", alg.short_name(), filename);
-                (key.pkcs8, key.spki, part, Some(key_path.clone()))
-            };
 
         // Whether the certificate is self-signed under its *current* key, so
-        // its own signature must be regenerated with the new key too.
+        // its own signature (and thus one more signing operation) is involved.
         let self_signed =
             matches!(self.sig_status, Some(SignatureStatus::Verified { self_signed: true, .. }));
 
-        // Replace the certificate's subjectPublicKeyInfo with the new key.
-        // `pkcs8` may be advanced in place for a stateful (XMSS) key.
-        if let Err(e) = self.install_new_public_key(&spki, &mut pkcs8, alg, self_signed) {
-            self.mode = Mode::Browse;
-            self.status = format!("could not modify the public key: {}", e);
-            return;
-        }
-
-        // Resign each selected issued object with the key, threading a
-        // stateful key's advancing state from one signature to the next.
-        let mut resigned = 0usize;
-        let mut failures = Vec::new();
-        for path in &selected_issued {
-            match resign_issued_file(path, alg, &pkcs8) {
-                Ok(updated) => {
-                    if let Some(updated) = updated {
-                        pkcs8 = updated;
-                    }
-                    resigned += 1;
+        // Validate the inputs and assemble the (Send) work plan. Validation
+        // failures keep the dialog open; only a ready plan proceeds.
+        let (source, state_target) = if use_existing {
+            let Some((path, id, label)) = chosen else {
+                self.status = "select an existing key that fits the chosen algorithm".to_string();
+                return; // stay in the dialog
+            };
+            let Some(pkcs8) = self.signing_materials_for(&id).into_iter().next() else {
+                self.status = format!("could not load key {}", file_name_string(&path));
+                return;
+            };
+            let Some(spki) = spki_der_from_pkcs8(&pkcs8) else {
+                self.status = "could not derive the public key from the selected key".to_string();
+                return;
+            };
+            let target = stateful.then(|| self.stateful_writeback_target(&path));
+            (RekeySource::Existing { pkcs8, spki, label }, target)
+        } else {
+            if let keygen::KeyAlgorithm::RsaCustom(bits) = alg {
+                if !(keygen::RSA_CUSTOM_BITS_MIN..=keygen::RSA_CUSTOM_BITS_MAX).contains(&bits) {
+                    self.status = format!(
+                        "enter a custom RSA modulus size between {} and {} bits",
+                        keygen::RSA_CUSTOM_BITS_MIN, keygen::RSA_CUSTOM_BITS_MAX
+                    );
+                    return; // stay in the dialog
                 }
-                Err(e) => failures.push(format!("{}: {}", file_name_string(path), e)),
+            }
+            if filename.trim().is_empty() {
+                self.status = "enter a file name for the new private key".to_string();
+                return; // stay in the dialog
+            }
+            if key_path.exists() {
+                self.status = format!("{} already exists — choose another name", filename);
+                return; // stay in the dialog
+            }
+            let target = stateful.then(|| StatefulKeyTarget {
+                path: key_path.clone(),
+                password: password.clone().into_bytes(),
+                persistable: true,
+            });
+            let source =
+                RekeySource::Generate { key_path: key_path.clone(), password: password.into_bytes() };
+            (source, target)
+        };
+
+        let plan = RekeyPlan {
+            alg,
+            source,
+            cert_der: ber::encode_forest(&self.roots),
+            self_signed,
+            selected_issued,
+            state_target,
+        };
+
+        // A slow algorithm (XMSS / SLH-DSA) runs on a background thread behind
+        // a progress window; everything else completes instantly inline.
+        if alg.shows_time_estimate() {
+            let signatures = usize::from(self_signed) + issued_count;
+            let estimate = cost::rekey_estimate(alg, signatures, !use_existing);
+            self.spawn_rekey(plan, alg, self_signed, estimate);
+        } else {
+            let outcome = perform_rekey(plan);
+            self.apply_rekey_outcome(outcome, self_signed);
+        }
+    }
+
+    /// Start the re-key on a background thread and enter the progress window.
+    fn spawn_rekey(
+        &mut self,
+        plan: RekeyPlan,
+        alg: keygen::KeyAlgorithm,
+        self_signed: bool,
+        estimate: Option<Duration>,
+    ) {
+        let (tx, rx) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            // Send failures are ignored: they only occur if the UI dropped the
+            // receiver (e.g. on quit), in which case there is nothing to do.
+            let _ = tx.send(perform_rekey(plan));
+        });
+        self.mode = Mode::Progress(ProgressState {
+            title: format!("Re-keying to {}", alg.label()),
+            start: Instant::now(),
+            estimate,
+            self_signed,
+            rx,
+            _handle: handle,
+        });
+        self.status = "re-keying in progress…".to_string();
+    }
+
+    /// Poll the background re-key worker; when it has finished, apply its
+    /// outcome (updating the document) and leave the progress window. A no-op
+    /// unless a re-key is running.
+    pub fn poll_rekey_progress(&mut self) {
+        let Mode::Progress(ref prog) = self.mode else { return };
+        let self_signed = prog.self_signed;
+        let received = prog.rx.try_recv();
+        match received {
+            Ok(outcome) => self.apply_rekey_outcome(outcome, self_signed),
+            Err(mpsc::TryRecvError::Empty) => {} // still running
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.mode = Mode::Browse;
+                self.status = "re-key worker terminated unexpectedly".to_string();
             }
         }
+    }
 
-        // Persist the stateful key's final state so a later session cannot
-        // reuse a one-time-signature index. `pkcs8` now holds the last state.
-        if let Some(target) = &state_target {
-            if let Err(e) = target.write(&pkcs8) {
-                failures.push(format!("key state not saved ({}): {}", target.describe(), e));
+    /// Install a finished re-key's result into the open document: swap in the
+    /// rekeyed certificate, register a generated key, refresh relations and
+    /// auto-save. Runs on the UI thread (it mutates the `App`).
+    fn apply_rekey_outcome(
+        &mut self,
+        outcome: Result<RekeyOk, String>,
+        self_signed: bool,
+    ) {
+        let ok = match outcome {
+            Ok(ok) => ok,
+            Err(e) => {
+                self.mode = Mode::Browse;
+                self.status = e;
+                return;
+            }
+        };
+        match ber::parse_forest(&ok.cert_der, 0) {
+            Ok(roots) => {
+                self.roots = roots;
+                self.dirty = true;
+                self.rebuild();
+            }
+            Err(e) => {
+                self.mode = Mode::Browse;
+                self.status = format!("re-key produced an invalid certificate: {}", e);
+                return;
             }
         }
 
         // Register a freshly written key so its key↔certificate link and any
         // later re-signing can find it this session. (An existing key is
         // already known.)
-        if let Some(ref path) = written {
-            self.register_generated_key(path, &spki, password.as_bytes());
+        if let Some(ref path) = ok.written_key {
+            self.register_generated_key(path, &ok.spki, &ok.written_password);
         }
         self.recompute_browser_relations();
 
@@ -2959,61 +3025,7 @@ impl App {
         let saved = self.write_current();
 
         self.mode = Mode::Browse;
-        self.status = self.pubkey_summary(&key_part, resigned, &failures, self_signed, &saved);
-    }
-
-    /// Splice the `SubjectPublicKeyInfo` `spki` into the open certificate,
-    /// re-signing the certificate itself with `pkcs8` when it is self-signed (so
-    /// it stays valid under the new key). Leaves the document dirty for `save`.
-    ///
-    /// `pkcs8` is `&mut` because signing may advance a stateful (XMSS) key's
-    /// one-time-signature index: on return it holds the updated key, which
-    /// the caller persists.
-    fn install_new_public_key(
-        &mut self,
-        spki: &[u8],
-        pkcs8: &mut Vec<u8>,
-        alg: keygen::KeyAlgorithm,
-        self_signed: bool,
-    ) -> Result<(), String> {
-        let paths = cert_paths(&self.roots).ok_or("the open document is not a certificate")?;
-        let spki_nodes =
-            ber::parse_forest(spki, 0).map_err(|e| format!("bad SPKI: {}", e))?;
-        let spki_node = spki_nodes.into_iter().next().ok_or("empty SPKI")?;
-        *node_at_mut(&mut self.roots, &paths.spki).ok_or("SPKI node missing")? = spki_node;
-
-        if self_signed {
-            // The self-signature must use the new algorithm and key: update
-            // both AlgorithmIdentifiers, then regenerate the signature over
-            // the new tbsCertificate.
-            let alg_id = ber::parse_forest(&alg.sig_alg_identifier_der(), 0)
-                .map_err(|e| format!("bad algorithm identifier: {}", e))?
-                .into_iter()
-                .next()
-                .ok_or("empty algorithm identifier")?;
-            *node_at_mut(&mut self.roots, &paths.tbs_sig_alg).ok_or("tbs sigAlg missing")? =
-                alg_id.clone();
-            *node_at_mut(&mut self.roots, &paths.outer_sig_alg).ok_or("outer sigAlg missing")? =
-                alg_id;
-            self.dirty = true;
-            self.rebuild();
-
-            // Sign the canonical new tbs and install the signature.
-            let der = ber::encode_forest(&self.roots);
-            let signable =
-                x509::parse_signable(&self.roots, &der).ok_or("re-encoded document is not a certificate")?;
-            let (sig, updated) = verify::sign_stateful(alg.sig_alg_oid(), pkcs8, &signable.tbs)?;
-            if let Some(updated) = updated {
-                *pkcs8 = updated;
-            }
-            let sig_node = node_at_mut(&mut self.roots, &paths.outer_sig).ok_or("signature node missing")?;
-            sig_node.value = std::iter::once(0u8).chain(sig).collect();
-            sig_node.children.clear();
-            sig_node.encapsulates = false;
-        }
-        self.dirty = true;
-        self.rebuild();
-        Ok(())
+        self.status = self.pubkey_summary(&ok.key_part, ok.resigned, &ok.failures, self_signed, &saved);
     }
 
     /// Record a freshly written key file so its key↔certificate link shows and
@@ -5048,6 +5060,170 @@ impl StatefulKeyTarget {
     fn describe(&self) -> String {
         file_name_string(&self.path)
     }
+}
+
+/// Where the new key material comes from for a re-key: a freshly generated
+/// key written to `key_path`, or an already-loaded existing key.
+enum RekeySource {
+    Generate { key_path: PathBuf, password: Vec<u8> },
+    Existing { pkcs8: Vec<u8>, spki: Vec<u8>, label: String },
+}
+
+/// Everything the heavy re-key work needs, captured by value so it can run on
+/// a background thread (all fields are `Send`): no `App` reference, no `Node`
+/// crosses the thread boundary — the certificate travels as DER.
+struct RekeyPlan {
+    alg: keygen::KeyAlgorithm,
+    source: RekeySource,
+    /// The open certificate's current DER (the SPKI is spliced into a parse of
+    /// this).
+    cert_der: Vec<u8>,
+    self_signed: bool,
+    selected_issued: Vec<PathBuf>,
+    /// Where a stateful key's advanced state is written back (generated or
+    /// existing); `None` for stateless algorithms.
+    state_target: Option<StatefulKeyTarget>,
+}
+
+/// The result of [`perform_rekey`], applied to the `App` on the UI thread.
+struct RekeyOk {
+    /// The rekeyed certificate DER, to become the open document.
+    cert_der: Vec<u8>,
+    /// The new public key, for the key↔certificate link.
+    spki: Vec<u8>,
+    /// The written key file (generated key only), and the password it was
+    /// written under, for session registration.
+    written_key: Option<PathBuf>,
+    written_password: Vec<u8>,
+    resigned: usize,
+    failures: Vec<String>,
+    key_part: String,
+}
+
+/// Run the heavy part of a re-key with no `App` access, so it can execute on a
+/// background thread while the UI shows a progress window: generate or take
+/// the key, splice its public key into the certificate (re-signing the cert
+/// when self-signed), re-sign each selected issued object (threading a
+/// stateful key's advancing state), and persist the key. Returns the data the
+/// UI thread needs to install the result.
+fn perform_rekey(plan: RekeyPlan) -> Result<RekeyOk, String> {
+    // 1. Obtain the key material and (for a generated key) write the file.
+    let (mut pkcs8, spki, key_part, written_key, written_password) = match plan.source {
+        RekeySource::Generate { key_path, password } => {
+            let key = keygen::generate(plan.alg)?;
+            // Write the initial key now to reserve the file and surface I/O
+            // errors early; a stateful key is rewritten with its final state
+            // below (via `state_target`).
+            let der = keygen::encrypt_key_file_der(&key.pkcs8, &password)?;
+            std::fs::write(&key_path, &der)
+                .map_err(|e| format!("could not write {}: {}", file_name_string(&key_path), e))?;
+            let part = format!("wrote {} key {}", plan.alg.short_name(), file_name_string(&key_path));
+            (key.pkcs8, key.spki, part, Some(key_path), password)
+        }
+        RekeySource::Existing { pkcs8, spki, label } => {
+            (pkcs8, spki, format!("re-keyed to existing key {}", label), None, Vec::new())
+        }
+    };
+
+    // 2. Splice the new public key into the certificate, re-signing it when
+    //    self-signed (which advances a stateful key).
+    let roots = ber::parse_forest(&plan.cert_der, 0).map_err(|e| format!("bad certificate: {}", e))?;
+    let built = build_rekeyed_cert(roots, &spki, &pkcs8, plan.alg, plan.self_signed)?;
+    pkcs8 = built.updated_pkcs8;
+
+    // 3. Re-sign each selected issued object, threading the advancing state.
+    let mut resigned = 0usize;
+    let mut failures = Vec::new();
+    for path in &plan.selected_issued {
+        match resign_issued_file(path, plan.alg, &pkcs8) {
+            Ok(updated) => {
+                if let Some(updated) = updated {
+                    pkcs8 = updated;
+                }
+                resigned += 1;
+            }
+            Err(e) => failures.push(format!("{}: {}", file_name_string(path), e)),
+        }
+    }
+
+    // 4. Persist a stateful key's final state so a later session cannot reuse
+    //    a one-time-signature index.
+    if let Some(target) = &plan.state_target {
+        if let Err(e) = target.write(&pkcs8) {
+            failures.push(format!("key state not saved ({}): {}", target.describe(), e));
+        }
+    }
+
+    Ok(RekeyOk {
+        cert_der: built.cert_der,
+        spki,
+        written_key,
+        written_password,
+        resigned,
+        failures,
+        key_part,
+    })
+}
+
+/// The certificate rebuilt around a new key: its DER and the (possibly
+/// state-advanced) private key.
+struct BuiltCert {
+    cert_der: Vec<u8>,
+    updated_pkcs8: Vec<u8>,
+}
+
+/// Splice `spki` into `roots` (a parsed certificate), re-signing it with
+/// `pkcs8` when `self_signed` so it stays valid under the new key. Pure (no
+/// `App`), returning the new DER and the advanced key — the off-thread
+/// counterpart of the old `install_new_public_key`.
+fn build_rekeyed_cert(
+    mut roots: Vec<Node>,
+    spki: &[u8],
+    pkcs8: &[u8],
+    alg: keygen::KeyAlgorithm,
+    self_signed: bool,
+) -> Result<BuiltCert, String> {
+    let paths = cert_paths(&roots).ok_or("the open document is not a certificate")?;
+    let spki_node = ber::parse_forest(spki, 0)
+        .map_err(|e| format!("bad SPKI: {}", e))?
+        .into_iter()
+        .next()
+        .ok_or("empty SPKI")?;
+    *node_at_mut(&mut roots, &paths.spki).ok_or("SPKI node missing")? = spki_node;
+
+    if self_signed {
+        // The self-signature must use the new algorithm: update both
+        // AlgorithmIdentifiers before signing.
+        let alg_id = ber::parse_forest(&alg.sig_alg_identifier_der(), 0)
+            .map_err(|e| format!("bad algorithm identifier: {}", e))?
+            .into_iter()
+            .next()
+            .ok_or("empty algorithm identifier")?;
+        *node_at_mut(&mut roots, &paths.tbs_sig_alg).ok_or("tbs sigAlg missing")? = alg_id.clone();
+        *node_at_mut(&mut roots, &paths.outer_sig_alg).ok_or("outer sigAlg missing")? = alg_id;
+    }
+
+    // Re-encode and re-parse so the spliced nodes' offsets are canonical
+    // (as `resign_issued_file` does) — otherwise the tbs bytes `parse_signable`
+    // extracts would not match the final encoding and the signature would not
+    // verify.
+    let der = ber::encode_forest(&roots);
+    let mut roots = ber::parse_forest(&der, 0).map_err(|e| format!("bad certificate: {}", e))?;
+
+    let mut updated_pkcs8 = pkcs8.to_vec();
+    if self_signed {
+        let signable =
+            x509::parse_signable(&roots, &der).ok_or("re-encoded document is not a certificate")?;
+        let (sig, updated) = verify::sign_stateful(alg.sig_alg_oid(), pkcs8, &signable.tbs)?;
+        if let Some(updated) = updated {
+            updated_pkcs8 = updated;
+        }
+        let sig_node = node_at_mut(&mut roots, &paths.outer_sig).ok_or("signature node missing")?;
+        sig_node.value = std::iter::once(0u8).chain(sig).collect();
+        sig_node.children.clear();
+        sig_node.encapsulates = false;
+    }
+    Ok(BuiltCert { cert_der: ber::encode_forest(&roots), updated_pkcs8 })
 }
 
 /// Re-sign the certificate/CRL at `path` with `key_pkcs8` under `alg`,
@@ -8047,6 +8223,19 @@ mod tests {
         dir
     }
 
+    /// Drive a background re-key (XMSS / SLH-DSA) to completion, as the event
+    /// loop does: poll until the progress window closes. Panics on timeout.
+    fn await_rekey(app: &mut App) {
+        let deadline = Instant::now() + Duration::from_secs(120);
+        while matches!(app.mode, Mode::Progress(_)) {
+            app.poll_rekey_progress();
+            if Instant::now() > deadline {
+                panic!("re-key did not finish within the timeout");
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        }
+    }
+
     fn spki_row(app: &App) -> usize {
         let paths = cert_paths(&app.roots).expect("open document is a certificate");
         row_of_source(app, RowSource::Document, &paths.spki)
@@ -8163,7 +8352,7 @@ mod tests {
         let dir = copy_chain("pk-xmss");
         let mut app = open_real_file(&dir.join("root_ca.der"));
         app.start_rekey();
-        let xmss = keygen::KeyAlgorithm::Xmss(0); // XMSS-SHA2_10_256
+        let xmss = keygen::KeyAlgorithm::Xmss(0); // XMSS-SHA2_10_192 (fast, height 10)
         assert_eq!(xmss.sig_alg_oid(), crate::xmss::XMSS_OID);
         if let Mode::EditPubKey(ref mut s) = app.mode {
             s.select_algorithm(xmss);
@@ -8171,6 +8360,9 @@ mod tests {
             s.filename_auto = false;
         }
         app.submit_pubkey();
+        // XMSS runs on a background thread behind the progress window; drive it
+        // to completion the way the event loop does.
+        await_rekey(&mut app);
         assert!(matches!(app.mode, Mode::Browse), "status: {}", app.status);
 
         // The rekeyed self-signed root uses the XMSS signature algorithm and
@@ -8204,6 +8396,38 @@ mod tests {
             file_leaf,
             cert_leaf
         );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn xmss_rekey_runs_behind_a_progress_window_then_completes() {
+        // Submitting an XMSS re-key enters the progress window (background
+        // thread) rather than blocking; polling drives it to completion.
+        let dir = copy_chain("pk-xmss-progress");
+        let mut app = open_real_file(&dir.join("root_ca.der"));
+        app.start_rekey();
+        if let Mode::EditPubKey(ref mut s) = app.mode {
+            s.select_algorithm(keygen::KeyAlgorithm::Xmss(0)); // fast height-10
+            s.filename = "root_xmss_prog.key".to_string();
+            s.filename_auto = false;
+        }
+        app.submit_pubkey();
+        // Immediately after submit the worker is running behind the window,
+        // with a time estimate carried over from the dialog.
+        match app.mode {
+            Mode::Progress(ref p) => {
+                assert!(p.title.contains("XMSS"), "title: {}", p.title);
+                assert!(p.estimate.is_some(), "an XMSS re-key has a time estimate");
+            }
+            _ => panic!("expected the progress window, got status: {}", app.status),
+        }
+        await_rekey(&mut app);
+        assert!(matches!(app.mode, Mode::Browse), "status: {}", app.status);
+        // The document really was rekeyed to XMSS.
+        let der = ber::encode_forest(&app.roots);
+        let s = x509::parse_signable(&app.roots, &der).unwrap();
+        assert_eq!(s.sig_alg, crate::xmss::XMSS_OID);
+        assert!(dir.join("root_xmss_prog.key").exists(), "the key file was written");
         let _ = std::fs::remove_dir_all(&dir);
     }
 

@@ -102,26 +102,34 @@ struct PqDesc {
     name: &'static str,
     param: &'static str,
     short: &'static str,
+    /// Measured keygen wall-clock (seconds) on the calibration machine, for
+    /// the SLH-DSA cost estimate ([`crate::cost`]). ML-DSA is effectively
+    /// instant and gets no time estimate, so its value here is nominal.
+    keygen_secs: f64,
+    /// Measured single-signature wall-clock (seconds); dominant for SLH-DSA's
+    /// slow-signing (`s`) parameter sets and multiplied by the re-signed
+    /// object count.
+    sign_secs: f64,
 }
 
 /// The post-quantum algorithms, indexed by `KeyAlgorithm::Pq(i)`: ML-DSA
 /// (FIPS 204) then SLH-DSA (FIPS 205), matching the NIST OID order.
 const PQ: &[PqDesc] = &[
-    PqDesc { oid: &[2, 16, 840, 1, 101, 3, 4, 3, 17], name: "ML-DSA-44", param: "44", short: "mldsa44" },
-    PqDesc { oid: &[2, 16, 840, 1, 101, 3, 4, 3, 18], name: "ML-DSA-65", param: "65", short: "mldsa65" },
-    PqDesc { oid: &[2, 16, 840, 1, 101, 3, 4, 3, 19], name: "ML-DSA-87", param: "87", short: "mldsa87" },
-    PqDesc { oid: &[2, 16, 840, 1, 101, 3, 4, 3, 20], name: "SLH-DSA-SHA2-128s", param: "SHA2-128s", short: "slhdsa-sha2-128s" },
-    PqDesc { oid: &[2, 16, 840, 1, 101, 3, 4, 3, 21], name: "SLH-DSA-SHA2-128f", param: "SHA2-128f", short: "slhdsa-sha2-128f" },
-    PqDesc { oid: &[2, 16, 840, 1, 101, 3, 4, 3, 22], name: "SLH-DSA-SHA2-192s", param: "SHA2-192s", short: "slhdsa-sha2-192s" },
-    PqDesc { oid: &[2, 16, 840, 1, 101, 3, 4, 3, 23], name: "SLH-DSA-SHA2-192f", param: "SHA2-192f", short: "slhdsa-sha2-192f" },
-    PqDesc { oid: &[2, 16, 840, 1, 101, 3, 4, 3, 24], name: "SLH-DSA-SHA2-256s", param: "SHA2-256s", short: "slhdsa-sha2-256s" },
-    PqDesc { oid: &[2, 16, 840, 1, 101, 3, 4, 3, 25], name: "SLH-DSA-SHA2-256f", param: "SHA2-256f", short: "slhdsa-sha2-256f" },
-    PqDesc { oid: &[2, 16, 840, 1, 101, 3, 4, 3, 26], name: "SLH-DSA-SHAKE-128s", param: "SHAKE-128s", short: "slhdsa-shake-128s" },
-    PqDesc { oid: &[2, 16, 840, 1, 101, 3, 4, 3, 27], name: "SLH-DSA-SHAKE-128f", param: "SHAKE-128f", short: "slhdsa-shake-128f" },
-    PqDesc { oid: &[2, 16, 840, 1, 101, 3, 4, 3, 28], name: "SLH-DSA-SHAKE-192s", param: "SHAKE-192s", short: "slhdsa-shake-192s" },
-    PqDesc { oid: &[2, 16, 840, 1, 101, 3, 4, 3, 29], name: "SLH-DSA-SHAKE-192f", param: "SHAKE-192f", short: "slhdsa-shake-192f" },
-    PqDesc { oid: &[2, 16, 840, 1, 101, 3, 4, 3, 30], name: "SLH-DSA-SHAKE-256s", param: "SHAKE-256s", short: "slhdsa-shake-256s" },
-    PqDesc { oid: &[2, 16, 840, 1, 101, 3, 4, 3, 31], name: "SLH-DSA-SHAKE-256f", param: "SHAKE-256f", short: "slhdsa-shake-256f" },
+    PqDesc { oid: &[2, 16, 840, 1, 101, 3, 4, 3, 17], name: "ML-DSA-44", param: "44", short: "mldsa44", keygen_secs: 0.0, sign_secs: 0.0 },
+    PqDesc { oid: &[2, 16, 840, 1, 101, 3, 4, 3, 18], name: "ML-DSA-65", param: "65", short: "mldsa65", keygen_secs: 0.0, sign_secs: 0.0 },
+    PqDesc { oid: &[2, 16, 840, 1, 101, 3, 4, 3, 19], name: "ML-DSA-87", param: "87", short: "mldsa87", keygen_secs: 0.0, sign_secs: 0.0 },
+    PqDesc { oid: &[2, 16, 840, 1, 101, 3, 4, 3, 20], name: "SLH-DSA-SHA2-128s", param: "SHA2-128s", short: "slhdsa-sha2-128s", keygen_secs: 0.12, sign_secs: 1.02 },
+    PqDesc { oid: &[2, 16, 840, 1, 101, 3, 4, 3, 21], name: "SLH-DSA-SHA2-128f", param: "SHA2-128f", short: "slhdsa-sha2-128f", keygen_secs: 0.003, sign_secs: 0.044 },
+    PqDesc { oid: &[2, 16, 840, 1, 101, 3, 4, 3, 22], name: "SLH-DSA-SHA2-192s", param: "SHA2-192s", short: "slhdsa-sha2-192s", keygen_secs: 0.18, sign_secs: 1.75 },
+    PqDesc { oid: &[2, 16, 840, 1, 101, 3, 4, 3, 23], name: "SLH-DSA-SHA2-192f", param: "SHA2-192f", short: "slhdsa-sha2-192f", keygen_secs: 0.003, sign_secs: 0.080 },
+    PqDesc { oid: &[2, 16, 840, 1, 101, 3, 4, 3, 24], name: "SLH-DSA-SHA2-256s", param: "SHA2-256s", short: "slhdsa-sha2-256s", keygen_secs: 0.10, sign_secs: 1.39 },
+    PqDesc { oid: &[2, 16, 840, 1, 101, 3, 4, 3, 25], name: "SLH-DSA-SHA2-256f", param: "SHA2-256f", short: "slhdsa-sha2-256f", keygen_secs: 0.007, sign_secs: 0.139 },
+    PqDesc { oid: &[2, 16, 840, 1, 101, 3, 4, 3, 26], name: "SLH-DSA-SHAKE-128s", param: "SHAKE-128s", short: "slhdsa-shake-128s", keygen_secs: 0.22, sign_secs: 2.10 },
+    PqDesc { oid: &[2, 16, 840, 1, 101, 3, 4, 3, 27], name: "SLH-DSA-SHAKE-128f", param: "SHAKE-128f", short: "slhdsa-shake-128f", keygen_secs: 0.004, sign_secs: 0.077 },
+    PqDesc { oid: &[2, 16, 840, 1, 101, 3, 4, 3, 28], name: "SLH-DSA-SHAKE-192s", param: "SHAKE-192s", short: "slhdsa-shake-192s", keygen_secs: 0.29, sign_secs: 3.64 },
+    PqDesc { oid: &[2, 16, 840, 1, 101, 3, 4, 3, 29], name: "SLH-DSA-SHAKE-192f", param: "SHAKE-192f", short: "slhdsa-shake-192f", keygen_secs: 0.006, sign_secs: 0.162 },
+    PqDesc { oid: &[2, 16, 840, 1, 101, 3, 4, 3, 30], name: "SLH-DSA-SHAKE-256s", param: "SHAKE-256s", short: "slhdsa-shake-256s", keygen_secs: 0.22, sign_secs: 2.44 },
+    PqDesc { oid: &[2, 16, 840, 1, 101, 3, 4, 3, 31], name: "SLH-DSA-SHAKE-256f", param: "SHAKE-256f", short: "slhdsa-shake-256f", keygen_secs: 0.011, sign_secs: 0.201 },
 ];
 
 /// Static description of one XMSS parameter set: the Botan parameter-set
@@ -132,14 +140,38 @@ struct XmssDesc {
     name: &'static str,
     param: &'static str,
     short: &'static str,
+    /// Tree height (10 or 16), the exponent driving keygen cost (~2^h).
+    height: u8,
+    /// Measured keygen wall-clock at height 10 for this hash/output class on
+    /// the calibration machine (seconds); the cost model scales it by
+    /// `2^(height-10)`. XMSS signing reloads the key (Botan reconstructs the
+    /// full state on load), so per-signature cost ≈ keygen cost — see
+    /// [`crate::cost`].
+    keygen_h10_secs: f64,
 }
 
-/// The XMSS parameter sets, indexed by `KeyAlgorithm::Xmss(i)`.
+/// The XMSS parameter sets, indexed by `KeyAlgorithm::Xmss(i)`, in the dialog
+/// display order: 192-bit, then 256-bit, then 512-bit. All share the single
+/// `id-alg-xmss-hashsig` X.509 OID (the concrete parameter set is carried in
+/// the key bytes), so adding one needs no OID plumbing. The 192-bit sets are
+/// NIST SP 800-208's truncated-hash additions (SHA-256/192 and SHAKE256/192);
+/// the 256-bit and 512-bit (n=64, ~256-bit-security) sets are RFC 8391.
 const XMSS: &[XmssDesc] = &[
-    XmssDesc { name: "XMSS-SHA2_10_256", param: "SHA2_10_256", short: "xmss-sha2-10-256" },
-    XmssDesc { name: "XMSS-SHA2_16_256", param: "SHA2_16_256", short: "xmss-sha2-16-256" },
-    XmssDesc { name: "XMSS-SHAKE_10_256", param: "SHAKE_10_256", short: "xmss-shake-10-256" },
-    XmssDesc { name: "XMSS-SHAKE_16_256", param: "SHAKE_16_256", short: "xmss-shake-16-256" },
+    // NIST SP 800-208 192-bit sets (SHA-256/192 and SHAKE256/192).
+    XmssDesc { name: "XMSS-SHA2_10_192", param: "SHA2_10_192", short: "xmss-sha2-10-192", height: 10, keygen_h10_secs: 0.37 },
+    XmssDesc { name: "XMSS-SHA2_16_192", param: "SHA2_16_192", short: "xmss-sha2-16-192", height: 16, keygen_h10_secs: 0.37 },
+    XmssDesc { name: "XMSS-SHAKE256_10_192", param: "SHAKE256_10_192", short: "xmss-shake256-10-192", height: 10, keygen_h10_secs: 0.57 },
+    XmssDesc { name: "XMSS-SHAKE256_16_192", param: "SHAKE256_16_192", short: "xmss-shake256-16-192", height: 16, keygen_h10_secs: 0.57 },
+    // RFC 8391 256-bit sets.
+    XmssDesc { name: "XMSS-SHA2_10_256", param: "SHA2_10_256", short: "xmss-sha2-10-256", height: 10, keygen_h10_secs: 0.65 },
+    XmssDesc { name: "XMSS-SHA2_16_256", param: "SHA2_16_256", short: "xmss-sha2-16-256", height: 16, keygen_h10_secs: 0.65 },
+    XmssDesc { name: "XMSS-SHAKE_10_256", param: "SHAKE_10_256", short: "xmss-shake-10-256", height: 10, keygen_h10_secs: 0.81 },
+    XmssDesc { name: "XMSS-SHAKE_16_256", param: "SHAKE_16_256", short: "xmss-shake-16-256", height: 16, keygen_h10_secs: 0.81 },
+    // RFC 8391 512-bit (n=64) sets, ~256-bit security.
+    XmssDesc { name: "XMSS-SHA2_10_512", param: "SHA2_10_512", short: "xmss-sha2-10-512", height: 10, keygen_h10_secs: 2.72 },
+    XmssDesc { name: "XMSS-SHA2_16_512", param: "SHA2_16_512", short: "xmss-sha2-16-512", height: 16, keygen_h10_secs: 2.72 },
+    XmssDesc { name: "XMSS-SHAKE_10_512", param: "SHAKE_10_512", short: "xmss-shake-10-512", height: 10, keygen_h10_secs: 2.66 },
+    XmssDesc { name: "XMSS-SHAKE_16_512", param: "SHAKE_16_512", short: "xmss-shake-16-512", height: 16, keygen_h10_secs: 2.66 },
 ];
 
 /// One algorithm family of the dialog's first column; the members are the
@@ -218,6 +250,14 @@ pub const FAMILIES: &[Family] = &[
             KeyAlgorithm::Xmss(1),
             KeyAlgorithm::Xmss(2),
             KeyAlgorithm::Xmss(3),
+            KeyAlgorithm::Xmss(4),
+            KeyAlgorithm::Xmss(5),
+            KeyAlgorithm::Xmss(6),
+            KeyAlgorithm::Xmss(7),
+            KeyAlgorithm::Xmss(8),
+            KeyAlgorithm::Xmss(9),
+            KeyAlgorithm::Xmss(10),
+            KeyAlgorithm::Xmss(11),
         ],
         default_member: 0,
         custom_modulus: false,
@@ -256,6 +296,14 @@ pub const ALL: &[KeyAlgorithm] = &[
     KeyAlgorithm::Xmss(1),
     KeyAlgorithm::Xmss(2),
     KeyAlgorithm::Xmss(3),
+    KeyAlgorithm::Xmss(4),
+    KeyAlgorithm::Xmss(5),
+    KeyAlgorithm::Xmss(6),
+    KeyAlgorithm::Xmss(7),
+    KeyAlgorithm::Xmss(8),
+    KeyAlgorithm::Xmss(9),
+    KeyAlgorithm::Xmss(10),
+    KeyAlgorithm::Xmss(11),
 ];
 
 // Signature-algorithm OIDs (the `signatureAlgorithm` of a certificate).
@@ -317,6 +365,46 @@ impl KeyAlgorithm {
             KeyAlgorithm::RsaCustom(_) => "custom",
             KeyAlgorithm::Pq(_) => self.pq().map(|d| d.param).unwrap_or("?"),
             KeyAlgorithm::Xmss(_) => self.xmss().map(|d| d.param).unwrap_or("?"),
+        }
+    }
+
+    /// Whether the re-key flow shows a time estimate / progress window for
+    /// this algorithm: only the slow stateful/hash-based families, XMSS and
+    /// SLH-DSA. Everything else (classical, ML-DSA) completes near-instantly.
+    pub fn shows_time_estimate(self) -> bool {
+        matches!(self, KeyAlgorithm::Xmss(_))
+            || self.pq().is_some_and(|d| d.name.starts_with("SLH-DSA"))
+    }
+
+    /// Estimated key-generation time (seconds) on the calibration machine, or
+    /// `None` for an algorithm without a time estimate. XMSS scales its
+    /// height-10 anchor by `2^(height-10)`; SLH-DSA reads a measured constant.
+    pub fn est_keygen_secs(self) -> Option<f64> {
+        if !self.shows_time_estimate() {
+            return None;
+        }
+        match self {
+            KeyAlgorithm::Xmss(_) => {
+                let d = self.xmss()?;
+                Some(d.keygen_h10_secs * 2f64.powi(i32::from(d.height) - 10))
+            }
+            KeyAlgorithm::Pq(_) => self.pq().map(|d| d.keygen_secs),
+            _ => None,
+        }
+    }
+
+    /// Estimated single-signature time (seconds) on the calibration machine,
+    /// or `None` for an algorithm without a time estimate. For XMSS this ≈ the
+    /// keygen time: signing reloads the key and Botan reconstructs the full
+    /// tree state on load.
+    pub fn est_sign_secs(self) -> Option<f64> {
+        if !self.shows_time_estimate() {
+            return None;
+        }
+        match self {
+            KeyAlgorithm::Xmss(_) => self.est_keygen_secs(),
+            KeyAlgorithm::Pq(_) => self.pq().map(|d| d.sign_secs),
+            _ => None,
         }
     }
 
@@ -571,6 +659,41 @@ mod tests {
                 assert!(!member.param_label().is_empty(), "{}", member.label());
             }
         }
+    }
+
+    #[test]
+    fn xmss_family_offers_the_rfc8391_and_sp800_208_parameter_sets() {
+        // Every offered XMSS parameter set, by its Botan name — the RFC 8391
+        // 256-bit and 512-bit (n=64) sets plus the NIST SP 800-208 192-bit
+        // (truncated-hash) additions, each at tree heights 10 and 16.
+        let xmss = FAMILIES.iter().find(|f| f.label == "XMSS").expect("XMSS family");
+        let names: Vec<String> = xmss.members.iter().map(|m| m.label()).collect();
+        for expected in [
+            "XMSS-SHA2_10_256",
+            "XMSS-SHA2_16_256",
+            "XMSS-SHAKE_10_256",
+            "XMSS-SHAKE_16_256",
+            "XMSS-SHA2_10_192",
+            "XMSS-SHA2_16_192",
+            "XMSS-SHAKE256_10_192",
+            "XMSS-SHAKE256_16_192",
+            "XMSS-SHA2_10_512",
+            "XMSS-SHA2_16_512",
+            "XMSS-SHAKE_10_512",
+            "XMSS-SHAKE_16_512",
+        ] {
+            assert!(names.iter().any(|n| n == expected), "missing XMSS set {}", expected);
+        }
+        // All XMSS sets share the one id-alg-xmss-hashsig OID, and each has a
+        // distinct filename token.
+        for &m in xmss.members {
+            assert_eq!(m.sig_alg_oid(), crate::xmss::XMSS_OID, "{}", m.label());
+        }
+        let mut shorts: Vec<String> = xmss.members.iter().map(|m| m.short_name()).collect();
+        let unique = shorts.len();
+        shorts.sort();
+        shorts.dedup();
+        assert_eq!(shorts.len(), unique, "XMSS filename tokens must be unique");
     }
 
     #[test]

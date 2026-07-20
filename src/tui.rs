@@ -30,11 +30,12 @@ use ratatui::{DefaultTerminal, Frame};
 
 use crate::app::{
     App, DateTimeEditor, EditKind, EditState, Editor, FilterMatcher, Focus, HexEditor, Mode,
-    PickerTarget, RowSource, TextEditor, TextFormat, DATE_FIELDS, EDIT_BYTES_PER_LINE,
+    PickerTarget, PubKeyState, RowSource, TextEditor, TextFormat, DATE_FIELDS, EDIT_BYTES_PER_LINE,
     EDIT_DIGITS_PER_LINE, PICKER_CLASSES, PICKER_UNIVERSAL,
 };
 use crate::x509::{self, basic_constraints, extended_key_usage, key_usage};
 use crate::browser::FileStatus;
+use crate::cost;
 use crate::ber::{
     self, Class, Node, TAG_BIT_STRING, TAG_BOOLEAN, TAG_GENERALIZED_TIME, TAG_INTEGER, TAG_NULL,
     TAG_OID, TAG_UTC_TIME,
@@ -76,9 +77,16 @@ fn event_loop(terminal: &mut DefaultTerminal, app: &mut App) -> io::Result<()> {
     let mut last_fs_poll = Instant::now();
     loop {
         terminal.draw(|f| draw(f, app))?;
+        // While a background re-key runs, poll it for completion (which applies
+        // the result and closes the progress window). The 250 ms poll below
+        // keeps the elapsed-time display ticking meanwhile.
+        if matches!(app.mode, Mode::Progress(_)) {
+            app.poll_rekey_progress();
+        }
         // Reconcile the browser with the filesystem on a timer (the poll below
-        // wakes at least every 250 ms even when the user is idle).
-        if last_fs_poll.elapsed() >= FS_POLL_INTERVAL {
+        // wakes at least every 250 ms even when the user is idle) — but not
+        // while a re-key worker is writing files, to avoid racing it.
+        if !matches!(app.mode, Mode::Progress(_)) && last_fs_poll.elapsed() >= FS_POLL_INTERVAL {
             app.refresh_filesystem();
             last_fs_poll = Instant::now();
         }
@@ -122,6 +130,9 @@ fn event_loop(terminal: &mut DefaultTerminal, app: &mut App) -> io::Result<()> {
             Mode::EditExtKeyUsage(_) => handle_ext_key_usage_key(app, key),
             Mode::FilterInput => handle_filter_key(app, key),
             Mode::Notice(_) => app.dismiss_notice(), // any key dismisses
+            // A running re-key cannot be safely interrupted (a partial XMSS
+            // state advance would be unrecoverable): ignore all input.
+            Mode::Progress(_) => {}
             Mode::Browse => {
                 if key.code != KeyCode::Char('q') {
                     app.quit_confirm = false;
@@ -417,6 +428,80 @@ fn draw(frame: &mut Frame, app: &mut App) {
     if matches!(app.mode, Mode::Notice(_)) {
         draw_notice(frame, app, main);
     }
+    if matches!(app.mode, Mode::Progress(_)) {
+        draw_progress(frame, app, main);
+    }
+}
+
+/// Centered popup shown while a background re-key runs: the operation title,
+/// the elapsed time (ticking as the event loop redraws), and — when known —
+/// the estimated total time and a progress bar.
+fn draw_progress(frame: &mut Frame, app: &App, area: Rect) {
+    let Mode::Progress(ref p) = app.mode else { return };
+    let width = 54.min(area.width);
+    let height = 8.min(area.height);
+    let popup = Rect {
+        x: area.x + (area.width.saturating_sub(width)) / 2,
+        y: area.y + (area.height.saturating_sub(height)) / 2,
+        width,
+        height,
+    };
+    frame.render_widget(Clear, popup);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::new().fg(Color::Cyan))
+        .title(" WORKING — please wait ");
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    let lines = progress_lines(
+        &p.title,
+        p.start.elapsed(),
+        p.estimate,
+        inner.width.saturating_sub(2) as usize,
+    );
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+/// Build the progress window's body: the title, the elapsed time, and — when
+/// an estimate is known — the estimated total (clock symbol) and an
+/// elapsed/estimated bar `bar_width` cells wide (capped at full, since the
+/// estimate is only a guide the real time may overrun).
+fn progress_lines(
+    title: &str,
+    elapsed: Duration,
+    estimate: Option<Duration>,
+    bar_width: usize,
+) -> Vec<Line<'static>> {
+    let mut lines = vec![
+        Line::from(Span::styled(title.to_string(), Style::new().bold())),
+        Line::default(),
+        Line::from(vec![
+            Span::styled("elapsed:   ", Style::new().dim()),
+            Span::raw(cost::format_hms(elapsed)),
+        ]),
+    ];
+    match estimate {
+        Some(est) => {
+            lines.push(Line::from(vec![
+                Span::styled("estimated: ", Style::new().dim()),
+                Span::styled(
+                    format!("🕐 {}", cost::format_hms(est)),
+                    Style::new().fg(Color::Yellow),
+                ),
+            ]));
+            let frac = (elapsed.as_secs_f64() / est.as_secs_f64().max(0.001)).min(1.0);
+            let filled = (frac * bar_width as f64).round() as usize;
+            let bar: String = std::iter::repeat_n('█', filled)
+                .chain(std::iter::repeat_n('░', bar_width.saturating_sub(filled)))
+                .collect();
+            lines.push(Line::from(Span::styled(bar, Style::new().fg(Color::Cyan))));
+        }
+        None => {
+            lines.push(Line::from(Span::styled("estimated: unknown", Style::new().dim())));
+        }
+    }
+    lines
 }
 
 /// Centered popup for a dismissible informational notice (used at start-up to
@@ -496,6 +581,62 @@ fn wrap_text(text: &str, width: usize) -> Vec<String> {
     lines
 }
 
+/// The re-key time-estimate line(s) for the dialog's parameter column, or
+/// empty for a fast algorithm (no estimate shown). The estimate covers the
+/// key generation (when generating a new key) plus one signature per object
+/// re-signed: the certificate itself when self-signed, and every selected
+/// issued object.
+fn pubkey_estimate_lines(app: &App, s: &PubKeyState, width: usize) -> Vec<Line<'static>> {
+    let alg = s.dialog_algorithm();
+    if !alg.shows_time_estimate() {
+        return Vec::new();
+    }
+    let self_signed =
+        matches!(app.sig_status, Some(SignatureStatus::Verified { self_signed: true, .. }));
+    let n_sigs = usize::from(self_signed) + s.selected_issued_count();
+    let Some(estimate) = cost::rekey_estimate(alg, n_sigs, !s.use_existing) else {
+        return Vec::new();
+    };
+    clock_estimate_lines(&cost::format_hms(estimate), width)
+}
+
+/// Render `hms` prefixed with a clock symbol, on one line when it fits in
+/// `width`, otherwise wrapped onto two lines (comma-separated units split
+/// across them, clock on the first) so the parameter column need not widen.
+fn clock_estimate_lines(hms: &str, width: usize) -> Vec<Line<'static>> {
+    const CLOCK: &str = "🕐 ";
+    const CLOCK_W: usize = 3; // clock emoji (~2 cells) + a space
+    let style = Style::new().fg(Color::Yellow);
+    if CLOCK_W + hms.chars().count() <= width {
+        return vec![Line::from(Span::styled(format!("{CLOCK}{hms}"), style))];
+    }
+    // Pack the "x h, y mins, z secs" units greedily onto the first line
+    // (after the clock), leaving one column for the trailing comma; the rest
+    // go on the second line, indented under the time text.
+    let tokens: Vec<&str> = hms.split(", ").collect();
+    let mut idx = 0;
+    let mut first = String::new();
+    while idx < tokens.len() {
+        let trial =
+            if first.is_empty() { tokens[idx].to_string() } else { format!("{first}, {}", tokens[idx]) };
+        let has_more = idx + 1 < tokens.len();
+        if !first.is_empty() && CLOCK_W + trial.chars().count() + usize::from(has_more) > width {
+            break;
+        }
+        first = trial;
+        idx += 1;
+    }
+    let rest = tokens[idx..].join(", ");
+    let mut out = Vec::new();
+    if rest.is_empty() {
+        out.push(Line::from(Span::styled(format!("{CLOCK}{first}"), style)));
+    } else {
+        out.push(Line::from(Span::styled(format!("{CLOCK}{first},"), style)));
+        out.push(Line::from(Span::styled(format!("   {rest}"), style)));
+    }
+    out
+}
+
 /// Centered four-column popup for the public-key modification dialog:
 /// algorithm family | parameters | key-generation options | issued
 /// certificates to resign.
@@ -520,7 +661,8 @@ fn draw_edit_pubkey(frame: &mut Frame, app: &App, area: Rect) {
         Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(inner);
     let [alg_col, param_col, opt_col, issued_col] = Layout::horizontal([
         Constraint::Length(12),
-        Constraint::Length(16),
+        // Wide enough for the longest parameter label (" SHAKE256_16_192 ").
+        Constraint::Length(18),
         Constraint::Length(34),
         Constraint::Min(20),
     ])
@@ -562,13 +704,24 @@ fn draw_edit_pubkey(frame: &mut Frame, app: &App, area: Rect) {
         param_rows.push(format!("custom: {}", field_value(&s.custom_rsa_bits)));
     }
     let mut param_lines = vec![header("Parameters", s.column == 1)];
-    let visible = (param_col.height as usize).saturating_sub(1).max(1);
+    // For the slow families (XMSS, SLH-DSA), estimate the whole re-key's
+    // wall-clock for the current parameter set and object selection, shown
+    // below the list with a clock symbol. It reserves room at the bottom of
+    // the column so the parameter list scrolls above it.
+    let estimate_lines = pubkey_estimate_lines(app, s, param_col.width as usize);
+    let reserve = if estimate_lines.is_empty() { 0 } else { estimate_lines.len() + 1 };
+    let visible =
+        (param_col.height as usize).saturating_sub(1).saturating_sub(reserve).max(1);
     let start = s
         .param_idx
         .saturating_sub(visible.saturating_sub(1))
         .min(param_rows.len().saturating_sub(visible));
     for (i, label) in param_rows.into_iter().enumerate().skip(start).take(visible) {
         param_lines.push(row(label, i == s.param_idx, s.column == 1));
+    }
+    if !estimate_lines.is_empty() {
+        param_lines.push(Line::default());
+        param_lines.extend(estimate_lines);
     }
     frame.render_widget(Paragraph::new(param_lines), param_col);
 
@@ -2472,6 +2625,7 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
         }
         Mode::FilterInput => "type to filter (hex/text/int/OID)  ⏎/Tab navigate  Esc clear",
         Mode::Notice(_) => "press any key to dismiss",
+        Mode::Progress(_) => "working — the operation cannot be interrupted",
     };
     let line = Line::from(vec![
         Span::styled(dirty, Style::new().fg(Color::Red).bold()),
@@ -2899,6 +3053,94 @@ mod tests {
         assert_eq!(lines.len(), 1);
         let text: String = lines[0].spans.iter().map(|s| s.content.as_ref()).collect();
         assert_eq!(text, "Decoded 42");
+    }
+
+    fn line_text(l: &Line) -> String {
+        l.spans.iter().map(|s| s.content.as_ref()).collect()
+    }
+
+    #[test]
+    fn rekey_dialog_shows_time_estimate_for_xmss_but_not_ecdsa() {
+        use crate::input::Container;
+        use ratatui::{backend::TestBackend, Terminal};
+        let der =
+            std::fs::read(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("testdata/cert_rsa.der"))
+                .unwrap();
+        let roots = parse_forest(&der, 0).unwrap();
+        let mut app = App::new(
+            PathBuf::from("cert_rsa.der"),
+            PathBuf::from("cert_rsa.der"),
+            Container::Raw,
+            roots,
+            der.len(),
+        );
+        app.start_rekey();
+        assert!(matches!(app.mode, Mode::EditPubKey(_)), "rekey dialog: {}", app.status);
+        let mut term = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        // ECDSA (the default family) is fast — no clock estimate.
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        assert!(
+            !buffer_text(term.backend().buffer()).contains('🕐'),
+            "no estimate should show for a fast algorithm"
+        );
+        // Move the family selection down to XMSS; the estimate appears.
+        let xmss = keygen::FAMILIES.iter().position(|f| f.label == "XMSS").unwrap();
+        for _ in 0..xmss {
+            app.pubkey_move_row(1);
+        }
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        assert!(
+            buffer_text(term.backend().buffer()).contains('🕐'),
+            "clock estimate should show for XMSS"
+        );
+    }
+
+    #[test]
+    fn progress_lines_show_elapsed_estimate_and_a_capped_bar() {
+        let lines = progress_lines(
+            "Re-keying to XMSS-SHA2_16_512",
+            Duration::from_secs(90),
+            Some(Duration::from_secs(180)),
+            20,
+        );
+        let joined: Vec<String> = lines.iter().map(line_text).collect();
+        assert!(joined[0].contains("XMSS-SHA2_16_512"), "title");
+        assert!(joined.iter().any(|l| l.contains("elapsed:") && l.contains("1 mins, 30 secs")));
+        assert!(joined.iter().any(|l| l.contains("estimated:") && l.contains("🕐 3 mins")));
+        // Halfway through the estimate → about half the 20-cell bar filled.
+        let bar = joined.last().unwrap();
+        assert_eq!(bar.chars().count(), 20, "bar spans the width: {bar}");
+        assert_eq!(bar.chars().filter(|&c| c == '█').count(), 10);
+        // A running job with no estimate degrades gracefully.
+        let unknown = progress_lines("x", Duration::from_secs(1), None, 20);
+        assert!(line_text(unknown.last().unwrap()).contains("unknown"));
+    }
+
+    #[test]
+    fn clock_estimate_stays_on_one_line_when_it_fits() {
+        let lines = clock_estimate_lines("41 secs", 18);
+        assert_eq!(lines.len(), 1);
+        let t = line_text(&lines[0]);
+        assert!(t.starts_with("🕐 ") && t.ends_with("41 secs"), "{t}");
+    }
+
+    #[test]
+    fn clock_estimate_wraps_to_two_lines_instead_of_widening() {
+        // "2 h, 2 mins, 5 secs" (19 chars) + clock exceeds an 18-col column.
+        let lines = clock_estimate_lines("2 h, 2 mins, 5 secs", 18);
+        assert_eq!(lines.len(), 2, "should wrap rather than widen");
+        let l0 = line_text(&lines[0]);
+        let l1 = line_text(&lines[1]);
+        assert!(l0.starts_with("🕐 "), "clock on the first line: {l0}");
+        // Every unit survives the split across the two lines, in order.
+        for tok in ["2 h", "2 mins", "5 secs"] {
+            assert!(l0.contains(tok) || l1.contains(tok), "lost unit {tok}");
+        }
+        // Each line's rendered width (clock counts as two cells) fits the column.
+        for (i, l) in [&l0, &l1].iter().enumerate() {
+            let cells = l.chars().map(|c| if c == '🕐' { 2 } else { 1 }).sum::<usize>();
+            assert!(cells <= 18, "line {i} too wide ({cells} cells): {l}");
+        }
     }
 
     #[test]
