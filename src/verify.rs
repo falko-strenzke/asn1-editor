@@ -18,7 +18,10 @@
 //! shape it already takes from `x509::Signable`.
 //!
 //! Two backends: classical algorithms use `aws-lc-rs` — RSA PKCS#1 v1.5
-//! (SHA-1/256/384/512), ECDSA (P-256/SHA-256, P-384/SHA-384), Ed25519 — while
+//! (SHA-1/256/384/512), ECDSA (P-256/SHA-256, P-384/SHA-384), Ed25519 — with
+//! an OpenSSL fallback for RSA moduli outside `aws-lc-rs`'s parameter ranges
+//! (the deliberately weak 512/768/1024-bit sizes the key generator offers) —
+//! while
 //! the post-quantum FIPS 204 (ML-DSA) and FIPS 205 (SLH-DSA) algorithms use the
 //! `openssl` crate (OpenSSL 3.5+), which covers both families; `aws-lc-rs` has
 //! ML-DSA but not SLH-DSA, so OpenSSL is used uniformly for the pair. The PQ
@@ -33,6 +36,7 @@ use aws_lc_rs::signature;
 use crate::ber;
 use crate::x509::{self, CaCandidate, PublicKeyId, Signable, SignableFile};
 
+const RSA_ENCRYPTION: &[u64] = &[1, 2, 840, 113549, 1, 1, 1];
 const SHA1_WITH_RSA: &[u64] = &[1, 2, 840, 113549, 1, 1, 5];
 const SHA256_WITH_RSA: &[u64] = &[1, 2, 840, 113549, 1, 1, 11];
 const SHA384_WITH_RSA: &[u64] = &[1, 2, 840, 113549, 1, 1, 12];
@@ -112,10 +116,34 @@ pub fn private_key_usable(pkcs8_key: &[u8]) -> bool {
         )
         .is_ok()
         || signature::RsaKeyPair::from_pkcs8(pkcs8_key).is_ok()
+        // An RSA key outside aws-lc-rs's modulus range (e.g. the deliberately
+        // weak 512/768-bit sizes) is validated by OpenSSL instead.
+        || (pkcs8_alg_arcs(pkcs8_key).as_deref() == Some(RSA_ENCRYPTION)
+            && rsa_private_key_usable(pkcs8_key))
         || signature::Ed25519KeyPair::from_pkcs8(pkcs8_key).is_ok()
         // A post-quantum key (ML-DSA/SLH-DSA) loads via OpenSSL, not aws-lc-rs.
         || (pkcs8_is_pq(pkcs8_key)
             && openssl::pkey::PKey::private_key_from_pkcs8(pkcs8_key).is_ok())
+}
+
+/// Whether `pkcs8_key` is a consistent RSA private key according to OpenSSL
+/// (`RSA_check_key`, which validates the primes against the modulus — the
+/// small-key counterpart of `RsaKeyPair::from_pkcs8`'s checks).
+fn rsa_private_key_usable(pkcs8_key: &[u8]) -> bool {
+    openssl::pkey::PKey::private_key_from_pkcs8(pkcs8_key)
+        .ok()
+        .and_then(|key| key.rsa().ok())
+        .is_some_and(|rsa| rsa.check_key().unwrap_or(false))
+}
+
+/// The `privateKeyAlgorithm` OID arcs of a PKCS#8 `PrivateKeyInfo`.
+fn pkcs8_alg_arcs(pkcs8_key: &[u8]) -> Option<Vec<u64>> {
+    let roots = ber::parse_forest(pkcs8_key, 0).ok()?;
+    roots
+        .first()
+        .and_then(|r| r.children.get(1)) // privateKeyAlgorithm
+        .and_then(|a| a.children.first()) // algorithm OID
+        .and_then(|o| ber::oid_arcs(&o.value))
 }
 
 /// Whether a PKCS#8 `PrivateKeyInfo`'s `privateKeyAlgorithm` is a pure
@@ -123,13 +151,7 @@ pub fn private_key_usable(pkcs8_key: &[u8]) -> bool {
 /// keys keep their stricter `aws-lc-rs` validation (which also catches a
 /// corrupted EC scalar).
 fn pkcs8_is_pq(pkcs8_key: &[u8]) -> bool {
-    let Ok(roots) = ber::parse_forest(pkcs8_key, 0) else { return false };
-    let alg = roots
-        .first()
-        .and_then(|r| r.children.get(1)) // privateKeyAlgorithm
-        .and_then(|a| a.children.first()) // algorithm OID
-        .and_then(|o| ber::oid_arcs(&o.value));
-    alg.as_deref().is_some_and(is_pq)
+    pkcs8_alg_arcs(pkcs8_key).as_deref().is_some_and(is_pq)
 }
 
 /// Whether `signature` is a valid `sig_alg` signature over `tbs` under the
@@ -140,10 +162,57 @@ pub fn verify_signature(sig_alg: &[u64], pubkey: &[u8], tbs: &[u8], signature: &
     if is_pq(sig_alg) {
         return pq_verify(sig_alg, pubkey, tbs, signature);
     }
-    match algorithm_for(sig_alg) {
+    let ok = match algorithm_for(sig_alg) {
         Some(alg) => signature::UnparsedPublicKey::new(alg, pubkey).verify(tbs, signature).is_ok(),
         None => false,
+    };
+    // aws-lc-rs refuses RSA moduli outside its parameter ranges (SHA-2 needs
+    // ≥ 2048 bits); retry with OpenSSL so signatures under the weak RSA key
+    // sizes the key generator offers still verify.
+    ok || rsa_openssl_verify(sig_alg, pubkey, tbs, signature)
+}
+
+/// Map an RSA X.509 signature-algorithm OID to the message digest used by the
+/// OpenSSL small-modulus fallback.
+fn rsa_openssl_digest(sig_alg: &[u64]) -> Option<openssl::hash::MessageDigest> {
+    use openssl::hash::MessageDigest;
+    if sig_alg == SHA1_WITH_RSA {
+        Some(MessageDigest::sha1())
+    } else if sig_alg == SHA256_WITH_RSA {
+        Some(MessageDigest::sha256())
+    } else if sig_alg == SHA384_WITH_RSA {
+        Some(MessageDigest::sha384())
+    } else if sig_alg == SHA512_WITH_RSA {
+        Some(MessageDigest::sha512())
+    } else {
+        None
     }
+}
+
+/// Verify an RSA PKCS#1 v1.5 signature with OpenSSL. `pubkey` is the raw
+/// `subjectPublicKey` bytes, i.e. a PKCS#1 `RSAPublicKey` DER. Returns false
+/// for non-RSA algorithms.
+fn rsa_openssl_verify(sig_alg: &[u64], pubkey: &[u8], tbs: &[u8], signature: &[u8]) -> bool {
+    let Some(digest) = rsa_openssl_digest(sig_alg) else { return false };
+    let Ok(rsa) = openssl::rsa::Rsa::public_key_from_der_pkcs1(pubkey) else { return false };
+    let Ok(key) = openssl::pkey::PKey::from_rsa(rsa) else { return false };
+    let Ok(mut verifier) = openssl::sign::Verifier::new(digest, &key) else { return false };
+    verifier.verify_oneshot(signature, tbs).unwrap_or(false)
+}
+
+/// Sign with an RSA private key through OpenSSL (PKCS#1 v1.5) — the fallback
+/// for moduli `aws-lc-rs` refuses to load.
+fn rsa_openssl_sign(sig_alg: &[u64], pkcs8_key: &[u8], tbs: &[u8]) -> Result<Vec<u8>, String> {
+    let digest = rsa_openssl_digest(sig_alg)
+        .ok_or_else(|| "unsupported RSA signature algorithm".to_string())?;
+    let key = openssl::pkey::PKey::private_key_from_pkcs8(pkcs8_key)
+        .map_err(|_| "the signing key is not a usable RSA key".to_string())?;
+    if key.rsa().is_err() {
+        return Err("the signing key is not a usable RSA key".to_string());
+    }
+    let mut signer = openssl::sign::Signer::new(digest, &key)
+        .map_err(|e| format!("RSA signer init failed: {}", e))?;
+    signer.sign_oneshot_to_vec(tbs).map_err(|e| format!("RSA signing failed: {}", e))
 }
 
 /// Verify a pure ML-DSA/SLH-DSA signature with OpenSSL. `pubkey` is the raw
@@ -221,8 +290,11 @@ pub fn sign(sig_alg: &[u64], pkcs8_key: &[u8], tbs: &[u8]) -> Result<Vec<u8>, St
         None
     };
     if let Some(padding) = rsa_padding {
-        let key = signature::RsaKeyPair::from_pkcs8(pkcs8_key)
-            .map_err(|_| "the signing key is not a usable RSA key".to_string())?;
+        // A modulus outside aws-lc-rs's range (e.g. a weak 512/768-bit key)
+        // fails to load; those sign through the OpenSSL fallback instead.
+        let Ok(key) = signature::RsaKeyPair::from_pkcs8(pkcs8_key) else {
+            return rsa_openssl_sign(sig_alg, pkcs8_key, tbs);
+        };
         let mut sig = vec![0u8; key.public_modulus_len()];
         key.sign(padding, &rng, tbs, &mut sig)
             .map_err(|_| "RSA signing failed".to_string())?;

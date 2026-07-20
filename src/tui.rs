@@ -492,11 +492,12 @@ fn wrap_text(text: &str, width: usize) -> Vec<String> {
     lines
 }
 
-/// Centered three-column popup for the public-key modification dialog:
-/// algorithm choice | key-generation options | issued certificates to resign.
+/// Centered four-column popup for the public-key modification dialog:
+/// algorithm family | parameters | key-generation options | issued
+/// certificates to resign.
 fn draw_edit_pubkey(frame: &mut Frame, app: &App, area: Rect) {
     let Mode::EditPubKey(ref s) = app.mode else { return };
-    let width = 92.min(area.width);
+    let width = 96.min(area.width);
     let height = 22.min(area.height);
     let popup = Rect {
         x: area.x + (area.width.saturating_sub(width)) / 2,
@@ -513,8 +514,9 @@ fn draw_edit_pubkey(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(block, popup);
     let [cols_area, hint_area] =
         Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(inner);
-    let [alg_col, opt_col, issued_col] = Layout::horizontal([
-        Constraint::Length(26),
+    let [alg_col, param_col, opt_col, issued_col] = Layout::horizontal([
+        Constraint::Length(12),
+        Constraint::Length(16),
         Constraint::Length(34),
         Constraint::Min(20),
     ])
@@ -539,21 +541,36 @@ fn draw_edit_pubkey(frame: &mut Frame, app: &App, area: Rect) {
         Line::from(Span::styled(format!(" {} ", text), style))
     };
 
-    // Column 0: algorithm list, scrolled so the selection stays visible
-    // (there are more algorithms than the popup is tall).
+    // Column 0: the algorithm families (all five fit without scrolling).
     let mut alg_lines = vec![header("Algorithm", s.column == 0)];
-    let visible = (alg_col.height as usize).saturating_sub(1).max(1);
-    let start = s.alg_idx.saturating_sub(visible.saturating_sub(1)).min(
-        keygen::ALL.len().saturating_sub(visible),
-    );
-    for (i, alg) in keygen::ALL.iter().enumerate().skip(start).take(visible) {
-        alg_lines.push(row(alg.label().to_string(), i == s.alg_idx, s.column == 0));
+    for (i, family) in keygen::FAMILIES.iter().enumerate() {
+        alg_lines.push(row(family.label.to_string(), i == s.family_idx, s.column == 0));
     }
     frame.render_widget(Paragraph::new(alg_lines), alg_col);
 
-    // Column 1: key-source radio, then either the generate fields (file name,
+    // Column 1: the chosen family's parameters (curve, RSA key size,
+    // parameter set) plus, for RSA, a free-entry custom-size row; scrolled so
+    // the selection stays visible.
+    let family = &keygen::FAMILIES[s.family_idx];
+    let mut param_rows: Vec<String> =
+        family.members.iter().map(|alg| alg.param_label().to_string()).collect();
+    if family.custom_modulus {
+        param_rows.push(format!("custom: {}", field_value(&s.custom_rsa_bits)));
+    }
+    let mut param_lines = vec![header("Parameters", s.column == 1)];
+    let visible = (param_col.height as usize).saturating_sub(1).max(1);
+    let start = s
+        .param_idx
+        .saturating_sub(visible.saturating_sub(1))
+        .min(param_rows.len().saturating_sub(visible));
+    for (i, label) in param_rows.into_iter().enumerate().skip(start).take(visible) {
+        param_lines.push(row(label, i == s.param_idx, s.column == 1));
+    }
+    frame.render_widget(Paragraph::new(param_lines), param_col);
+
+    // Column 2: key-source radio, then either the generate fields (file name,
     // password) or the list of existing keys fitting the chosen algorithm.
-    let active1 = s.column == 1;
+    let active1 = s.column == 2;
     let radio_active = active1 && s.option_field == 0;
     let gen_mark = if s.use_existing { "( )" } else { "(•)" };
     let use_mark = if s.use_existing { "(•)" } else { "( )" };
@@ -586,8 +603,8 @@ fn draw_edit_pubkey(frame: &mut Frame, app: &App, area: Rect) {
     }
     frame.render_widget(Paragraph::new(opt_lines), opt_col);
 
-    // Column 2: issued certificates and CRLs with resign checkboxes.
-    let mut issued_lines = vec![header("Resign issued objects", s.column == 2)];
+    // Column 3: issued certificates and CRLs with resign checkboxes.
+    let mut issued_lines = vec![header("Resign issued objects", s.column == 3)];
     if s.issued.is_empty() {
         issued_lines.push(Line::from(Span::styled(" (none found)", Style::new().dim())));
     } else {
@@ -596,13 +613,13 @@ fn draw_edit_pubkey(frame: &mut Frame, app: &App, area: Rect) {
         for (i, cert) in s.issued.iter().enumerate().skip(start).take(visible) {
             let box_ = if cert.selected { "[x]" } else { "[ ]" };
             let label = format!("{} {}  {}", box_, cert.name, cert.detail);
-            issued_lines.push(row(label, i == s.issued_idx, s.column == 2));
+            issued_lines.push(row(label, i == s.issued_idx, s.column == 3));
         }
     }
     frame.render_widget(Paragraph::new(issued_lines), issued_col);
 
     let hint = Line::from(Span::styled(
-        "←→ column  ↑↓ move  Space toggle  type to edit name/password  ⏎ apply  Esc cancel",
+        "←→ column  ↑↓ move  Space toggle  type to edit size/name/password  ⏎ apply  Esc cancel",
         Style::new().dim(),
     ));
     frame.render_widget(Paragraph::new(hint), hint_area);
@@ -2414,7 +2431,7 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
         Mode::Password(_) => "type password  ⏎ decrypt  Esc cancel",
         Mode::Resign(_) => "⏎ create new signature (if available)  Esc cancel",
         Mode::EditPubKey(_) => {
-            "←→ column  ↑↓ move  Space toggle  type name/password  ⏎ apply  Esc cancel"
+            "←→ column  ↑↓ move  Space toggle  type size/name/password  ⏎ apply  Esc cancel"
         }
         Mode::EditBasicConstraints(_) => {
             "↑↓ field  Space toggle  digits set pathLen  ⏎ apply  Esc cancel"

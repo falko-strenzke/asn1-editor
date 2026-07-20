@@ -23,12 +23,17 @@
 //! `pkcs8.rs` can later decrypt.
 //!
 //! The supported algorithms are those `verify` can both *sign* with and
-//! *verify*: classically, RSA with SHA-256 (2048/4096-bit keys), ECDSA on
+//! *verify*: classically, RSA with SHA-256 (512- to 8192-bit keys), ECDSA on
 //! P-256 (SHA-256) and P-384 (SHA-384), and Ed25519; and, post-quantum, the
 //! FIPS 204 ML-DSA (44/65/87) and FIPS 205 SLH-DSA (all twelve parameter sets)
 //! families. The post-quantum keys are generated with OpenSSL by algorithm
 //! name (`EVP_PKEY_CTX_new_from_name`, via raw `openssl-sys` FFI, since the
 //! safe crate lacks SLH-DSA), then handled by the same PKCS#8/SPKI code paths.
+//!
+//! The dialog presents the algorithms as a *family* (ECDSA, RSA, Ed25519,
+//! ML-DSA, SLH-DSA — [`FAMILIES`]) plus a per-family *parameter* (the curve
+//! for ECDSA, the key size for RSA, the parameter set for ML-DSA/SLH-DSA);
+//! each `(family, parameter)` pair resolves to one [`KeyAlgorithm`].
 
 use std::ffi::CString;
 use std::ptr;
@@ -45,8 +50,12 @@ use crate::ber::{self, Class, Node, TAG_NULL, TAG_OID, TAG_SEQUENCE};
 /// A signature algorithm the program can generate a key for and sign with.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum KeyAlgorithm {
-    RsaSha256_2048,
-    RsaSha256_4096,
+    /// RSA with SHA-256, identified by its key-size entry in [`RSA`].
+    Rsa(usize),
+    /// RSA with SHA-256 and a user-entered modulus size in bits (the
+    /// parameter column's "custom" row); valid sizes are
+    /// [`RSA_CUSTOM_BITS_MIN`]..=[`RSA_CUSTOM_BITS_MAX`].
+    RsaCustom(u32),
     EcdsaP256,
     EcdsaP384,
     Ed25519,
@@ -54,44 +63,148 @@ pub enum KeyAlgorithm {
     Pq(usize),
 }
 
+/// Bounds for a custom RSA modulus size: OpenSSL refuses to generate keys
+/// below 512 bits (and SHA-256 PKCS#1 v1.5 needs at least 496); the upper
+/// bound keeps generation time within reason.
+pub const RSA_CUSTOM_BITS_MIN: u32 = 512;
+pub const RSA_CUSTOM_BITS_MAX: u32 = 16384;
+
+/// Static description of one RSA key size: the modulus bits, the labels for
+/// the dialog (full and parameter-column form) and a filename token.
+struct RsaDesc {
+    bits: u32,
+    name: &'static str,
+    param: &'static str,
+    short: &'static str,
+}
+
+/// The RSA key sizes, indexed by `KeyAlgorithm::Rsa(i)`, in ascending order.
+const RSA: &[RsaDesc] = &[
+    RsaDesc { bits: 512, name: "RSA-512 (SHA-256)", param: "512", short: "rsa512" },
+    RsaDesc { bits: 768, name: "RSA-768 (SHA-256)", param: "768", short: "rsa768" },
+    RsaDesc { bits: 1024, name: "RSA-1024 (SHA-256)", param: "1024", short: "rsa1024" },
+    RsaDesc { bits: 2048, name: "RSA-2048 (SHA-256)", param: "2048", short: "rsa2048" },
+    RsaDesc { bits: 3072, name: "RSA-3072 (SHA-256)", param: "3072", short: "rsa3072" },
+    RsaDesc { bits: 4096, name: "RSA-4096 (SHA-256)", param: "4096", short: "rsa4096" },
+    RsaDesc { bits: 8192, name: "RSA-8192 (SHA-256)", param: "8192", short: "rsa8192" },
+];
+
 /// Static description of one post-quantum algorithm: its full X.509
 /// `signatureAlgorithm` OID (under `2.16.840.1.101.3.4.3`), its OpenSSL/FIPS
 /// name (used both as the display label and the `EVP_PKEY_CTX_new_from_name`
-/// string), and a filename token.
+/// string), its parameter-column label (the name without the family prefix),
+/// and a filename token.
 struct PqDesc {
     oid: &'static [u64],
     name: &'static str,
+    param: &'static str,
     short: &'static str,
 }
 
 /// The post-quantum algorithms, indexed by `KeyAlgorithm::Pq(i)`: ML-DSA
 /// (FIPS 204) then SLH-DSA (FIPS 205), matching the NIST OID order.
 const PQ: &[PqDesc] = &[
-    PqDesc { oid: &[2, 16, 840, 1, 101, 3, 4, 3, 17], name: "ML-DSA-44", short: "mldsa44" },
-    PqDesc { oid: &[2, 16, 840, 1, 101, 3, 4, 3, 18], name: "ML-DSA-65", short: "mldsa65" },
-    PqDesc { oid: &[2, 16, 840, 1, 101, 3, 4, 3, 19], name: "ML-DSA-87", short: "mldsa87" },
-    PqDesc { oid: &[2, 16, 840, 1, 101, 3, 4, 3, 20], name: "SLH-DSA-SHA2-128s", short: "slhdsa-sha2-128s" },
-    PqDesc { oid: &[2, 16, 840, 1, 101, 3, 4, 3, 21], name: "SLH-DSA-SHA2-128f", short: "slhdsa-sha2-128f" },
-    PqDesc { oid: &[2, 16, 840, 1, 101, 3, 4, 3, 22], name: "SLH-DSA-SHA2-192s", short: "slhdsa-sha2-192s" },
-    PqDesc { oid: &[2, 16, 840, 1, 101, 3, 4, 3, 23], name: "SLH-DSA-SHA2-192f", short: "slhdsa-sha2-192f" },
-    PqDesc { oid: &[2, 16, 840, 1, 101, 3, 4, 3, 24], name: "SLH-DSA-SHA2-256s", short: "slhdsa-sha2-256s" },
-    PqDesc { oid: &[2, 16, 840, 1, 101, 3, 4, 3, 25], name: "SLH-DSA-SHA2-256f", short: "slhdsa-sha2-256f" },
-    PqDesc { oid: &[2, 16, 840, 1, 101, 3, 4, 3, 26], name: "SLH-DSA-SHAKE-128s", short: "slhdsa-shake-128s" },
-    PqDesc { oid: &[2, 16, 840, 1, 101, 3, 4, 3, 27], name: "SLH-DSA-SHAKE-128f", short: "slhdsa-shake-128f" },
-    PqDesc { oid: &[2, 16, 840, 1, 101, 3, 4, 3, 28], name: "SLH-DSA-SHAKE-192s", short: "slhdsa-shake-192s" },
-    PqDesc { oid: &[2, 16, 840, 1, 101, 3, 4, 3, 29], name: "SLH-DSA-SHAKE-192f", short: "slhdsa-shake-192f" },
-    PqDesc { oid: &[2, 16, 840, 1, 101, 3, 4, 3, 30], name: "SLH-DSA-SHAKE-256s", short: "slhdsa-shake-256s" },
-    PqDesc { oid: &[2, 16, 840, 1, 101, 3, 4, 3, 31], name: "SLH-DSA-SHAKE-256f", short: "slhdsa-shake-256f" },
+    PqDesc { oid: &[2, 16, 840, 1, 101, 3, 4, 3, 17], name: "ML-DSA-44", param: "44", short: "mldsa44" },
+    PqDesc { oid: &[2, 16, 840, 1, 101, 3, 4, 3, 18], name: "ML-DSA-65", param: "65", short: "mldsa65" },
+    PqDesc { oid: &[2, 16, 840, 1, 101, 3, 4, 3, 19], name: "ML-DSA-87", param: "87", short: "mldsa87" },
+    PqDesc { oid: &[2, 16, 840, 1, 101, 3, 4, 3, 20], name: "SLH-DSA-SHA2-128s", param: "SHA2-128s", short: "slhdsa-sha2-128s" },
+    PqDesc { oid: &[2, 16, 840, 1, 101, 3, 4, 3, 21], name: "SLH-DSA-SHA2-128f", param: "SHA2-128f", short: "slhdsa-sha2-128f" },
+    PqDesc { oid: &[2, 16, 840, 1, 101, 3, 4, 3, 22], name: "SLH-DSA-SHA2-192s", param: "SHA2-192s", short: "slhdsa-sha2-192s" },
+    PqDesc { oid: &[2, 16, 840, 1, 101, 3, 4, 3, 23], name: "SLH-DSA-SHA2-192f", param: "SHA2-192f", short: "slhdsa-sha2-192f" },
+    PqDesc { oid: &[2, 16, 840, 1, 101, 3, 4, 3, 24], name: "SLH-DSA-SHA2-256s", param: "SHA2-256s", short: "slhdsa-sha2-256s" },
+    PqDesc { oid: &[2, 16, 840, 1, 101, 3, 4, 3, 25], name: "SLH-DSA-SHA2-256f", param: "SHA2-256f", short: "slhdsa-sha2-256f" },
+    PqDesc { oid: &[2, 16, 840, 1, 101, 3, 4, 3, 26], name: "SLH-DSA-SHAKE-128s", param: "SHAKE-128s", short: "slhdsa-shake-128s" },
+    PqDesc { oid: &[2, 16, 840, 1, 101, 3, 4, 3, 27], name: "SLH-DSA-SHAKE-128f", param: "SHAKE-128f", short: "slhdsa-shake-128f" },
+    PqDesc { oid: &[2, 16, 840, 1, 101, 3, 4, 3, 28], name: "SLH-DSA-SHAKE-192s", param: "SHAKE-192s", short: "slhdsa-shake-192s" },
+    PqDesc { oid: &[2, 16, 840, 1, 101, 3, 4, 3, 29], name: "SLH-DSA-SHAKE-192f", param: "SHAKE-192f", short: "slhdsa-shake-192f" },
+    PqDesc { oid: &[2, 16, 840, 1, 101, 3, 4, 3, 30], name: "SLH-DSA-SHAKE-256s", param: "SHAKE-256s", short: "slhdsa-shake-256s" },
+    PqDesc { oid: &[2, 16, 840, 1, 101, 3, 4, 3, 31], name: "SLH-DSA-SHAKE-256f", param: "SHAKE-256f", short: "slhdsa-shake-256f" },
 ];
 
-/// The algorithms offered in the public-key modification dialog, in display
-/// order: classical first, then the post-quantum families.
+/// One algorithm family of the dialog's first column; the members are the
+/// choices of its parameter column, in display order.
+pub struct Family {
+    /// First-column label (the family name alone).
+    pub label: &'static str,
+    /// The concrete algorithms behind the parameter column, in display order.
+    pub members: &'static [KeyAlgorithm],
+    /// Index into [`Self::members`] preselected when the family is chosen
+    /// (e.g. RSA lands on 2048, not on the weak 512).
+    pub default_member: usize,
+    /// Whether the parameter column offers an extra "custom" row with a
+    /// user-entered modulus size ([`KeyAlgorithm::RsaCustom`]; RSA only).
+    pub custom_modulus: bool,
+}
+
+/// The algorithm families offered in the public-key modification dialog, in
+/// display order.
+pub const FAMILIES: &[Family] = &[
+    Family {
+        label: "ECDSA",
+        members: &[KeyAlgorithm::EcdsaP256, KeyAlgorithm::EcdsaP384],
+        default_member: 0,
+        custom_modulus: false,
+    },
+    Family {
+        label: "RSA",
+        members: &[
+            KeyAlgorithm::Rsa(0),
+            KeyAlgorithm::Rsa(1),
+            KeyAlgorithm::Rsa(2),
+            KeyAlgorithm::Rsa(3),
+            KeyAlgorithm::Rsa(4),
+            KeyAlgorithm::Rsa(5),
+            KeyAlgorithm::Rsa(6),
+        ],
+        default_member: 3, // 2048
+        custom_modulus: true,
+    },
+    Family {
+        label: "Ed25519",
+        members: &[KeyAlgorithm::Ed25519],
+        default_member: 0,
+        custom_modulus: false,
+    },
+    Family {
+        label: "ML-DSA",
+        members: &[KeyAlgorithm::Pq(0), KeyAlgorithm::Pq(1), KeyAlgorithm::Pq(2)],
+        default_member: 0,
+        custom_modulus: false,
+    },
+    Family {
+        label: "SLH-DSA",
+        members: &[
+            KeyAlgorithm::Pq(3),
+            KeyAlgorithm::Pq(4),
+            KeyAlgorithm::Pq(5),
+            KeyAlgorithm::Pq(6),
+            KeyAlgorithm::Pq(7),
+            KeyAlgorithm::Pq(8),
+            KeyAlgorithm::Pq(9),
+            KeyAlgorithm::Pq(10),
+            KeyAlgorithm::Pq(11),
+            KeyAlgorithm::Pq(12),
+            KeyAlgorithm::Pq(13),
+            KeyAlgorithm::Pq(14),
+        ],
+        default_member: 0,
+        custom_modulus: false,
+    },
+];
+
+/// Every supported algorithm — [`FAMILIES`] flattened in display order. Used
+/// where the family structure does not matter (tests, exhaustive checks).
 pub const ALL: &[KeyAlgorithm] = &[
     KeyAlgorithm::EcdsaP256,
     KeyAlgorithm::EcdsaP384,
+    KeyAlgorithm::Rsa(0),
+    KeyAlgorithm::Rsa(1),
+    KeyAlgorithm::Rsa(2),
+    KeyAlgorithm::Rsa(3),
+    KeyAlgorithm::Rsa(4),
+    KeyAlgorithm::Rsa(5),
+    KeyAlgorithm::Rsa(6),
     KeyAlgorithm::Ed25519,
-    KeyAlgorithm::RsaSha256_2048,
-    KeyAlgorithm::RsaSha256_4096,
     KeyAlgorithm::Pq(0),
     KeyAlgorithm::Pq(1),
     KeyAlgorithm::Pq(2),
@@ -123,27 +236,55 @@ impl KeyAlgorithm {
         }
     }
 
-    /// Human-readable label for the dialog list.
-    pub fn label(self) -> &'static str {
+    fn rsa(self) -> Option<&'static RsaDesc> {
         match self {
-            KeyAlgorithm::EcdsaP256 => "ECDSA P-256 (SHA-256)",
-            KeyAlgorithm::EcdsaP384 => "ECDSA P-384 (SHA-384)",
-            KeyAlgorithm::Ed25519 => "Ed25519",
-            KeyAlgorithm::RsaSha256_2048 => "RSA-2048 (SHA-256)",
-            KeyAlgorithm::RsaSha256_4096 => "RSA-4096 (SHA-256)",
-            KeyAlgorithm::Pq(_) => self.pq().map(|d| d.name).unwrap_or("post-quantum"),
+            KeyAlgorithm::Rsa(i) => RSA.get(i),
+            _ => None,
+        }
+    }
+
+    /// Human-readable label naming the full algorithm (family and parameters),
+    /// used in status messages.
+    pub fn label(self) -> String {
+        match self {
+            KeyAlgorithm::EcdsaP256 => "ECDSA P-256 (SHA-256)".to_string(),
+            KeyAlgorithm::EcdsaP384 => "ECDSA P-384 (SHA-384)".to_string(),
+            KeyAlgorithm::Ed25519 => "Ed25519".to_string(),
+            KeyAlgorithm::Rsa(_) => self.rsa().map(|d| d.name).unwrap_or("RSA").to_string(),
+            KeyAlgorithm::RsaCustom(bits) => format!("RSA-{} (SHA-256)", bits),
+            KeyAlgorithm::Pq(_) => {
+                self.pq().map(|d| d.name).unwrap_or("post-quantum").to_string()
+            }
+        }
+    }
+
+    /// Label for the dialog's parameter column: the part of the algorithm the
+    /// family name leaves open — the curve for ECDSA, the key size for RSA,
+    /// the parameter set for ML-DSA/SLH-DSA (Ed25519 has no parameters). The
+    /// custom-size RSA row is rendered from its entered digits instead.
+    pub fn param_label(self) -> &'static str {
+        match self {
+            KeyAlgorithm::EcdsaP256 => "P-256",
+            KeyAlgorithm::EcdsaP384 => "P-384",
+            KeyAlgorithm::Ed25519 => "(none)",
+            KeyAlgorithm::Rsa(_) => self.rsa().map(|d| d.param).unwrap_or("?"),
+            KeyAlgorithm::RsaCustom(_) => "custom",
+            KeyAlgorithm::Pq(_) => self.pq().map(|d| d.param).unwrap_or("?"),
         }
     }
 
     /// Short token used to derive the default key file name.
-    pub fn short_name(self) -> &'static str {
+    pub fn short_name(self) -> String {
         match self {
-            KeyAlgorithm::EcdsaP256 => "p256",
-            KeyAlgorithm::EcdsaP384 => "p384",
-            KeyAlgorithm::Ed25519 => "ed25519",
-            KeyAlgorithm::RsaSha256_2048 => "rsa2048",
-            KeyAlgorithm::RsaSha256_4096 => "rsa4096",
-            KeyAlgorithm::Pq(_) => self.pq().map(|d| d.short).unwrap_or("pq"),
+            KeyAlgorithm::EcdsaP256 => "p256".to_string(),
+            KeyAlgorithm::EcdsaP384 => "p384".to_string(),
+            KeyAlgorithm::Ed25519 => "ed25519".to_string(),
+            KeyAlgorithm::Rsa(_) => self.rsa().map(|d| d.short).unwrap_or("rsa").to_string(),
+            // 0 bits means "nothing entered yet" on the custom row; keep the
+            // derived default file name generic until digits arrive.
+            KeyAlgorithm::RsaCustom(0) => "rsa".to_string(),
+            KeyAlgorithm::RsaCustom(bits) => format!("rsa{}", bits),
+            KeyAlgorithm::Pq(_) => self.pq().map(|d| d.short).unwrap_or("pq").to_string(),
         }
     }
 
@@ -154,7 +295,7 @@ impl KeyAlgorithm {
             KeyAlgorithm::EcdsaP256 => ECDSA_WITH_SHA256,
             KeyAlgorithm::EcdsaP384 => ECDSA_WITH_SHA384,
             KeyAlgorithm::Ed25519 => ED25519_OID,
-            KeyAlgorithm::RsaSha256_2048 | KeyAlgorithm::RsaSha256_4096 => SHA256_WITH_RSA,
+            KeyAlgorithm::Rsa(_) | KeyAlgorithm::RsaCustom(_) => SHA256_WITH_RSA,
             KeyAlgorithm::Pq(_) => self.pq().map(|d| d.oid).unwrap_or(&[]),
         }
     }
@@ -168,8 +309,7 @@ impl KeyAlgorithm {
             self.sig_alg_oid().iter().map(|a| a.to_string()).collect::<Vec<_>>().join(".");
         let oid = universal(TAG_OID, false, ber::encode_oid(&dotted).expect("static OID"));
         let mut children = vec![oid];
-        let rsa = matches!(self, KeyAlgorithm::RsaSha256_2048 | KeyAlgorithm::RsaSha256_4096);
-        if rsa {
+        if matches!(self, KeyAlgorithm::Rsa(_) | KeyAlgorithm::RsaCustom(_)) {
             children.push(universal(TAG_NULL, false, Vec::new()));
         }
         ber::encode_node(&universal_seq(children))
@@ -181,8 +321,19 @@ impl KeyAlgorithm {
             KeyAlgorithm::Ed25519 => PKey::generate_ed25519().map_err(crypto),
             KeyAlgorithm::EcdsaP256 => ec_key(Nid::X9_62_PRIME256V1).map_err(crypto),
             KeyAlgorithm::EcdsaP384 => ec_key(Nid::SECP384R1).map_err(crypto),
-            KeyAlgorithm::RsaSha256_2048 => rsa_key(2048).map_err(crypto),
-            KeyAlgorithm::RsaSha256_4096 => rsa_key(4096).map_err(crypto),
+            KeyAlgorithm::Rsa(_) => {
+                let bits = self.rsa().ok_or("unknown RSA key size")?.bits;
+                rsa_key(bits).map_err(crypto)
+            }
+            KeyAlgorithm::RsaCustom(bits) => {
+                if !(RSA_CUSTOM_BITS_MIN..=RSA_CUSTOM_BITS_MAX).contains(&bits) {
+                    return Err(format!(
+                        "the RSA modulus size must be between {} and {} bits",
+                        RSA_CUSTOM_BITS_MIN, RSA_CUSTOM_BITS_MAX
+                    ));
+                }
+                rsa_key(bits).map_err(crypto)
+            }
             KeyAlgorithm::Pq(_) => {
                 let name = self.pq().ok_or("unknown post-quantum algorithm")?.name;
                 generate_by_name(name)
@@ -311,9 +462,15 @@ mod tests {
         alg.pq().is_some_and(|d| d.name.starts_with("SLH-DSA") && d.name.ends_with('s'))
     }
 
+    /// Very large RSA moduli take tens of seconds to generate; the tests skip
+    /// them (the generation code path is identical to the smaller sizes).
+    fn slow_to_generate(alg: KeyAlgorithm) -> bool {
+        alg.rsa().is_some_and(|d| d.bits > 4096)
+    }
+
     #[test]
     fn every_algorithm_generates_a_key_and_pq_spki_carries_its_oid() {
-        for &alg in ALL {
+        for &alg in ALL.iter().filter(|&&a| !slow_to_generate(a)) {
             let key = generate(alg).unwrap_or_else(|e| panic!("{}: {}", alg.label(), e));
             assert!(!key.pkcs8.is_empty() && !key.spki.is_empty(), "{}", alg.label());
             // A post-quantum SPKI's AlgorithmIdentifier is the signature OID.
@@ -324,9 +481,22 @@ mod tests {
     }
 
     #[test]
+    fn families_flatten_to_all_and_default_members_are_valid() {
+        let flattened: Vec<KeyAlgorithm> =
+            FAMILIES.iter().flat_map(|f| f.members.iter().copied()).collect();
+        assert_eq!(flattened, ALL);
+        for family in FAMILIES {
+            assert!(family.default_member < family.members.len(), "{}", family.label);
+            for &member in family.members {
+                assert!(!member.param_label().is_empty(), "{}", member.label());
+            }
+        }
+    }
+
+    #[test]
     fn signing_round_trips_for_classical_ml_dsa_and_fast_slh_dsa() {
         let tbs = b"a message standing in for a tbsCertificate";
-        for &alg in ALL.iter().filter(|&&a| !slow_to_sign(a)) {
+        for &alg in ALL.iter().filter(|&&a| !slow_to_sign(a) && !slow_to_generate(a)) {
             let key = generate(alg).unwrap_or_else(|e| panic!("{}: {}", alg.label(), e));
             let sig = verify::sign(alg.sig_alg_oid(), &key.pkcs8, tbs)
                 .unwrap_or_else(|e| panic!("{}: sign: {}", alg.label(), e));
@@ -380,7 +550,7 @@ mod tests {
             (KeyAlgorithm::Ed25519, 1),
             (KeyAlgorithm::Pq(1), 1),  // ML-DSA-65
             (KeyAlgorithm::Pq(9), 1),  // SLH-DSA-SHAKE-128s
-            (KeyAlgorithm::RsaSha256_2048, 2),
+            (KeyAlgorithm::Rsa(3), 2), // RSA-2048
         ] {
             let der = alg.sig_alg_identifier_der();
             let roots = ber::parse_forest(&der, 0).unwrap();

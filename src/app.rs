@@ -807,7 +807,7 @@ pub struct NoticeState {
 }
 
 /// One signed object (certificate or CRL) issued by the certificate being
-/// rekeyed, offered in the dialog's third column for re-signing with the new
+/// rekeyed, offered in the dialog's last column for re-signing with the new
 /// key. Certificates are listed first, then CRLs.
 pub struct IssuedObject {
     pub path: PathBuf,
@@ -837,8 +837,15 @@ pub struct ExistingKeyChoice {
 /// with an existing key the user selects (a plaintext or session-unlocked key
 /// fitting the chosen signature algorithm).
 pub struct PubKeyState {
-    /// Index into [`keygen::ALL`] of the chosen signature algorithm.
-    pub alg_idx: usize,
+    /// Index into [`keygen::FAMILIES`] of the chosen algorithm family.
+    pub family_idx: usize,
+    /// Index into the chosen family's `members` — the parameter column's
+    /// selection (curve, RSA key size, ML-DSA/SLH-DSA parameter set). For a
+    /// family with a custom-modulus row, `members.len()` selects that row.
+    pub param_idx: usize,
+    /// Digits of the user-entered modulus size for the RSA family's "custom"
+    /// parameter row.
+    pub custom_rsa_bits: String,
     /// Key source: `false` = generate a new key (default), `true` = use an
     /// existing key from [`Self::existing`].
     pub use_existing: bool,
@@ -855,7 +862,8 @@ pub struct PubKeyState {
     /// Signed objects issued by this certificate (certs then CRLs), each with
     /// a re-sign checkbox.
     pub issued: Vec<IssuedObject>,
-    /// Active column: 0 = algorithm, 1 = key options, 2 = issued objects.
+    /// Active column: 0 = algorithm family, 1 = parameters, 2 = key options,
+    /// 3 = issued objects.
     pub column: usize,
     /// Active field within the key-options column: 0 = the generate/use-existing
     /// radio; in *generate* mode 1 = file name, 2 = password; in *use-existing*
@@ -866,8 +874,37 @@ pub struct PubKeyState {
 }
 
 impl PubKeyState {
+    fn family(&self) -> &'static keygen::Family {
+        &keygen::FAMILIES[self.family_idx]
+    }
+
+    /// Whether the parameter column's custom-modulus row (index
+    /// `members.len()`, RSA only) is the current parameter selection.
+    fn custom_param_selected(&self) -> bool {
+        self.family().custom_modulus && self.param_idx == self.family().members.len()
+    }
+
     fn alg(&self) -> keygen::KeyAlgorithm {
-        keygen::ALL[self.alg_idx]
+        if self.custom_param_selected() {
+            // Unparsable (e.g. empty) digits yield 0 bits; submit rejects it.
+            keygen::KeyAlgorithm::RsaCustom(self.custom_rsa_bits.parse().unwrap_or(0))
+        } else {
+            self.family().members[self.param_idx]
+        }
+    }
+
+    /// Select `alg` by locating its family and parameter indices (used by
+    /// tests to drive the dialog to a specific algorithm).
+    #[cfg(test)]
+    fn select_algorithm(&mut self, alg: keygen::KeyAlgorithm) {
+        for (fi, family) in keygen::FAMILIES.iter().enumerate() {
+            if let Some(pi) = family.members.iter().position(|m| *m == alg) {
+                self.family_idx = fi;
+                self.param_idx = pi;
+                return;
+            }
+        }
+        panic!("algorithm {:?} not offered by any family", alg);
     }
 
     /// The existing keys fitting the chosen signature algorithm, in list order.
@@ -902,8 +939,18 @@ impl PubKeyState {
         }
     }
 
+    /// Re-derive the state that depends on the chosen algorithm after a
+    /// family or parameter change: the default key file name and the
+    /// key-options focus (the fitting-key list may have shrunk).
+    fn algorithm_changed(&mut self, cert_stem: &str) {
+        if self.filename_auto {
+            self.filename = Self::default_filename(cert_stem, self.alg());
+        }
+        self.option_field = self.option_field.min(self.max_option_field());
+    }
+
     fn move_column(&mut self, delta: isize) {
-        self.column = (self.column as isize + delta).clamp(0, 2) as usize;
+        self.column = (self.column as isize + delta).clamp(0, 3) as usize;
         // Keep the key-options focus valid for the (possibly different) column.
         self.option_field = self.option_field.min(self.max_option_field());
     }
@@ -911,15 +958,22 @@ impl PubKeyState {
     fn move_row(&mut self, delta: isize, cert_stem: &str) {
         match self.column {
             0 => {
-                let n = keygen::ALL.len() as isize;
-                self.alg_idx = (self.alg_idx as isize + delta).clamp(0, n - 1) as usize;
-                if self.filename_auto {
-                    self.filename = Self::default_filename(cert_stem, self.alg());
+                let n = keygen::FAMILIES.len() as isize;
+                let new = (self.family_idx as isize + delta).clamp(0, n - 1) as usize;
+                if new != self.family_idx {
+                    self.family_idx = new;
+                    self.param_idx = self.family().default_member;
+                    self.algorithm_changed(cert_stem);
                 }
-                // The fitting-key list depends on the algorithm; keep focus valid.
-                self.option_field = self.option_field.min(self.max_option_field());
             }
             1 => {
+                // A custom-modulus family has one extra row after the presets.
+                let n = (self.family().members.len()
+                    + usize::from(self.family().custom_modulus)) as isize;
+                self.param_idx = (self.param_idx as isize + delta).clamp(0, n - 1) as usize;
+                self.algorithm_changed(cert_stem);
+            }
+            2 => {
                 let max = self.max_option_field() as isize;
                 self.option_field = (self.option_field as isize + delta).clamp(0, max) as usize;
             }
@@ -932,22 +986,33 @@ impl PubKeyState {
         }
     }
 
-    /// Space toggles the key-source radio (column 1, field 0) or an issued
-    /// object's re-sign checkbox (column 2).
+    /// Space toggles the key-source radio (column 2, field 0) or an issued
+    /// object's re-sign checkbox (column 3).
     fn toggle(&mut self) {
-        if self.column == 1 && self.option_field == 0 {
+        if self.column == 2 && self.option_field == 0 {
             self.use_existing = !self.use_existing;
             // Land on the first fitting key when switching to use-existing.
             self.option_field = usize::from(self.use_existing && !self.fitting_keys().is_empty());
-        } else if self.column == 2 {
+        } else if self.column == 3 {
             if let Some(cert) = self.issued.get_mut(self.issued_idx) {
                 cert.selected = !cert.selected;
             }
         }
     }
 
-    fn insert_char(&mut self, c: char) {
-        if c.is_control() || self.column != 1 || self.use_existing {
+    fn insert_char(&mut self, c: char, cert_stem: &str) {
+        if c.is_control() {
+            return;
+        }
+        // On the parameter column's custom-modulus row, digits edit the size.
+        if self.column == 1 && self.custom_param_selected() {
+            if c.is_ascii_digit() && self.custom_rsa_bits.len() < 5 {
+                self.custom_rsa_bits.push(c);
+                self.algorithm_changed(cert_stem);
+            }
+            return;
+        }
+        if self.column != 2 || self.use_existing {
             return;
         }
         match self.option_field {
@@ -960,8 +1025,13 @@ impl PubKeyState {
         }
     }
 
-    fn backspace(&mut self) {
-        if self.column != 1 || self.use_existing {
+    fn backspace(&mut self, cert_stem: &str) {
+        if self.column == 1 && self.custom_param_selected() {
+            self.custom_rsa_bits.pop();
+            self.algorithm_changed(cert_stem);
+            return;
+        }
+        if self.column != 2 || self.use_existing {
             return;
         }
         match self.option_field {
@@ -2491,11 +2561,15 @@ impl App {
             self.status = "re-keying is only available for a certificate".to_string();
             return;
         }
-        let alg = keygen::ALL[0];
+        let family_idx = 0;
+        let param_idx = keygen::FAMILIES[family_idx].default_member;
+        let alg = keygen::FAMILIES[family_idx].members[param_idx];
         let issued = self.issued_objects();
         let existing = self.gather_existing_keys();
         let state = PubKeyState {
-            alg_idx: 0,
+            family_idx,
+            param_idx,
+            custom_rsa_bits: String::new(),
             use_existing: false,
             filename: PubKeyState::default_filename(&self.cert_file_stem(), alg),
             filename_auto: true,
@@ -2680,14 +2754,16 @@ impl App {
     }
 
     pub fn pubkey_insert_char(&mut self, c: char) {
+        let stem = self.cert_file_stem();
         if let Mode::EditPubKey(ref mut s) = self.mode {
-            s.insert_char(c);
+            s.insert_char(c, &stem);
         }
     }
 
     pub fn pubkey_backspace(&mut self) {
+        let stem = self.cert_file_stem();
         if let Mode::EditPubKey(ref mut s) = self.mode {
-            s.backspace();
+            s.backspace(&stem);
         }
     }
 
@@ -2729,6 +2805,18 @@ impl App {
                 };
                 (pkcs8, spki, format!("re-keyed to existing key {}", label), None)
             } else {
+                if let keygen::KeyAlgorithm::RsaCustom(bits) = alg {
+                    if !(keygen::RSA_CUSTOM_BITS_MIN..=keygen::RSA_CUSTOM_BITS_MAX)
+                        .contains(&bits)
+                    {
+                        self.status = format!(
+                            "enter a custom RSA modulus size between {} and {} bits",
+                            keygen::RSA_CUSTOM_BITS_MIN,
+                            keygen::RSA_CUSTOM_BITS_MAX
+                        );
+                        return; // stay in the dialog
+                    }
+                }
                 if filename.trim().is_empty() {
                     self.status = "enter a file name for the new private key".to_string();
                     return; // stay in the dialog
@@ -7881,6 +7969,109 @@ mod tests {
     }
 
     #[test]
+    fn family_navigation_lands_on_the_default_parameter_and_updates_the_filename() {
+        let dir = copy_chain("pk-family");
+        let mut app = open_real_file(&dir.join("root_ca.der"));
+        app.start_rekey();
+        // The dialog opens on the ECDSA family with its P-256 default.
+        if let Mode::EditPubKey(ref s) = app.mode {
+            assert_eq!(keygen::FAMILIES[s.family_idx].label, "ECDSA");
+            assert_eq!(s.param_idx, 0);
+        }
+        // Down in the family column: RSA, preselecting 2048 (not the weak 512).
+        app.pubkey_move_row(1);
+        if let Mode::EditPubKey(ref s) = app.mode {
+            assert_eq!(keygen::FAMILIES[s.family_idx].label, "RSA");
+            assert_eq!(keygen::FAMILIES[s.family_idx].members[s.param_idx].param_label(), "2048");
+            assert!(s.filename.contains("rsa2048"), "auto filename follows: {}", s.filename);
+        }
+        // In the parameter column, moving up reaches the smaller key sizes.
+        app.pubkey_move_column(1);
+        for _ in 0..3 {
+            app.pubkey_move_row(-1);
+        }
+        if let Mode::EditPubKey(ref s) = app.mode {
+            assert_eq!(s.column, 1);
+            assert_eq!(keygen::FAMILIES[s.family_idx].members[s.param_idx].param_label(), "512");
+            assert!(s.filename.contains("rsa512"), "auto filename follows: {}", s.filename);
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rekeying_with_a_small_rsa_key_signs_and_verifies() {
+        // 512-bit RSA is below what aws-lc-rs accepts, so this exercises the
+        // OpenSSL sign/verify fallback through the whole re-key flow.
+        let dir = copy_chain("pk-rsa512");
+        let mut app = open_real_file(&dir.join("root_ca.der"));
+        app.start_rekey();
+        let rsa512 = keygen::KeyAlgorithm::Rsa(0);
+        assert_eq!(rsa512.param_label(), "512");
+        if let Mode::EditPubKey(ref mut s) = app.mode {
+            s.select_algorithm(rsa512);
+            s.filename = "root_rsa512.key".to_string();
+            s.filename_auto = false;
+        }
+        app.submit_pubkey();
+        assert!(matches!(app.mode, Mode::Browse), "status: {}", app.status);
+        // The self-signed root carries the new signature algorithm and
+        // verifies under its own new (weak) key.
+        let der = ber::encode_forest(&app.roots);
+        let s = x509::parse_signable(&app.roots, &der).unwrap();
+        assert_eq!(s.sig_alg, rsa512.sig_alg_oid());
+        assert!(verify::verify_signature(&s.sig_alg, s.pubkey.as_ref().unwrap(), &s.tbs, &s.signature));
+        // The issued intermediate was resigned on disk and verifies too.
+        assert!(
+            cert_verifies_under(&dir.join("intermediate_ca.der"), s.pubkey.as_ref().unwrap()),
+            "intermediate verifies under the new 512-bit RSA root key"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rekeying_with_a_custom_rsa_modulus_size() {
+        let dir = copy_chain("pk-rsacustom");
+        let mut app = open_real_file(&dir.join("root_ca.der"));
+        app.start_rekey();
+        // Family column: down once lands on RSA; parameter column: below the
+        // presets sits the custom row, where typed digits form the size.
+        app.pubkey_move_row(1);
+        app.pubkey_move_column(1);
+        let rsa_presets = keygen::FAMILIES[1].members.len();
+        for _ in 0..rsa_presets {
+            app.pubkey_move_row(1);
+        }
+        if let Mode::EditPubKey(ref s) = app.mode {
+            assert!(s.custom_param_selected(), "the custom row is the last parameter row");
+        }
+        // A size below the 512-bit minimum is refused; the dialog stays open.
+        for c in "60".chars() {
+            app.pubkey_insert_char(c);
+        }
+        app.submit_pubkey();
+        assert!(matches!(app.mode, Mode::EditPubKey(_)));
+        assert!(app.status.contains("modulus size"), "status: {}", app.status);
+        // Correct it to 640 bits; the auto-derived file name follows along.
+        app.pubkey_backspace();
+        app.pubkey_backspace();
+        for c in "640".chars() {
+            app.pubkey_insert_char(c);
+        }
+        if let Mode::EditPubKey(ref s) = app.mode {
+            assert!(s.filename.contains("rsa640"), "auto filename follows: {}", s.filename);
+        }
+        app.submit_pubkey();
+        assert!(matches!(app.mode, Mode::Browse), "status: {}", app.status);
+        // The rekeyed root signs sha256WithRSA and verifies under its new
+        // 640-bit key (an odd size no preset offers).
+        let der = ber::encode_forest(&app.roots);
+        let s = x509::parse_signable(&app.roots, &der).unwrap();
+        assert_eq!(s.sig_alg, keygen::KeyAlgorithm::RsaCustom(640).sig_alg_oid());
+        assert!(verify::verify_signature(&s.sig_alg, s.pubkey.as_ref().unwrap(), &s.tbs, &s.signature));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
     fn the_edit_menu_on_the_spki_offers_rekeying() {
         let dir = copy_chain("pk-emenu");
         let mut app = open_real_file(&dir.join("root_ca.der"));
@@ -7914,7 +8105,7 @@ mod tests {
         let mut app = open_real_file(&dir.join("root_ca.der"));
         app.start_rekey();
         if let Mode::EditPubKey(ref mut s) = app.mode {
-            s.alg_idx = keygen::ALL.iter().position(|a| *a == keygen::KeyAlgorithm::Ed25519).unwrap();
+            s.select_algorithm(keygen::KeyAlgorithm::Ed25519);
             s.filename = "root_crlkey.key".to_string();
             s.filename_auto = false;
             // Everything (the cert and the CRL) stays checked by default.
@@ -7949,7 +8140,7 @@ mod tests {
         app.edit_selected();
         // Choose Ed25519 (fast), keep generate on, plaintext key.
         if let Mode::EditPubKey(ref mut s) = app.mode {
-            s.alg_idx = keygen::ALL.iter().position(|a| *a == keygen::KeyAlgorithm::Ed25519).unwrap();
+            s.select_algorithm(keygen::KeyAlgorithm::Ed25519);
             s.filename = "root_new.key".to_string();
             s.filename_auto = false;
         }
@@ -8012,7 +8203,7 @@ mod tests {
         // are quick.
         let ml_dsa = keygen::KeyAlgorithm::Pq(0);
         if let Mode::EditPubKey(ref mut s) = app.mode {
-            s.alg_idx = keygen::ALL.iter().position(|a| *a == ml_dsa).unwrap();
+            s.select_algorithm(ml_dsa);
             s.filename = "root_mldsa.key".to_string();
             s.filename_auto = false;
         }
@@ -8048,7 +8239,7 @@ mod tests {
         app.edit_selected();
         let ml_dsa = keygen::KeyAlgorithm::Pq(0); // ML-DSA-44 (fast)
         if let Mode::EditPubKey(ref mut s) = app.mode {
-            s.alg_idx = keygen::ALL.iter().position(|a| *a == ml_dsa).unwrap();
+            s.select_algorithm(ml_dsa);
             s.filename = "root_pq.key".to_string();
             s.filename_auto = false;
         }
@@ -8097,7 +8288,7 @@ mod tests {
         app.select(spki_row(&app));
         app.edit_selected();
         if let Mode::EditPubKey(ref mut s) = app.mode {
-            s.alg_idx = keygen::ALL.iter().position(|a| *a == keygen::KeyAlgorithm::Ed25519).unwrap();
+            s.select_algorithm(keygen::KeyAlgorithm::Ed25519);
             s.filename = "root_enc.key".to_string();
             s.filename_auto = false;
             s.password = "hunter2".to_string();
@@ -8156,7 +8347,7 @@ mod tests {
         app.select(spki_row(&app));
         app.edit_selected();
         if let Mode::EditPubKey(ref mut s) = app.mode {
-            s.alg_idx = keygen::ALL.iter().position(|a| *a == keygen::KeyAlgorithm::Ed25519).unwrap();
+            s.select_algorithm(keygen::KeyAlgorithm::Ed25519);
             s.use_existing = true;
             // The spare key fits the Ed25519 algorithm and is offered.
             let labels: Vec<&str> = s.fitting_keys().iter().map(|k| k.label.as_str()).collect();
