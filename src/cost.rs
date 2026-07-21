@@ -100,6 +100,19 @@ pub fn rekey_estimate(
     Some(Duration::from_secs_f64(raw * speed_factor()))
 }
 
+/// Like [`rekey_estimate`] but for HSS/LMS, whose cost depends on its
+/// structured parameters (per-level height and Winternitz, hash) rather than a
+/// `KeyAlgorithm` discriminant. Machine-speed-corrected like the others.
+pub fn rekey_estimate_hsslms(
+    params: &crate::keygen::HssLmsParams,
+    signature_count: usize,
+    generate_key: bool,
+) -> Duration {
+    let sign = params.est_sign_secs();
+    let keygen = if generate_key { params.est_keygen_secs() } else { 0.0 };
+    Duration::from_secs_f64((keygen + sign * signature_count as f64).max(0.0) * speed_factor())
+}
+
 /// Format a duration as `"x h, y mins, z secs"`, omitting any unit whose value
 /// is zero (e.g. `"3 mins, 12 secs"`, `"2 h, 5 secs"`, `"41 secs"`). Rounds to
 /// whole seconds; a sub-second or zero duration renders as `"0 secs"`.

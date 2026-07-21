@@ -64,7 +64,126 @@ pub enum KeyAlgorithm {
     /// XMSS (RFC 8391, stateful hash-based), identified by its entry in
     /// [`XMSS`]; generated and signed by the Botan backend (`xmss.rs`).
     Xmss(usize),
+    /// HSS/LMS (RFC 8554, stateful hash-based). Its parameters (LMS vs HSS,
+    /// hash, and per-level height + Winternitz) are structured and edited in
+    /// the dialog as [`HssLmsParams`] rather than encoded in this `Copy`
+    /// discriminant; generation goes through [`generate_hsslms`].
+    HssLms,
 }
+
+/// The hash functions Botan supports for HSS/LMS, with their Botan spec name,
+/// display label, and filename token.
+pub struct HssHash {
+    pub botan: &'static str,
+    pub label: &'static str,
+    pub short: &'static str,
+    /// Measured keygen wall-clock per tree leaf, in seconds, at Winternitz 8
+    /// on the calibration machine; scaled by [`HSS_W_FACTOR`] and the leaf
+    /// count for the time estimate (see [`HssLmsParams::est_keygen_secs`]).
+    keygen_per_leaf_w8_secs: f64,
+}
+
+/// The four HSS/LMS hash functions (RFC 8554 SHA-256 and the NIST SP 800-208
+/// truncated/SHAKE additions) that Botan accepts.
+pub const HSS_HASHES: &[HssHash] = &[
+    HssHash { botan: "SHA-256", label: "SHA-256", short: "sha256", keygen_per_leaf_w8_secs: 0.0011 },
+    HssHash { botan: "Truncated(SHA-256,192)", label: "SHA-256/192", short: "sha256_192", keygen_per_leaf_w8_secs: 0.00137 },
+    HssHash { botan: "SHAKE-256(256)", label: "SHAKE-256/256", short: "shake256", keygen_per_leaf_w8_secs: 0.0062 },
+    HssHash { botan: "SHAKE-256(192)", label: "SHAKE-256/192", short: "shake256_192", keygen_per_leaf_w8_secs: 0.0049 },
+];
+
+/// Keygen-cost multiplier per Winternitz value (indexed like
+/// [`HSS_WINTERNITZ`]: W = 1, 2, 4, 8): larger `W` means longer LM-OTS hash
+/// chains, so `W=8` dominates. Measured relative to `W=8`.
+const HSS_W_FACTOR: &[f64] = &[0.15, 0.13, 0.18, 1.0];
+
+/// LMS tree heights (RFC 8554 `H`), and the LM-OTS Winternitz parameters
+/// (`W`), offered per level in the dialog.
+pub const HSS_HEIGHTS: &[u8] = &[5, 10, 15, 20, 25];
+pub const HSS_WINTERNITZ: &[u8] = &[1, 2, 4, 8];
+/// The most HSS levels Botan allows.
+pub const HSS_MAX_LEVELS: usize = 8;
+
+/// One HSS level's parameters: indices into [`HSS_HEIGHTS`] and
+/// [`HSS_WINTERNITZ`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct HssLevel {
+    pub height_idx: usize,
+    pub w_idx: usize,
+}
+
+impl HssLevel {
+    pub fn height(&self) -> u8 {
+        HSS_HEIGHTS[self.height_idx]
+    }
+    pub fn winternitz(&self) -> u8 {
+        HSS_WINTERNITZ[self.w_idx]
+    }
+}
+
+/// The structured HSS/LMS parameters edited in the re-key dialog: LMS (a
+/// single tree) or HSS (a hierarchy), a hash shared across all levels (Botan
+/// requires one hash per key), and one [`HssLevel`] per tree with the root
+/// level first.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HssLmsParams {
+    /// `false` = LMS (locked to one level); `true` = HSS (1..=[`HSS_MAX_LEVELS`]).
+    pub is_hss: bool,
+    /// Index into [`HSS_HASHES`], shared by every level.
+    pub hash_idx: usize,
+    /// Levels, root first; LMS always has exactly one.
+    pub levels: Vec<HssLevel>,
+}
+
+impl Default for HssLmsParams {
+    fn default() -> Self {
+        // Default: LMS, SHA-256, one level of height 10, Winternitz 8.
+        HssLmsParams {
+            is_hss: false,
+            hash_idx: 0,
+            levels: vec![HssLevel { height_idx: 1, w_idx: 3 }],
+        }
+    }
+}
+
+impl HssLmsParams {
+    /// The Botan parameter string, e.g. `"SHA-256,HW(10,8)"` (LMS) or
+    /// `"SHA-256,HW(10,8),HW(5,8)"` (two-level HSS).
+    pub fn botan_string(&self) -> String {
+        let hash = HSS_HASHES[self.hash_idx].botan;
+        let layers: Vec<String> =
+            self.levels.iter().map(|l| format!("HW({},{})", l.height(), l.winternitz())).collect();
+        format!("{},{}", hash, layers.join(","))
+    }
+
+    /// Estimated key-generation time (seconds) on the calibration machine:
+    /// each level's LMS tree is generated independently, so the total is the
+    /// sum over levels of `per-leaf-cost(hash, Winternitz) * 2^height`.
+    pub fn est_keygen_secs(&self) -> f64 {
+        let per_leaf = HSS_HASHES[self.hash_idx].keygen_per_leaf_w8_secs;
+        self.levels
+            .iter()
+            .map(|l| per_leaf * HSS_W_FACTOR[l.w_idx] * 2f64.powi(i32::from(l.height())))
+            .sum()
+    }
+
+    /// Estimated single-signature time (seconds). Like XMSS, signing reloads
+    /// the key and Botan reconstructs tree state, so it is dominated by the
+    /// keygen-equivalent work.
+    pub fn est_sign_secs(&self) -> f64 {
+        self.est_keygen_secs()
+    }
+
+    /// Filename token, e.g. `lms-sha256-h10w8` or `hss-sha256-h10w8-h5w8`.
+    pub fn short_name(&self) -> String {
+        let mode = if self.is_hss { "hss" } else { "lms" };
+        let hash = HSS_HASHES[self.hash_idx].short;
+        let levels: Vec<String> =
+            self.levels.iter().map(|l| format!("h{}w{}", l.height(), l.winternitz())).collect();
+        format!("{}-{}-{}", mode, hash, levels.join("-"))
+    }
+}
+
 
 /// Bounds for a custom RSA modulus size: OpenSSL refuses to generate keys
 /// below 512 bits (and SHA-256 PKCS#1 v1.5 needs at least 496); the upper
@@ -262,6 +381,15 @@ pub const FAMILIES: &[Family] = &[
         default_member: 0,
         custom_modulus: false,
     },
+    // HSS/LMS has a single member; its structured parameters (LMS/HSS, hash,
+    // per-level height + Winternitz) are edited by a dedicated editor in the
+    // dialog rather than a flat parameter list.
+    Family {
+        label: "HSS/LMS",
+        members: &[KeyAlgorithm::HssLms],
+        default_member: 0,
+        custom_modulus: false,
+    },
 ];
 
 /// Every supported algorithm — [`FAMILIES`] flattened in display order. Used
@@ -304,6 +432,7 @@ pub const ALL: &[KeyAlgorithm] = &[
     KeyAlgorithm::Xmss(9),
     KeyAlgorithm::Xmss(10),
     KeyAlgorithm::Xmss(11),
+    KeyAlgorithm::HssLms,
 ];
 
 // Signature-algorithm OIDs (the `signatureAlgorithm` of a certificate).
@@ -349,6 +478,7 @@ impl KeyAlgorithm {
             KeyAlgorithm::Xmss(_) => {
                 self.xmss().map(|d| d.name).unwrap_or("XMSS").to_string()
             }
+            KeyAlgorithm::HssLms => "HSS/LMS".to_string(),
         }
     }
 
@@ -365,14 +495,15 @@ impl KeyAlgorithm {
             KeyAlgorithm::RsaCustom(_) => "custom",
             KeyAlgorithm::Pq(_) => self.pq().map(|d| d.param).unwrap_or("?"),
             KeyAlgorithm::Xmss(_) => self.xmss().map(|d| d.param).unwrap_or("?"),
+            KeyAlgorithm::HssLms => "HSS/LMS",
         }
     }
 
     /// Whether the re-key flow shows a time estimate / progress window for
-    /// this algorithm: only the slow stateful/hash-based families, XMSS and
-    /// SLH-DSA. Everything else (classical, ML-DSA) completes near-instantly.
+    /// this algorithm: the slow stateful/hash-based families (XMSS, HSS/LMS)
+    /// and SLH-DSA. Everything else (classical, ML-DSA) completes near-instantly.
     pub fn shows_time_estimate(self) -> bool {
-        matches!(self, KeyAlgorithm::Xmss(_))
+        matches!(self, KeyAlgorithm::Xmss(_) | KeyAlgorithm::HssLms)
             || self.pq().is_some_and(|d| d.name.starts_with("SLH-DSA"))
     }
 
@@ -423,6 +554,7 @@ impl KeyAlgorithm {
             KeyAlgorithm::Xmss(_) => {
                 self.xmss().map(|d| d.short).unwrap_or("xmss").to_string()
             }
+            KeyAlgorithm::HssLms => "hsslms".to_string(),
         }
     }
 
@@ -436,6 +568,7 @@ impl KeyAlgorithm {
             KeyAlgorithm::Rsa(_) | KeyAlgorithm::RsaCustom(_) => SHA256_WITH_RSA,
             KeyAlgorithm::Pq(_) => self.pq().map(|d| d.oid).unwrap_or(&[]),
             KeyAlgorithm::Xmss(_) => crate::xmss::XMSS_OID,
+            KeyAlgorithm::HssLms => crate::hsslms::HSS_LMS_OID,
         }
     }
 
@@ -477,9 +610,10 @@ impl KeyAlgorithm {
                 let name = self.pq().ok_or("unknown post-quantum algorithm")?.name;
                 generate_by_name(name)
             }
-            // XMSS is generated by the Botan backend; `generate` intercepts
-            // it before this OpenSSL path.
+            // XMSS and HSS/LMS are generated by the Botan backend; `generate`
+            // (resp. `generate_hsslms`) intercepts them before this path.
             KeyAlgorithm::Xmss(_) => Err("XMSS keys are generated via Botan".to_string()),
+            KeyAlgorithm::HssLms => Err("HSS/LMS keys are generated via Botan".to_string()),
         }
     }
 }
@@ -563,6 +697,12 @@ pub fn encrypt_key_file_der(pkcs8: &[u8], password: &[u8]) -> Result<Vec<u8>, St
             .map_err(|_| "the password is not valid UTF-8".to_string())?;
         return crate::xmss::encrypt_pkcs8(pkcs8, password);
     }
+    // An HSS/LMS key file (Botan's private-key OID) is also encrypted by Botan.
+    if crate::verify::pkcs8_is_hsslms(pkcs8) {
+        let password = std::str::from_utf8(password)
+            .map_err(|_| "the password is not valid UTF-8".to_string())?;
+        return crate::hsslms::encrypt_pkcs8(pkcs8, password);
+    }
     let crypto = |e: openssl::error::ErrorStack| format!("key encryption failed: {}", e);
     let pkey = PKey::private_key_from_pkcs8(pkcs8).map_err(crypto)?;
     pkey.private_key_to_pkcs8_passphrase(Cipher::aes_256_cbc(), password).map_err(crypto)
@@ -580,6 +720,14 @@ pub fn generate(alg: KeyAlgorithm) -> Result<GeneratedKey, String> {
     let pkey = alg.generate_pkey()?;
     let pkcs8 = pkey.private_key_to_pkcs8().map_err(crypto)?;
     let spki = pkey.public_key_to_der().map_err(crypto)?;
+    Ok(GeneratedKey { pkcs8, spki })
+}
+
+/// Generate an HSS/LMS key for the structured `params` via the Botan backend.
+/// (Separate from [`generate`] because HSS/LMS parameters are not encoded in
+/// the `Copy` [`KeyAlgorithm`] discriminant.)
+pub fn generate_hsslms(params: &HssLmsParams) -> Result<GeneratedKey, String> {
+    let (pkcs8, spki) = crate::hsslms::generate(&params.botan_string())?;
     Ok(GeneratedKey { pkcs8, spki })
 }
 
@@ -634,6 +782,10 @@ mod tests {
     fn slow_to_generate(alg: KeyAlgorithm) -> bool {
         alg.rsa().is_some_and(|d| d.bits > 4096)
             || alg.xmss().is_some_and(|d| !d.name.contains("_10_"))
+            // HSS/LMS carries no parameters in the enum; it is generated via
+            // `generate_hsslms` and covered by its own tests, so the
+            // `generate(alg)` exhaustive tests skip it.
+            || matches!(alg, KeyAlgorithm::HssLms)
     }
 
     #[test]

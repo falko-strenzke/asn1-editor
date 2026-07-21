@@ -861,6 +861,31 @@ pub struct ExistingKeyChoice {
     pub id: x509::PublicKeyId,
 }
 
+/// A small modal choice popup for one HSS/LMS field, opened with Enter on a
+/// value field in the parameter editor (arrow keys stay reserved for
+/// navigating the dialog's rows and columns).
+pub struct HssPicker {
+    /// The field being edited.
+    pub field: HssField,
+    /// Index of the highlighted choice.
+    pub selected: usize,
+}
+
+/// One field of the HSS/LMS parameter editor (see [`PubKeyState::hss_fields`]).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum HssField {
+    /// LMS (single tree) vs HSS (hierarchy).
+    Mode,
+    /// The hash function shared by all levels.
+    Hash,
+    /// Level `i`'s tree height (root is level 0).
+    Height(usize),
+    /// Level `i`'s LM-OTS Winternitz parameter.
+    Winternitz(usize),
+    /// The "add a level" affordance (HSS mode, below the level limit).
+    AddLevel,
+}
+
 /// State of the public-key modification dialog. The certificate is rekeyed
 /// either with a freshly generated key pair (optionally written to a file) or
 /// with an existing key the user selects (a plaintext or session-unlocked key
@@ -875,6 +900,13 @@ pub struct PubKeyState {
     /// Digits of the user-entered modulus size for the RSA family's "custom"
     /// parameter row.
     pub custom_rsa_bits: String,
+    /// Structured parameters for the HSS/LMS family, edited in the parameter
+    /// column by its dedicated editor (LMS/HSS, hash, per-level height +
+    /// Winternitz). Ignored unless the HSS/LMS family is selected; `param_idx`
+    /// then indexes the editor's fields (see [`Self::hss_fields`]).
+    pub hss: keygen::HssLmsParams,
+    /// The open HSS/LMS value-choice popup, if any (Enter on a value field).
+    pub hss_picker: Option<HssPicker>,
     /// Key source: `false` = generate a new key (default), `true` = use an
     /// existing key from [`Self::existing`].
     pub use_existing: bool,
@@ -914,6 +946,11 @@ impl PubKeyState {
     }
 
     fn alg(&self) -> keygen::KeyAlgorithm {
+        // The HSS/LMS family carries no per-member parameters (`param_idx`
+        // indexes its structured editor's fields, not `members`).
+        if self.family().members.first() == Some(&keygen::KeyAlgorithm::HssLms) {
+            return keygen::KeyAlgorithm::HssLms;
+        }
         if self.custom_param_selected() {
             // Unparsable (e.g. empty) digits yield 0 bits; submit rejects it.
             keygen::KeyAlgorithm::RsaCustom(self.custom_rsa_bits.parse().unwrap_or(0))
@@ -926,6 +963,131 @@ impl PubKeyState {
     /// the dialog renderer's time estimate.
     pub fn dialog_algorithm(&self) -> keygen::KeyAlgorithm {
         self.alg()
+    }
+
+    /// Whether the HSS/LMS family is selected, so the parameter column shows
+    /// its structured editor instead of a flat list.
+    pub fn is_hsslms(&self) -> bool {
+        matches!(self.alg(), keygen::KeyAlgorithm::HssLms)
+    }
+
+    /// The editable fields of the HSS/LMS parameter editor, in display/cursor
+    /// order: mode, hash, then each level's height and Winternitz (root
+    /// first), then an "add level" affordance in HSS mode below the limit.
+    /// `param_idx` indexes this list.
+    pub fn hss_fields(&self) -> Vec<HssField> {
+        let mut f = vec![HssField::Mode, HssField::Hash];
+        for i in 0..self.hss.levels.len() {
+            f.push(HssField::Height(i));
+            f.push(HssField::Winternitz(i));
+        }
+        if self.hss.is_hss && self.hss.levels.len() < keygen::HSS_MAX_LEVELS {
+            f.push(HssField::AddLevel);
+        }
+        f
+    }
+
+    /// The HSS/LMS field the cursor (`param_idx`) is on.
+    fn hss_focused(&self) -> HssField {
+        let fields = self.hss_fields();
+        fields[self.param_idx.min(fields.len() - 1)]
+    }
+
+    /// Move the HSS/LMS field cursor; keeps `param_idx` in range.
+    fn hss_move_field(&mut self, delta: isize) {
+        let n = self.hss_fields().len() as isize;
+        self.param_idx = (self.param_idx as isize + delta).clamp(0, n - 1) as usize;
+    }
+
+    /// The choice labels for an HSS/LMS `field`, in selection order, for the
+    /// value-choice popup.
+    pub fn hss_field_choices(&self, field: HssField) -> Vec<String> {
+        match field {
+            HssField::Mode => vec!["LMS (single tree)".into(), "HSS (hierarchy)".into()],
+            HssField::Hash => {
+                keygen::HSS_HASHES.iter().map(|h| h.label.to_string()).collect()
+            }
+            HssField::Height(_) => keygen::HSS_HEIGHTS.iter().map(|h| h.to_string()).collect(),
+            HssField::Winternitz(_) => {
+                keygen::HSS_WINTERNITZ.iter().map(|w| w.to_string()).collect()
+            }
+            HssField::AddLevel => Vec::new(),
+        }
+    }
+
+    /// The currently selected choice index for an HSS/LMS `field`.
+    fn hss_field_value(&self, field: HssField) -> usize {
+        match field {
+            HssField::Mode => usize::from(self.hss.is_hss),
+            HssField::Hash => self.hss.hash_idx,
+            HssField::Height(i) => self.hss.levels[i].height_idx,
+            HssField::Winternitz(i) => self.hss.levels[i].w_idx,
+            HssField::AddLevel => 0,
+        }
+    }
+
+    /// Open the value-choice popup for the focused field (no-op on "add level",
+    /// which is an action, not a value).
+    fn hss_open_picker(&mut self) {
+        let field = self.hss_focused();
+        if field == HssField::AddLevel {
+            return;
+        }
+        self.hss_picker = Some(HssPicker { field, selected: self.hss_field_value(field) });
+    }
+
+    /// A short label for the picker's title, naming the focused field.
+    pub fn hss_field_name(field: HssField) -> String {
+        match field {
+            HssField::Mode => "Mode".into(),
+            HssField::Hash => "Hash".into(),
+            HssField::Height(i) => format!("{} height", if i == 0 { "root".into() } else { format!("L{}", i) }),
+            HssField::Winternitz(i) => format!("{} Winternitz", if i == 0 { "root".into() } else { format!("L{}", i) }),
+            HssField::AddLevel => "add level".into(),
+        }
+    }
+
+    /// Apply the picker's highlighted choice to the focused field and close it.
+    /// Switching to LMS truncates to a single level.
+    fn hss_picker_confirm(&mut self) {
+        let Some(picker) = self.hss_picker.take() else { return };
+        let sel = picker.selected;
+        match picker.field {
+            HssField::Mode => {
+                self.hss.is_hss = sel == 1;
+                if !self.hss.is_hss {
+                    self.hss.levels.truncate(1);
+                }
+                // The field list changed (no "add level" in LMS); keep the
+                // cursor valid.
+                self.param_idx = self.param_idx.min(self.hss_fields().len() - 1);
+            }
+            HssField::Hash => self.hss.hash_idx = sel,
+            HssField::Height(i) => self.hss.levels[i].height_idx = sel,
+            HssField::Winternitz(i) => self.hss.levels[i].w_idx = sel,
+            HssField::AddLevel => {}
+        }
+    }
+
+    /// Append an HSS level (a copy of the last) if in HSS mode below the limit,
+    /// and move the cursor onto the new level's height.
+    fn hss_add_level(&mut self) {
+        if self.hss.is_hss && self.hss.levels.len() < keygen::HSS_MAX_LEVELS {
+            let last = *self.hss.levels.last().unwrap();
+            self.hss.levels.push(last);
+            // Cursor to the new level's height field.
+            self.param_idx = 2 + 2 * (self.hss.levels.len() - 1);
+        }
+    }
+
+    /// Remove the level the cursor is on (never the last remaining level).
+    fn hss_remove_level(&mut self) {
+        if let HssField::Height(i) | HssField::Winternitz(i) = self.hss_focused() {
+            if self.hss.levels.len() > 1 {
+                self.hss.levels.remove(i);
+                self.param_idx = self.param_idx.min(self.hss_fields().len() - 1);
+            }
+        }
     }
 
     /// How many issued objects are checked for re-signing.
@@ -984,7 +1146,11 @@ impl PubKeyState {
     /// key-options focus (the fitting-key list may have shrunk).
     fn algorithm_changed(&mut self, cert_stem: &str) {
         if self.filename_auto {
-            self.filename = Self::default_filename(cert_stem, self.alg());
+            self.filename = if self.is_hsslms() {
+                format!("{}_{}_key.der", cert_stem, self.hss.short_name())
+            } else {
+                Self::default_filename(cert_stem, self.alg())
+            };
         }
         self.option_field = self.option_field.min(self.max_option_field());
     }
@@ -1005,6 +1171,11 @@ impl PubKeyState {
                     self.param_idx = self.family().default_member;
                     self.algorithm_changed(cert_stem);
                 }
+            }
+            1 if self.is_hsslms() => {
+                // The HSS/LMS editor: up/down move the field cursor.
+                self.hss_move_field(delta);
+                self.algorithm_changed(cert_stem);
             }
             1 => {
                 // A custom-modulus family has one extra row after the presets.
@@ -1027,8 +1198,9 @@ impl PubKeyState {
     }
 
     /// Space toggles the key-source radio (column 2, field 0) or an issued
-    /// object's re-sign checkbox (column 3).
-    fn toggle(&mut self) {
+    /// object's re-sign checkbox (column 3). (HSS/LMS value editing is done via
+    /// the Enter-triggered choice popup, not here.)
+    fn toggle(&mut self, _cert_stem: &str) {
         if self.column == 2 && self.option_field == 0 {
             self.use_existing = !self.use_existing;
             // Land on the first fitting key when switching to use-existing.
@@ -2617,6 +2789,8 @@ impl App {
             family_idx,
             param_idx,
             custom_rsa_bits: String::new(),
+            hss: keygen::HssLmsParams::default(),
+            hss_picker: None,
             use_existing: false,
             filename: PubKeyState::default_filename(&self.cert_file_stem(), alg),
             filename_auto: true,
@@ -2777,6 +2951,20 @@ impl App {
             .unwrap_or_else(|| "key".to_string())
     }
 
+    /// The path the re-key would write the generated key to — the certificate's
+    /// directory joined with the entered `filename` — shown relative to the
+    /// process's current working directory when it lies under it (else as
+    /// given). This is what the dialog displays in its full-width key-file row.
+    pub fn rekey_key_path_display(&self, filename: &str) -> String {
+        let dir = self.path.parent().map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."));
+        let key_path = dir.join(filename);
+        let shown = std::env::current_dir()
+            .ok()
+            .and_then(|cwd| key_path.strip_prefix(&cwd).ok().map(Path::to_path_buf))
+            .unwrap_or(key_path);
+        shown.display().to_string()
+    }
+
     /// The signed objects in the scanned tree that the open certificate issued,
     /// for the dialog's third column: certificates first (each with its serial
     /// number), then CRLs. Uses the same issuer resolution as the relation
@@ -2836,8 +3024,86 @@ impl App {
     }
 
     pub fn pubkey_toggle(&mut self) {
+        let stem = self.cert_file_stem();
         if let Mode::EditPubKey(ref mut s) = self.mode {
-            s.toggle();
+            s.toggle(&stem);
+        }
+    }
+
+    /// Whether the parameter column is showing the HSS/LMS structured editor
+    /// (so +/- add or remove a level there).
+    pub fn pubkey_in_hsslms_editor(&self) -> bool {
+        matches!(self.mode, Mode::EditPubKey(ref s) if s.column == 1 && s.is_hsslms())
+    }
+
+    /// Whether the HSS/LMS value-choice popup is open (it captures navigation).
+    pub fn pubkey_hss_picker_open(&self) -> bool {
+        matches!(self.mode, Mode::EditPubKey(ref s) if s.hss_picker.is_some())
+    }
+
+    /// Activate the focused HSS/LMS editor field (Enter/Space): open the
+    /// value-choice popup for a value field, or add a level on the "add level"
+    /// row. Returns whether it handled the key (so the caller can otherwise
+    /// submit the dialog / toggle a radio).
+    pub fn pubkey_hss_activate(&mut self) -> bool {
+        if !self.pubkey_in_hsslms_editor() {
+            return false;
+        }
+        let stem = self.cert_file_stem();
+        if let Mode::EditPubKey(ref mut s) = self.mode {
+            if s.hss_focused() == HssField::AddLevel {
+                s.hss_add_level();
+                s.algorithm_changed(&stem);
+            } else {
+                s.hss_open_picker();
+            }
+            return true;
+        }
+        false
+    }
+
+    /// Move the highlighted choice in the open HSS/LMS popup.
+    pub fn pubkey_hss_picker_move(&mut self, delta: isize) {
+        if let Mode::EditPubKey(ref mut s) = self.mode {
+            let Some(field) = s.hss_picker.as_ref().map(|p| p.field) else { return };
+            let n = s.hss_field_choices(field).len() as isize;
+            if let (true, Some(picker)) = (n > 0, s.hss_picker.as_mut()) {
+                picker.selected = (picker.selected as isize + delta).clamp(0, n - 1) as usize;
+            }
+        }
+    }
+
+    /// Apply the HSS/LMS popup's choice and close it.
+    pub fn pubkey_hss_picker_confirm(&mut self) {
+        let stem = self.cert_file_stem();
+        if let Mode::EditPubKey(ref mut s) = self.mode {
+            s.hss_picker_confirm();
+            s.algorithm_changed(&stem);
+        }
+    }
+
+    /// Close the HSS/LMS popup without applying.
+    pub fn pubkey_hss_picker_cancel(&mut self) {
+        if let Mode::EditPubKey(ref mut s) = self.mode {
+            s.hss_picker = None;
+        }
+    }
+
+    /// Add an HSS level (the '+' key in the editor).
+    pub fn pubkey_hss_add_level(&mut self) {
+        let stem = self.cert_file_stem();
+        if let Mode::EditPubKey(ref mut s) = self.mode {
+            s.hss_add_level();
+            s.algorithm_changed(&stem);
+        }
+    }
+
+    /// Remove the focused HSS level (the '-' key in the editor).
+    pub fn pubkey_hss_remove_level(&mut self) {
+        let stem = self.cert_file_stem();
+        if let Mode::EditPubKey(ref mut s) = self.mode {
+            s.hss_remove_level();
+            s.algorithm_changed(&stem);
         }
     }
 
@@ -2863,6 +3129,9 @@ impl App {
     pub fn submit_pubkey(&mut self) {
         let Mode::EditPubKey(ref state) = self.mode else { return };
         let alg = state.alg();
+        // The HSS/LMS structured parameters (used only when generating HSS/LMS).
+        let hss_params =
+            matches!(alg, keygen::KeyAlgorithm::HssLms).then(|| state.hss.clone());
         let use_existing = state.use_existing;
         let filename = state.filename.clone();
         let password = state.password.clone();
@@ -2922,8 +3191,11 @@ impl App {
                 password: password.clone().into_bytes(),
                 persistable: true,
             });
-            let source =
-                RekeySource::Generate { key_path: key_path.clone(), password: password.into_bytes() };
+            let source = RekeySource::Generate {
+                key_path: key_path.clone(),
+                password: password.into_bytes(),
+                hsslms: hss_params.clone(),
+            };
             (source, target)
         };
 
@@ -2940,7 +3212,11 @@ impl App {
         // a progress window; everything else completes instantly inline.
         if alg.shows_time_estimate() {
             let signatures = usize::from(self_signed) + issued_count;
-            let estimate = cost::rekey_estimate(alg, signatures, !use_existing);
+            let estimate = match &hss_params {
+                // HSS/LMS: cost depends on its structured parameters.
+                Some(p) => Some(cost::rekey_estimate_hsslms(p, signatures, !use_existing)),
+                None => cost::rekey_estimate(alg, signatures, !use_existing),
+            };
             self.spawn_rekey(plan, alg, self_signed, estimate);
         } else {
             let outcome = perform_rekey(plan);
@@ -5076,7 +5352,13 @@ impl StatefulKeyTarget {
 /// Where the new key material comes from for a re-key: a freshly generated
 /// key written to `key_path`, or an already-loaded existing key.
 enum RekeySource {
-    Generate { key_path: PathBuf, password: Vec<u8> },
+    Generate {
+        key_path: PathBuf,
+        password: Vec<u8>,
+        /// Structured HSS/LMS parameters when `alg` is HSS/LMS (which cannot
+        /// be generated from the `Copy` `KeyAlgorithm` alone); `None` otherwise.
+        hsslms: Option<keygen::HssLmsParams>,
+    },
     Existing { pkcs8: Vec<u8>, spki: Vec<u8>, label: String },
 }
 
@@ -5120,8 +5402,11 @@ struct RekeyOk {
 fn perform_rekey(plan: RekeyPlan) -> Result<RekeyOk, String> {
     // 1. Obtain the key material and (for a generated key) write the file.
     let (mut pkcs8, spki, key_part, written_key, written_password) = match plan.source {
-        RekeySource::Generate { key_path, password } => {
-            let key = keygen::generate(plan.alg)?;
+        RekeySource::Generate { key_path, password, hsslms } => {
+            let key = match &hsslms {
+                Some(params) => keygen::generate_hsslms(params)?,
+                None => keygen::generate(plan.alg)?,
+            };
             // Write the initial key now to reserve the file and surface I/O
             // errors early; a stateful key is rewritten with its final state
             // below (via `state_target`).
@@ -8478,6 +8763,144 @@ mod tests {
         let s = x509::parse_signable(&app.roots, &der).unwrap();
         assert_eq!(s.sig_alg, crate::xmss::XMSS_OID);
         assert!(dir.join("root_xmss_prog.key").exists(), "the key file was written");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn hss_family_idx() -> usize {
+        keygen::FAMILIES.iter().position(|f| f.label == "HSS/LMS").unwrap()
+    }
+
+    const HSS_LMS_OID: &[u64] = &[1, 2, 840, 113549, 1, 9, 16, 3, 17];
+
+    #[test]
+    fn rekeying_to_single_level_lms_verifies_via_openssl_with_the_rfc9802_oid() {
+        // A self-signed root re-keyed to LMS (single level): its own signature
+        // and its issued objects use the RFC 9802 OID and verify — the
+        // single-level path goes through OpenSSL's LMS implementation.
+        let dir = copy_chain("pk-lms");
+        let mut app = open_real_file(&dir.join("root_ca.der"));
+        app.start_rekey();
+        if let Mode::EditPubKey(ref mut s) = app.mode {
+            s.family_idx = hss_family_idx();
+            s.param_idx = 0;
+            // LMS, SHA-256, one level of height 5 (fast), Winternitz 8.
+            s.hss = keygen::HssLmsParams {
+                is_hss: false,
+                hash_idx: 0,
+                levels: vec![keygen::HssLevel { height_idx: 0, w_idx: 3 }],
+            };
+            assert!(s.is_hsslms());
+            s.filename = "root_lms.key".to_string();
+            s.filename_auto = false;
+        }
+        app.submit_pubkey();
+        await_rekey(&mut app); // HSS/LMS is slow → runs behind the progress window
+        assert!(matches!(app.mode, Mode::Browse), "status: {}", app.status);
+
+        let der = ber::encode_forest(&app.roots);
+        let s = x509::parse_signable(&app.roots, &der).unwrap();
+        assert_eq!(s.sig_alg, HSS_LMS_OID, "RFC 9802 signatureAlgorithm");
+        assert_eq!(s.pubkey_alg.as_deref(), Some(HSS_LMS_OID), "RFC 9802 SPKI OID");
+        assert!(
+            verify::verify_signature(&s.sig_alg, s.pubkey.as_ref().unwrap(), &s.tbs, &s.signature),
+            "self-signed LMS root verifies (via OpenSSL)"
+        );
+        assert!(
+            cert_verifies_under(&dir.join("intermediate_ca.der"), s.pubkey.as_ref().unwrap()),
+            "issued intermediate verifies under the new LMS key (via OpenSSL)"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn rekeying_to_multi_level_hss_verifies_via_botan() {
+        // Two-level HSS: OpenSSL has no HSS, so verification falls back to
+        // Botan — the certificate must still verify in the tool.
+        let dir = copy_chain("pk-hss");
+        let mut app = open_real_file(&dir.join("root_ca.der"));
+        app.start_rekey();
+        if let Mode::EditPubKey(ref mut s) = app.mode {
+            s.family_idx = hss_family_idx();
+            s.param_idx = 0;
+            // HSS, SHA-256, two levels each height 5.
+            s.hss = keygen::HssLmsParams {
+                is_hss: true,
+                hash_idx: 0,
+                levels: vec![
+                    keygen::HssLevel { height_idx: 0, w_idx: 3 },
+                    keygen::HssLevel { height_idx: 0, w_idx: 3 },
+                ],
+            };
+            s.filename = "root_hss.key".to_string();
+            s.filename_auto = false;
+        }
+        app.submit_pubkey();
+        await_rekey(&mut app);
+        assert!(matches!(app.mode, Mode::Browse), "status: {}", app.status);
+        let der = ber::encode_forest(&app.roots);
+        let s = x509::parse_signable(&app.roots, &der).unwrap();
+        assert_eq!(s.sig_alg, HSS_LMS_OID);
+        assert!(
+            verify::verify_signature(&s.sig_alg, s.pubkey.as_ref().unwrap(), &s.tbs, &s.signature),
+            "multi-level HSS verifies (via Botan)"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn hss_editor_value_choice_via_popup_and_level_management() {
+        let dir = copy_chain("pk-hssnav");
+        let mut app = open_real_file(&dir.join("root_ca.der"));
+        app.start_rekey();
+        // Navigate the family column down to HSS/LMS, then into the editor.
+        for _ in 0..hss_family_idx() {
+            app.pubkey_move_row(1);
+        }
+        app.pubkey_move_column(1);
+        assert!(app.pubkey_in_hsslms_editor());
+        if let Mode::EditPubKey(ref s) = app.mode {
+            assert!(!s.hss.is_hss && s.hss.levels.len() == 1, "LMS default");
+        }
+
+        // Field 0 is Mode. Arrow keys do NOT change the value — they navigate;
+        // pressing Down here moves to the Hash field, leaving Mode = LMS.
+        app.pubkey_move_row(1);
+        if let Mode::EditPubKey(ref s) = app.mode {
+            assert!(!s.hss.is_hss, "arrow keys must not toggle the value");
+            assert_eq!(s.hss_fields()[s.param_idx], crate::app::HssField::Hash);
+        }
+        // Back to the Mode field; Space opens the choice popup.
+        app.pubkey_move_row(-1);
+        assert!(app.pubkey_hss_activate()); // the Space action
+        assert!(app.pubkey_hss_picker_open(), "Space opens the value popup");
+        // Down selects "HSS", Enter applies it.
+        app.pubkey_hss_picker_move(1);
+        app.pubkey_hss_picker_confirm();
+        assert!(!app.pubkey_hss_picker_open(), "popup closes on confirm");
+        if let Mode::EditPubKey(ref s) = app.mode {
+            assert!(s.hss.is_hss, "popup selection switched to HSS");
+        }
+
+        // '+' appends a level; '-' on the focused new level removes it.
+        app.pubkey_hss_add_level();
+        if let Mode::EditPubKey(ref s) = app.mode {
+            assert_eq!(s.hss.levels.len(), 2, "a level was added");
+        }
+        app.pubkey_hss_remove_level();
+        if let Mode::EditPubKey(ref s) = app.mode {
+            assert_eq!(s.hss.levels.len(), 1);
+        }
+
+        // A cancelled popup leaves the value unchanged (Hash stays index 0).
+        if let Mode::EditPubKey(ref mut s) = app.mode {
+            s.param_idx = 1; // Hash field
+        }
+        app.pubkey_hss_activate();
+        app.pubkey_hss_picker_move(2);
+        app.pubkey_hss_picker_cancel();
+        if let Mode::EditPubKey(ref s) = app.mode {
+            assert_eq!(s.hss.hash_idx, 0, "cancel does not apply the choice");
+        }
         let _ = std::fs::remove_dir_all(&dir);
     }
 

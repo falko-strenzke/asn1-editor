@@ -24,6 +24,7 @@ pub mod ber;
 pub mod browser;
 pub mod cost;
 pub mod dump;
+pub mod hsslms;
 pub mod input;
 pub mod keygen;
 pub mod oid;

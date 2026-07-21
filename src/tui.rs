@@ -30,7 +30,7 @@ use ratatui::{DefaultTerminal, Frame};
 
 use crate::app::{
     App, DateTimeEditor, EditKind, EditState, Editor, FilterMatcher, Focus, HexEditor, Mode,
-    PickerTarget, PubKeyState, RowSource, TextEditor, TextFormat, DATE_FIELDS, EDIT_BYTES_PER_LINE,
+    HssPicker, PickerTarget, PubKeyState, RowSource, TextEditor, TextFormat, DATE_FIELDS, EDIT_BYTES_PER_LINE,
     EDIT_DIGITS_PER_LINE, PICKER_CLASSES, PICKER_UNIVERSAL,
 };
 use crate::x509::{self, basic_constraints, extended_key_usage, key_usage};
@@ -239,6 +239,21 @@ fn handle_resign_key(app: &mut App, key: KeyEvent) {
 }
 
 fn handle_pubkey_key(app: &mut App, key: KeyEvent) {
+    // The HSS/LMS value-choice popup, when open, captures navigation.
+    if app.pubkey_hss_picker_open() {
+        match key.code {
+            KeyCode::Up => app.pubkey_hss_picker_move(-1),
+            KeyCode::Down => app.pubkey_hss_picker_move(1),
+            KeyCode::Enter | KeyCode::Char(' ') => app.pubkey_hss_picker_confirm(),
+            KeyCode::Esc => app.pubkey_hss_picker_cancel(),
+            _ => {}
+        }
+        return;
+    }
+    // Arrow keys always navigate rows/columns; Enter applies the whole dialog.
+    // In the HSS/LMS editor, Space opens a choice popup for the focused field
+    // (or adds a level), and +/- add/remove a level.
+    let hss = app.pubkey_in_hsslms_editor();
     match key.code {
         KeyCode::Esc => app.cancel_pubkey(),
         KeyCode::Enter => app.submit_pubkey(),
@@ -246,7 +261,13 @@ fn handle_pubkey_key(app: &mut App, key: KeyEvent) {
         KeyCode::Right | KeyCode::Tab => app.pubkey_move_column(1),
         KeyCode::Up => app.pubkey_move_row(-1),
         KeyCode::Down => app.pubkey_move_row(1),
-        KeyCode::Char(' ') => app.pubkey_toggle(),
+        KeyCode::Char('+') if hss => app.pubkey_hss_add_level(),
+        KeyCode::Char('-') if hss => app.pubkey_hss_remove_level(),
+        KeyCode::Char(' ') => {
+            if !app.pubkey_hss_activate() {
+                app.pubkey_toggle();
+            }
+        }
         KeyCode::Backspace => app.pubkey_backspace(),
         KeyCode::Char(c) => app.pubkey_insert_char(c),
         _ => {}
@@ -582,6 +603,32 @@ fn wrap_text(text: &str, width: usize) -> Vec<String> {
     lines
 }
 
+/// The rows of the HSS/LMS structured parameter editor, one per field in
+/// [`PubKeyState::hss_fields`] order: mode, hash, each level's height and
+/// Winternitz (root first), and the "add level" affordance. `param_idx`
+/// selects the focused row.
+fn hss_editor_rows(s: &PubKeyState) -> Vec<String> {
+    let lvl = |i: usize| if i == 0 { "root".to_string() } else { format!("L{}", i) };
+    s.hss_fields()
+        .into_iter()
+        .map(|f| match f {
+            crate::app::HssField::Mode => {
+                format!("Mode: {}", if s.hss.is_hss { "HSS" } else { "LMS" })
+            }
+            crate::app::HssField::Hash => {
+                format!("Hash: {}", keygen::HSS_HASHES[s.hss.hash_idx].label)
+            }
+            crate::app::HssField::Height(i) => {
+                format!("{} H: {}", lvl(i), s.hss.levels[i].height())
+            }
+            crate::app::HssField::Winternitz(i) => {
+                format!("{} W: {}", lvl(i), s.hss.levels[i].winternitz())
+            }
+            crate::app::HssField::AddLevel => "＋ add level".to_string(),
+        })
+        .collect()
+}
+
 /// The re-key time-estimate line(s) for the dialog's parameter column, or
 /// empty for a fast algorithm (no estimate shown). The estimate covers the
 /// key generation (when generating a new key) plus one signature per object
@@ -595,7 +642,13 @@ fn pubkey_estimate_lines(app: &App, s: &PubKeyState, width: usize) -> Vec<Line<'
     let self_signed =
         matches!(app.sig_status, Some(SignatureStatus::Verified { self_signed: true, .. }));
     let n_sigs = usize::from(self_signed) + s.selected_issued_count();
-    let Some(estimate) = cost::rekey_estimate(alg, n_sigs, !s.use_existing) else {
+    let estimate = if s.is_hsslms() {
+        // HSS/LMS cost comes from its structured parameters.
+        Some(cost::rekey_estimate_hsslms(&s.hss, n_sigs, !s.use_existing))
+    } else {
+        cost::rekey_estimate(alg, n_sigs, !s.use_existing)
+    };
+    let Some(estimate) = estimate else {
         return Vec::new();
     };
     clock_estimate_lines(&cost::format_hms(estimate), width)
@@ -658,14 +711,23 @@ fn draw_edit_pubkey(frame: &mut Frame, app: &App, area: Rect) {
         .title(" MODIFY PUBLIC KEY — new key pair, resign issued objects ");
     let inner = block.inner(popup);
     frame.render_widget(block, popup);
-    let [cols_area, hint_area] =
-        Layout::vertical([Constraint::Min(1), Constraint::Length(1)]).areas(inner);
+    // A full-width key-file row sits between the columns and the hint (only in
+    // generate mode), so a long file name / path stays fully visible instead of
+    // being clipped inside the narrow key-options column.
+    let key_file_rows: u16 = if s.use_existing { 0 } else { 2 };
+    let [cols_area, keyfile_area, hint_area] = Layout::vertical([
+        Constraint::Min(1),
+        Constraint::Length(key_file_rows),
+        Constraint::Length(1),
+    ])
+    .areas(inner);
     let [alg_col, param_col, opt_col, issued_col] = Layout::horizontal([
         Constraint::Length(12),
-        // Wide enough for the longest parameter label (" SHAKE256_16_192 ").
-        Constraint::Length(18),
-        Constraint::Length(34),
-        Constraint::Min(20),
+        // Wide enough for the longest parameter row (the HSS/LMS editor's
+        // " Hash: SHAKE-256/256 ").
+        Constraint::Length(22),
+        Constraint::Length(32),
+        Constraint::Min(18),
     ])
     .areas(cols_area);
 
@@ -697,10 +759,13 @@ fn draw_edit_pubkey(frame: &mut Frame, app: &App, area: Rect) {
 
     // Column 1: the chosen family's parameters (curve, RSA key size,
     // parameter set) plus, for RSA, a free-entry custom-size row; scrolled so
-    // the selection stays visible.
+    // the selection stays visible. HSS/LMS has a dedicated structured editor.
     let family = &keygen::FAMILIES[s.family_idx];
-    let mut param_rows: Vec<String> =
-        family.members.iter().map(|alg| alg.param_label().to_string()).collect();
+    let mut param_rows: Vec<String> = if s.is_hsslms() {
+        hss_editor_rows(s)
+    } else {
+        family.members.iter().map(|alg| alg.param_label().to_string()).collect()
+    };
     if family.custom_modulus {
         param_rows.push(format!("custom: {}", field_value(&s.custom_rsa_bits)));
     }
@@ -740,8 +805,9 @@ fn draw_edit_pubkey(frame: &mut Frame, app: &App, area: Rect) {
     ];
     if !s.use_existing {
         let mask: String = "•".repeat(s.password.chars().count());
-        opt_lines.push(Line::from(Span::styled(" file name", Style::new().dim())));
-        opt_lines.push(row(field_value(&s.filename), s.option_field == 1, active1));
+        // The file-name field is focusable here; its value (the full path) is
+        // shown in the wide row below the columns so long names stay visible.
+        opt_lines.push(row("file name (edit ↓ below)".to_string(), s.option_field == 1, active1));
         opt_lines.push(Line::default());
         opt_lines.push(Line::from(Span::styled(" password (blank = unencrypted)", Style::new().dim())));
         opt_lines.push(row(field_value(&mask), s.option_field == 2, active1));
@@ -776,11 +842,74 @@ fn draw_edit_pubkey(frame: &mut Frame, app: &App, area: Rect) {
     }
     frame.render_widget(Paragraph::new(issued_lines), issued_col);
 
-    let hint = Line::from(Span::styled(
-        "←→ column  ↑↓ move  Space toggle  type to edit size/name/password  ⏎ apply  Esc cancel",
-        Style::new().dim(),
-    ));
+    // Full-width key-file row (generate mode): the file name plus its path
+    // relative to the CWD, wrapped to the whole dialog width so nothing is cut
+    // off. Highlighted while the file-name field is the active focus.
+    if !s.use_existing && keyfile_area.height > 0 {
+        let active_fn = s.column == 2 && s.option_field == 1;
+        let path = app.rekey_key_path_display(&s.filename);
+        let value_style = if active_fn {
+            Style::new().fg(Color::Yellow).bold()
+        } else {
+            Style::new()
+        };
+        let lines = header_field(
+            "Key file: ",
+            vec![Span::styled(field_value(&path), value_style)],
+            keyfile_area.width as usize,
+        );
+        frame.render_widget(Paragraph::new(lines), keyfile_area);
+    }
+
+    let hint_text = if s.hss_picker.is_some() {
+        "↑↓ choose  Space/⏎ select  Esc cancel"
+    } else if s.is_hsslms() && s.column == 1 {
+        "↑↓ field  ←→ column  Space edit value  + add level  - remove level  ⏎ apply  Esc cancel"
+    } else {
+        "←→ column  ↑↓ move  Space toggle  type to edit size/name/password  ⏎ apply  Esc cancel"
+    };
+    let hint = Line::from(Span::styled(hint_text, Style::new().dim()));
     frame.render_widget(Paragraph::new(hint), hint_area);
+
+    // The HSS/LMS value-choice popup sits on top of the dialog.
+    if let Some(ref picker) = s.hss_picker {
+        draw_hss_picker(frame, s, picker, area);
+    }
+}
+
+/// Centered popup listing the choices for one HSS/LMS field, opened with Enter
+/// on a value field so the arrow keys stay free for dialog navigation.
+fn draw_hss_picker(frame: &mut Frame, s: &PubKeyState, picker: &HssPicker, area: Rect) {
+    let choices = s.hss_field_choices(picker.field);
+    let title = format!(" {} ", PubKeyState::hss_field_name(picker.field));
+    let inner_w = choices.iter().map(|c| c.chars().count()).max().unwrap_or(4).max(title.len());
+    let width = (inner_w as u16 + 4).min(area.width);
+    let height = (choices.len() as u16 + 2).min(area.height);
+    let popup = Rect {
+        x: area.x + (area.width.saturating_sub(width)) / 2,
+        y: area.y + (area.height.saturating_sub(height)) / 2,
+        width,
+        height,
+    };
+    frame.render_widget(Clear, popup);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::new().fg(Color::Cyan))
+        .title(title);
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+    let lines: Vec<Line> = choices
+        .into_iter()
+        .enumerate()
+        .map(|(i, c)| {
+            let mut style = Style::new();
+            if i == picker.selected {
+                style = style.add_modifier(Modifier::REVERSED).bold();
+            }
+            Line::from(Span::styled(format!(" {} ", c), style))
+        })
+        .collect();
+    frame.render_widget(Paragraph::new(lines), inner);
 }
 
 /// Render a text-field value, showing a single-space placeholder when empty so
@@ -2266,6 +2395,18 @@ fn botan_path_status_lines(
             "revoked — a certificate on the path is on a CRL".to_string(),
             Style::new().fg(Color::Red).bold(),
         ),
+        // Botan's path-validation policy rejects a signature whose hash is not
+        // on its trusted-hash allow-list. That fires for post-quantum
+        // signatures (SLH-DSA/XMSS), whose hash is not on Botan's classical
+        // default list, even though the signature is valid — so annotate this
+        // case rather than showing the bare message, which reads like a
+        // certificate defect.
+        BotanPathStatus::Invalid { reason } if reason.to_lowercase().contains("too weak") => (
+            "Botan policy rejects the signature's hash — expected for \
+             post-quantum signatures (e.g. SLH-DSA/XMSS); OpenSSL accepts it"
+                .to_string(),
+            Style::new().fg(Color::Yellow),
+        ),
         BotanPathStatus::Invalid { reason } => {
             (format!("no valid path — {}", reason), Style::new().fg(Color::Red).bold())
         }
@@ -2418,7 +2559,7 @@ fn draw_content_browse(frame: &mut Frame, app: &App, area: Rect) {
             // Cap at the hex-dump width so these sections, like the header
             // fields above, never run wider than the content below them.
             let inner_w =
-                (area.width.saturating_sub(2) as usize).min(HEX_DUMP_LINE_WIDTH).max(20);
+                (area.width.saturating_sub(2) as usize).clamp(20, HEX_DUMP_LINE_WIDTH);
             let mut out = vec![
                 Line::default(),
                 Line::from(Span::styled(heading.to_string(), Style::new().fg(Color::LightCyan).bold())),
@@ -3205,10 +3346,109 @@ mod tests {
     }
 
     #[test]
+    fn botan_hash_too_weak_is_annotated_but_other_reasons_are_verbatim() {
+        // The "too weak" hash rejection (post-quantum signatures) is reworded
+        // so it doesn't read as a certificate defect.
+        let weak = botan_path_status_lines(
+            "Path/Botan   ",
+            &BotanPathStatus::Invalid {
+                reason: "Hash function used is considered too weak for security".to_string(),
+            },
+            HEX_DUMP_LINE_WIDTH,
+        );
+        let weak_text: String = weak.iter().map(line_text).collect::<Vec<_>>().join(" ");
+        assert!(weak_text.contains("post-quantum"), "annotated: {weak_text}");
+        assert!(weak_text.contains("OpenSSL accepts it"), "annotated: {weak_text}");
+        assert!(!weak_text.contains("too weak"), "raw message hidden: {weak_text}");
+
+        // Any other rejection reason is shown verbatim.
+        let other = botan_path_status_lines(
+            "Path/Botan   ",
+            &BotanPathStatus::Invalid { reason: "certificate has expired".to_string() },
+            HEX_DUMP_LINE_WIDTH,
+        );
+        let other_text: String = other.iter().map(line_text).collect::<Vec<_>>().join(" ");
+        assert!(other_text.contains("no valid path — certificate has expired"), "{other_text}");
+    }
+
+    #[test]
     fn header_field_keeps_a_short_value_on_one_line() {
         let lines = header_field("Type    ", vec![Span::raw("SEQUENCE")], HEX_DUMP_LINE_WIDTH);
         assert_eq!(lines.len(), 1);
         assert_eq!(line_text(&lines[0]), "Type    SEQUENCE");
+    }
+
+    #[test]
+    fn rekey_dialog_shows_key_file_path_full_width_not_clipped() {
+        use crate::input::Container;
+        use ratatui::{backend::TestBackend, Terminal};
+        let der =
+            std::fs::read(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("testdata/cert_rsa.der"))
+                .unwrap();
+        let roots = parse_forest(&der, 0).unwrap();
+        let mut app = App::new(
+            PathBuf::from("cert_rsa.der"),
+            PathBuf::from("cert_rsa.der"),
+            Container::Raw,
+            roots,
+            der.len(),
+        );
+        app.start_rekey();
+        // A name far longer than the ~32-wide key-options column.
+        let long = "a_very_long_generated_key_file_name_that_the_column_would_clip.der";
+        if let Mode::EditPubKey(ref mut s) = app.mode {
+            s.filename = long.to_string();
+            s.filename_auto = false;
+        }
+        let mut term = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let text = buffer_text(term.backend().buffer());
+        // The full path is visible in the wide key-file row, uncut…
+        assert!(text.contains("Key file:"), "key-file row label:\n{text}");
+        assert!(text.contains(long), "full file name must be visible:\n{text}");
+        // …and the key-options column now carries only a focusable pointer.
+        assert!(text.contains("file name (edit"), "column pointer to the row below:\n{text}");
+    }
+
+    #[test]
+    fn rekey_dialog_renders_the_hsslms_structured_editor() {
+        use crate::input::Container;
+        use ratatui::{backend::TestBackend, Terminal};
+        let der =
+            std::fs::read(PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("testdata/cert_rsa.der"))
+                .unwrap();
+        let roots = parse_forest(&der, 0).unwrap();
+        let mut app = App::new(
+            PathBuf::from("cert_rsa.der"),
+            PathBuf::from("cert_rsa.der"),
+            Container::Raw,
+            roots,
+            der.len(),
+        );
+        app.start_rekey();
+        // Navigate the family column to HSS/LMS.
+        let hss = keygen::FAMILIES.iter().position(|f| f.label == "HSS/LMS").unwrap();
+        for _ in 0..hss {
+            app.pubkey_move_row(1);
+        }
+        let mut term = Terminal::new(TestBackend::new(120, 30)).unwrap();
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let text = buffer_text(term.backend().buffer());
+        // The structured editor's fields render.
+        assert!(text.contains("Mode: LMS"), "mode field:\n{text}");
+        assert!(text.contains("Hash: SHA-256"), "hash field:\n{text}");
+        assert!(text.contains("root H:"), "root level height:\n{text}");
+        assert!(text.contains('🕐'), "HSS/LMS shows a time estimate");
+
+        // Enter the parameter column, focus the Hash field, and press Space:
+        // a choice popup appears (arrow keys never edited the value inline).
+        app.pubkey_move_column(1);
+        app.pubkey_move_row(1); // Mode -> Hash
+        assert!(app.pubkey_hss_activate()); // the Space action
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let popup = buffer_text(term.backend().buffer());
+        assert!(popup.contains("SHAKE-256/256"), "hash choice popup:\n{popup}");
+        assert!(popup.contains("SHA-256/192"), "hash choice popup:\n{popup}");
     }
 
     #[test]

@@ -15,11 +15,11 @@ env:
   LINUX_TARGET: x86_64-unknown-linux-gnu
   WINDOWS_TARGET: x86_64-pc-windows-msvc
   # The `openssl` crate is used for the post-quantum algorithms (ML-DSA /
-  # SLH-DSA), which need OpenSSL 3.5+. Runner system OpenSSL is older (and the
+  # SLH-DSA), which need OpenSSL 3.5+, and HSS/LMS which needs 3.6+enable-lms. Runner system OpenSSL is older (and the
   # `openssl-sys` vendored build only bundles the 3.0 LTS), so a static 3.5 is
-  # built from source and linked in — this also makes the artifacts
+  # built from source and linked in (enable-lms adds HSS/LMS verification) — this also makes the artifacts
   # self-contained (no external libssl at runtime).
-  OPENSSL_VERSION: '3.5.6'
+  OPENSSL_VERSION: '3.6.0'
 
 jobs:
   appimage:
@@ -42,7 +42,7 @@ jobs:
           path: ${{ runner.temp }}/openssl
           key: openssl-${{ env.OPENSSL_VERSION }}-linux-x86_64-static
 
-      - name: Build static OpenSSL 3.5 (ML-DSA / SLH-DSA)
+      - name: Build static OpenSSL 3.6 (ML-DSA / SLH-DSA / LMS)
         if: steps.cache-openssl.outputs.cache-hit != 'true'
         run: |
           prefix="$RUNNER_TEMP/openssl"
@@ -52,12 +52,12 @@ jobs:
             "https://github.com/openssl/openssl/releases/download/openssl-${OPENSSL_VERSION}/openssl-${OPENSSL_VERSION}.tar.gz" \
             | tar -xz -C "$src" --strip-components=1
           cd "$src"
-          ./Configure --prefix="$prefix" --libdir=lib no-shared no-docs linux-x86_64
+          ./Configure --prefix="$prefix" --libdir=lib enable-lms no-shared no-docs linux-x86_64
           make -j"$(nproc)"
           make install_sw
           make install_ssldirs   # openssl.cnf, needed by the `openssl req` CLI tests
 
-      - name: Use static OpenSSL 3.5
+      - name: Use static OpenSSL 3.6
         run: |
           echo "OPENSSL_DIR=$RUNNER_TEMP/openssl" >> "$GITHUB_ENV"
           echo "OPENSSL_STATIC=1" >> "$GITHUB_ENV"
@@ -65,7 +65,7 @@ jobs:
 
       - name: Build and test
         run: |
-          openssl version   # the freshly built 3.5, used by the openssl-CLI tests
+          openssl version   # the freshly built 3.6, used by the openssl-CLI tests
           cargo test --locked --target "$LINUX_TARGET"
           cargo build --locked --release --target "$LINUX_TARGET"
 
@@ -160,7 +160,7 @@ jobs:
           path: ${{ runner.temp }}\openssl
           key: openssl-${{ env.OPENSSL_VERSION }}-windows-x86_64-static
 
-      - name: Build static OpenSSL 3.5 (ML-DSA / SLH-DSA)
+      - name: Build static OpenSSL 3.6 (ML-DSA / SLH-DSA / LMS)
         if: steps.cache-openssl.outputs.cache-hit != 'true'
         shell: pwsh
         run: |
@@ -174,13 +174,13 @@ jobs:
           Push-Location $src
           # no-asm avoids a NASM dependency; no-shared links OpenSSL statically
           # into our binary so the portable app carries no libssl DLLs.
-          perl Configure VC-WIN64A no-shared no-asm no-docs "--prefix=$prefix" "--openssldir=$prefix"
+          perl Configure VC-WIN64A enable-lms no-shared no-asm no-docs "--prefix=$prefix" "--openssldir=$prefix"
           nmake
           nmake install_sw
           nmake install_ssldirs   # openssl.cnf, needed by any `openssl` CLI use
           Pop-Location
 
-      - name: Use static OpenSSL 3.5
+      - name: Use static OpenSSL 3.6
         shell: pwsh
         run: |
           $prefix = Join-Path $env:RUNNER_TEMP "openssl"

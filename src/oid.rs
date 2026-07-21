@@ -60,6 +60,43 @@ macro_rules! nist_sig {
 /// Register; the remaining entries come from the applicable PKCS, CMS,
 /// X.500/X.509, SEC/ANSI, NIST, and IETF specifications.
 pub static OIDS: &[OidEntry] = &[
+    // HSS/LMS (RFC 8708 / RFC 9802) — id-alg-hss-lms-hashsig. This is the OID
+    // this tool writes into a certificate's SubjectPublicKeyInfo and the
+    // certificate/CRL signatureAlgorithm for an HSS/LMS key.
+    oid!(
+        "1.2.840.113549.1.9.16.3.17",
+        [1, 2, 840, 113549, 1, 9, 16, 3, 17],
+        "id-alg-hss-lms-hashsig",
+        [
+            "iso",
+            "member-body",
+            "us",
+            "rsadsi",
+            "pkcs",
+            "pkcs-9",
+            "smime",
+            "alg",
+            "id-alg-hss-lms-hashsig"
+        ]
+    ),
+    // The OID Botan puts in an HSS/LMS *private* key's PKCS#8 (its own arc);
+    // key files carry it so Botan can load them.
+    oid!(
+        "1.3.6.1.4.1.25258.1.13",
+        [1, 3, 6, 1, 4, 1, 25258, 1, 13],
+        "HSS-LMS-privateKey",
+        [
+            "iso",
+            "identified-organization",
+            "dod",
+            "internet",
+            "private",
+            "enterprise",
+            "randombit",
+            "algorithm",
+            "HSS-LMS-privateKey"
+        ]
+    ),
     // XMSS (RFC 9802, June 2025) — id-alg-xmss-hashsig on the PKIX algorithms
     // arc. This is the OID this tool writes into a certificate's
     // SubjectPublicKeyInfo and the certificate/CRL signatureAlgorithm.

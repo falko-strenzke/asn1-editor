@@ -18,13 +18,37 @@ cargo build --release        # binary in target/release/asn1-editor
 cargo test                   # includes the dumpasn1 comparison if installed
 ```
 
-The XMSS backend links Botan, built from bundled source via the `botan`
-crate's `vendored` feature, so the resulting binary is self-contained (no
-system Botan or shared library at runtime). Building it needs a C++17
+The XMSS and HSS/LMS backends link Botan, built from bundled source via the
+`botan` crate's `vendored` feature, so the resulting binary is self-contained
+(no system Botan or shared library at runtime). Building it needs a C++17
 compiler, GNU `make`, and Python 3 on `PATH` — Botan's `configure.py`. The
 first build spends a few minutes compiling Botan; later builds are cached.
 
-The only dependency is `ratatui`.
+### OpenSSL 3.6 (required for HSS/LMS verification)
+
+The `openssl` crate is used for ML-DSA / SLH-DSA and for verifying single-level
+**LMS** certificates. LMS verification landed in **OpenSSL 3.6** and is
+disabled by default, so the build must link an OpenSSL **3.6 or newer built
+with `enable-lms`**. Point `openssl-sys` at such a build with the standard
+environment variables:
+
+```sh
+# Build OpenSSL 3.6 with LMS once (any prefix you like):
+curl -L https://github.com/openssl/openssl/releases/download/openssl-3.6.0/openssl-3.6.0.tar.gz | tar xz
+cd openssl-3.6.0
+./Configure --prefix="$HOME/.local/openssl-3.6-lms" --libdir=lib enable-lms no-shared no-docs
+make -j"$(nproc)" && make install_sw && cd ..
+
+# Then build/test asn1-editor against it:
+export OPENSSL_DIR="$HOME/.local/openssl-3.6-lms"
+export OPENSSL_STATIC=1
+cargo build --release
+```
+
+The CI (`.github/workflows/appimage.yml`) builds this OpenSSL from source and
+sets the same variables. Without a 3.6-`enable-lms` OpenSSL, everything builds
+but HSS/LMS single-level (LMS) certificates cannot be verified (multi-level
+HSS is verified by Botan and is unaffected).
 
 ## Usage
 

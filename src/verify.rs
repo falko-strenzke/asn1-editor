@@ -63,12 +63,138 @@ fn is_xmss(sig_alg: &[u64]) -> bool {
     crate::xmss::is_xmss_oid(sig_alg)
 }
 
+/// Whether `sig_alg` is the HSS/LMS OID. Signing is Botan (`hsslms.rs`);
+/// verification is split — single-level LMS via OpenSSL, multi-level HSS via
+/// Botan (OpenSSL has no HSS). See [`hsslms_verify`].
+fn is_hsslms(sig_alg: &[u64]) -> bool {
+    crate::hsslms::is_hss_lms_oid(sig_alg)
+}
+
+/// Verify an HSS/LMS signature over `tbs` under the raw HSS public-key bytes
+/// `pubkey` (a `subjectPublicKey`, unused-bits octet stripped). A single-level
+/// key (HSS `L=1` ≡ plain LMS) is verified by OpenSSL 3.6's LMS implementation;
+/// a multi-level HSS key is verified by Botan (OpenSSL has no HSS support).
+fn hsslms_verify(pubkey: &[u8], tbs: &[u8], signature: &[u8]) -> bool {
+    match crate::hsslms::hss_levels(pubkey) {
+        // Single level: strip the HSS framing (a 4-byte level count on the key,
+        // a 4-byte `Nspk`=0 prefix on the signature) to recover the plain
+        // RFC 8554 LMS public key and signature that OpenSSL verifies.
+        Some(1) => {
+            if pubkey.len() <= 4 || signature.len() < 4 {
+                return false;
+            }
+            openssl_lms_verify(&pubkey[4..], tbs, &signature[4..])
+        }
+        Some(_) => crate::hsslms::verify(pubkey, tbs, signature),
+        None => false,
+    }
+}
+
+/// Verify a plain RFC 8554 LMS signature with OpenSSL 3.6 (which implements
+/// LMS as a verify-only "signature with message" algorithm). Imports the raw
+/// LMS public key via `EVP_PKEY_fromdata` and verifies with
+/// `EVP_PKEY_verify_message_init` + `EVP_PKEY_verify` — APIs the safe
+/// `openssl` crate does not wrap for LMS, so this drops to `openssl-sys`.
+fn openssl_lms_verify(lms_pubkey: &[u8], msg: &[u8], lms_sig: &[u8]) -> bool {
+    use std::ffi::c_void;
+    use std::ptr;
+
+    // Not wrapped by openssl-sys; declared here.
+    extern "C" {
+        fn EVP_PKEY_CTX_new_from_pkey(
+            libctx: *mut openssl_sys::OSSL_LIB_CTX,
+            pkey: *mut openssl_sys::EVP_PKEY,
+            propquery: *const std::os::raw::c_char,
+        ) -> *mut openssl_sys::EVP_PKEY_CTX;
+    }
+
+    let lms = c"LMS";
+    let pub_param = c"pub";
+
+    // SAFETY: every object created is freed on all paths by the guards below;
+    // pointers are null-checked before use. The input buffers outlive the
+    // calls that read them (OpenSSL copies the key material in `fromdata`).
+    unsafe {
+        let ctx =
+            openssl_sys::EVP_PKEY_CTX_new_from_name(ptr::null_mut(), lms.as_ptr(), ptr::null());
+        if ctx.is_null() {
+            return false;
+        }
+        struct CtxGuard(*mut openssl_sys::EVP_PKEY_CTX);
+        impl Drop for CtxGuard {
+            fn drop(&mut self) {
+                unsafe { openssl_sys::EVP_PKEY_CTX_free(self.0) }
+            }
+        }
+        let _ctx = CtxGuard(ctx);
+
+        if openssl_sys::EVP_PKEY_fromdata_init(ctx) <= 0 {
+            return false;
+        }
+        let mut params = [
+            openssl_sys::OSSL_PARAM_construct_octet_string(
+                pub_param.as_ptr(),
+                lms_pubkey.as_ptr() as *mut c_void,
+                lms_pubkey.len(),
+            ),
+            openssl_sys::OSSL_PARAM_construct_end(),
+        ];
+        let mut pkey: *mut openssl_sys::EVP_PKEY = ptr::null_mut();
+        if openssl_sys::EVP_PKEY_fromdata(
+            ctx,
+            &mut pkey,
+            openssl_sys::EVP_PKEY_PUBLIC_KEY,
+            params.as_mut_ptr(),
+        ) <= 0
+            || pkey.is_null()
+        {
+            return false;
+        }
+        struct PkeyGuard(*mut openssl_sys::EVP_PKEY);
+        impl Drop for PkeyGuard {
+            fn drop(&mut self) {
+                unsafe { openssl_sys::EVP_PKEY_free(self.0) }
+            }
+        }
+        let _pkey = PkeyGuard(pkey);
+
+        let sig_alg = openssl_sys::EVP_SIGNATURE_fetch(ptr::null_mut(), lms.as_ptr(), ptr::null());
+        if sig_alg.is_null() {
+            return false;
+        }
+        struct SigGuard(*mut openssl_sys::EVP_SIGNATURE);
+        impl Drop for SigGuard {
+            fn drop(&mut self) {
+                unsafe { openssl_sys::EVP_SIGNATURE_free(self.0) }
+            }
+        }
+        let _sig = SigGuard(sig_alg);
+
+        let vctx = EVP_PKEY_CTX_new_from_pkey(ptr::null_mut(), pkey, ptr::null());
+        if vctx.is_null() {
+            return false;
+        }
+        let _vctx = CtxGuard(vctx);
+
+        if openssl_sys::EVP_PKEY_verify_message_init(vctx, sig_alg, ptr::null()) <= 0 {
+            return false;
+        }
+        openssl_sys::EVP_PKEY_verify(
+            vctx,
+            lms_sig.as_ptr(),
+            lms_sig.len(),
+            msg.as_ptr(),
+            msg.len(),
+        ) == 1
+    }
+}
+
 /// Whether signing with `sig_alg` mutates the private key — the caller must
 /// persist the updated key [`sign_stateful`] returns. True for XMSS (each
 /// signature consumes a one-time-signature index); false for every stateless
 /// algorithm.
 pub fn is_stateful(sig_alg: &[u64]) -> bool {
-    is_xmss(sig_alg)
+    is_xmss(sig_alg) || is_hsslms(sig_alg)
 }
 
 #[derive(Debug)]
@@ -142,6 +268,9 @@ pub fn private_key_usable(pkcs8_key: &[u8]) -> bool {
         // An XMSS key loads via the Botan backend.
         || (pkcs8_alg_arcs(pkcs8_key).as_deref().is_some_and(is_xmss)
             && crate::xmss::key_usable(pkcs8_key))
+        // An HSS/LMS key (Botan's private-key OID) loads via the Botan backend.
+        || (pkcs8_alg_arcs(pkcs8_key).as_deref().is_some_and(is_hsslms)
+            && crate::hsslms::key_usable(pkcs8_key))
 }
 
 /// Whether `pkcs8_key` is a consistent RSA private key according to OpenSSL
@@ -178,6 +307,12 @@ pub fn pkcs8_is_xmss(pkcs8_key: &[u8]) -> bool {
     pkcs8_alg_arcs(pkcs8_key).as_deref().is_some_and(is_xmss)
 }
 
+/// Whether a PKCS#8 `PrivateKeyInfo`'s `privateKeyAlgorithm` is the HSS/LMS
+/// OID (Botan's private-key arc), so it goes through the Botan backend.
+pub fn pkcs8_is_hsslms(pkcs8_key: &[u8]) -> bool {
+    pkcs8_alg_arcs(pkcs8_key).as_deref().is_some_and(is_hsslms)
+}
+
 /// Whether `signature` is a valid `sig_alg` signature over `tbs` under the
 /// public key `pubkey` (a `subjectPublicKey`, unused-bits octet stripped).
 /// Used by re-signing to confirm a freshly generated signature actually
@@ -188,6 +323,9 @@ pub fn verify_signature(sig_alg: &[u64], pubkey: &[u8], tbs: &[u8], signature: &
     }
     if is_xmss(sig_alg) {
         return crate::xmss::verify(pubkey, tbs, signature);
+    }
+    if is_hsslms(sig_alg) {
+        return hsslms_verify(pubkey, tbs, signature);
     }
     let ok = match algorithm_for(sig_alg) {
         Some(alg) => signature::UnparsedPublicKey::new(alg, pubkey).verify(tbs, signature).is_ok(),
@@ -285,6 +423,7 @@ fn spki_der(sig_alg: &[u64], pubkey: &[u8]) -> Option<Vec<u8>> {
 pub fn signing_supported(sig_alg: &[u64]) -> bool {
     is_pq(sig_alg)
         || is_xmss(sig_alg)
+        || is_hsslms(sig_alg)
         || [
             SHA256_WITH_RSA,
             SHA384_WITH_RSA,
@@ -320,6 +459,10 @@ pub fn sign_stateful(
 ) -> Result<(Vec<u8>, Option<Vec<u8>>), String> {
     if is_xmss(sig_alg) {
         let (sig, updated) = crate::xmss::sign(pkcs8_key, tbs)?;
+        return Ok((sig, Some(updated)));
+    }
+    if is_hsslms(sig_alg) {
+        let (sig, updated) = crate::hsslms::sign(pkcs8_key, tbs)?;
         return Ok((sig, Some(updated)));
     }
     sign_stateless(sig_alg, pkcs8_key, tbs).map(|sig| (sig, None))
@@ -423,7 +566,11 @@ pub fn verify_cms(files: &[SignableFile], cms: &x509::CmsSigned, cms_der: &[u8])
         return SignatureStatus::IssuerNotFound;
     };
     let summary = signer.signable.subject_summary.clone().unwrap_or_default();
-    if !is_pq(&cms.sig_alg) && !is_xmss(&cms.sig_alg) && algorithm_for(&cms.sig_alg).is_none() {
+    if !is_pq(&cms.sig_alg)
+        && !is_xmss(&cms.sig_alg)
+        && !is_hsslms(&cms.sig_alg)
+        && algorithm_for(&cms.sig_alg).is_none()
+    {
         return SignatureStatus::UnsupportedAlgorithm(oid_string(&cms.sig_alg));
     }
     let raw_ok = cms_raw_verify(cms, &signer.signable);
@@ -515,6 +662,7 @@ pub fn verify_against(index: &[CaCandidate], signable: &Signable) -> SignatureSt
     };
     if !is_pq(&signable.sig_alg)
         && !is_xmss(&signable.sig_alg)
+        && !is_hsslms(&signable.sig_alg)
         && algorithm_for(&signable.sig_alg).is_none()
     {
         return SignatureStatus::UnsupportedAlgorithm(oid_string(&signable.sig_alg));
@@ -1125,6 +1273,38 @@ mod tests {
             SignatureStatus::IssuerNotFound => "IssuerNotFound",
             SignatureStatus::UnsupportedAlgorithm(_) => "UnsupportedAlgorithm",
         }
+    }
+
+    #[test]
+    fn hsslms_single_level_verifies_via_openssl_and_multi_level_via_botan() {
+        use crate::{ber, hsslms};
+        let msg = b"a tbsCertificate stand-in for HSS/LMS";
+        let spki_bits = |spki: &[u8]| -> Vec<u8> {
+            let roots = ber::parse_forest(spki, 0).unwrap();
+            roots[0].children.last().unwrap().value[1..].to_vec()
+        };
+
+        // Single-level LMS: verify_signature must route to OpenSSL and accept.
+        let (lms_pkcs8, lms_spki) = hsslms::generate("SHA-256,HW(5,8)").unwrap();
+        let (lms_sig, _) = sign_stateful(hsslms::HSS_LMS_OID, &lms_pkcs8, msg).unwrap();
+        let lms_pub = spki_bits(&lms_spki);
+        assert_eq!(hsslms::hss_levels(&lms_pub), Some(1));
+        assert!(
+            verify_signature(hsslms::HSS_LMS_OID, &lms_pub, msg, &lms_sig),
+            "single-level LMS must verify (via OpenSSL)"
+        );
+        assert!(!verify_signature(hsslms::HSS_LMS_OID, &lms_pub, b"x", &lms_sig));
+
+        // Multi-level HSS: verify_signature must route to Botan and accept.
+        let (hss_pkcs8, hss_spki) = hsslms::generate("SHA-256,HW(5,8),HW(5,8)").unwrap();
+        let (hss_sig, _) = sign_stateful(hsslms::HSS_LMS_OID, &hss_pkcs8, msg).unwrap();
+        let hss_pub = spki_bits(&hss_spki);
+        assert_eq!(hsslms::hss_levels(&hss_pub), Some(2));
+        assert!(
+            verify_signature(hsslms::HSS_LMS_OID, &hss_pub, msg, &hss_sig),
+            "multi-level HSS must verify (via Botan)"
+        );
+        assert!(!verify_signature(hsslms::HSS_LMS_OID, &hss_pub, b"x", &hss_sig));
     }
 
     #[test]
