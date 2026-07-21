@@ -3728,17 +3728,18 @@ impl App {
     /// gets the new identity. Encrypted keys are never in `key_files`.
     ///
     /// When the open document is unmodified (`!dirty`), its live content equals
-    /// what the directory scan already read from disk, so an existing scanned
-    /// entry is reused as-is. This matters for browser live-preview: deriving a
-    /// key's identity reloads it through the backend, and for HSS/LMS and XMSS
-    /// keys that reload recomputes the whole public key (the LMS Merkle tree) —
-    /// seconds of work that would otherwise run on every arrow-key press.
+    /// what the directory scan already read from disk, so the scan's verdict for
+    /// this file stands as-is — whether that verdict was "linkable key" (an
+    /// entry in `key_files`) or "not linkable" (no entry). Recomputing it would
+    /// reload the key through the backend, and for HSS/LMS and XMSS keys that
+    /// reload recomputes the whole public key (the LMS Merkle tree) — seconds of
+    /// work that would otherwise run on every browser arrow-key press. Note
+    /// those very keys are the ones *absent* from `key_files` (their public key
+    /// cannot be derived without the backend), so the skip must not be
+    /// conditioned on an entry already being present.
     fn refresh_own_key_file(&mut self) {
-        if self.file_open
-            && !self.dirty
-            && self.key_files.iter().any(|k| k.path == self.path)
-        {
-            return; // unchanged on disk — the scanned entry is still valid
+        if self.file_open && !self.dirty {
+            return; // unchanged on disk — the scan's verdict is still valid
         }
         self.key_files.retain(|k| k.path != self.path);
         if self.file_open {
@@ -8705,33 +8706,38 @@ mod tests {
     }
 
     #[test]
-    fn unchanged_key_file_reuses_the_scanned_entry_instead_of_reloading() {
-        // Deriving a key's identity reloads it through the backend, and for
-        // HSS/LMS and XMSS that reload recomputes the whole public key — too
-        // slow to redo on every browser arrow-key press. A clean, already-
-        // scanned file must therefore reuse its scanned `key_files` entry.
-        // Proxy for "was not reloaded": a sentinel entry survives untouched.
-        let mut app = open_real_file(Path::new("testdata/cert_rsa.der"));
-        app.file_open = true;
-        app.dirty = false;
-        let sentinel = x509::PublicKeyId::Ec(vec![0xAB; 4]);
-        app.key_files.retain(|k| k.path != app.path);
-        app.key_files.push(x509::KeyFile { path: app.path.clone(), key: sentinel.clone() });
-
-        app.refresh_own_key_file();
-        assert_eq!(
-            app.key_files.iter().find(|k| k.path == app.path).map(|k| &k.key),
-            Some(&sentinel),
-            "clean, already-scanned file must reuse its entry (no reload)"
+    fn a_clean_key_file_is_not_reloaded_to_rebuild_its_key_files_entry() {
+        // Deriving a key's identity reloads it through the backend; for HSS/LMS
+        // and XMSS that reload recomputes the whole public key (the LMS Merkle
+        // tree) — seconds of work that must not run on every browser arrow-key
+        // press. An unmodified file's verdict already stands from the directory
+        // scan. Crucially those slow keys are the ones the scan leaves *out* of
+        // `key_files` (their public key cannot be derived without the backend),
+        // so the skip must hold even when no entry is present — not only when
+        // one is.
+        //
+        // A real EC key stands in for the mechanism: it *is* linkable, so a
+        // reload would (re)populate its entry. After clearing `key_files`, a
+        // clean refresh must leave it empty (no reload); a dirty one must
+        // repopulate it from live content.
+        let mut app = open_real_file(&kl("key_ec_pkcs8.der"));
+        assert!(
+            app.key_files.iter().any(|k| k.path == app.path),
+            "the startup scan should have found this usable EC key"
         );
 
-        // With unsaved edits the identity is recomputed from live content: the
-        // open certificate is not a private key, so the stale entry is dropped.
-        app.dirty = true;
-        app.refresh_own_key_file();
+        app.key_files.clear();
+        app.refresh_own_key_file(); // clean: must not reload
         assert!(
-            app.key_files.iter().all(|k| k.path != app.path),
-            "a modified document recomputes from live content and drops the stale entry"
+            app.key_files.is_empty(),
+            "a clean file must not be reloaded to rebuild its entry"
+        );
+
+        app.dirty = true;
+        app.refresh_own_key_file(); // modified: recompute from live content
+        assert!(
+            app.key_files.iter().any(|k| k.path == app.path),
+            "a modified key is re-derived from live content"
         );
     }
 
