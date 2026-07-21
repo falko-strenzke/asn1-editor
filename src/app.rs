@@ -915,6 +915,12 @@ pub struct PubKeyState {
     /// True while `filename` still tracks the algorithm-derived default; set
     /// false once the user edits it, so an algorithm change stops overwriting.
     pub filename_auto: bool,
+    /// Whether the file-name column (column 4) is in cursor-edit mode: entered
+    /// with Space, left with Enter. Outside it, ←/→ move between columns; inside
+    /// it, ←/→ move [`Self::filename_cursor`] and typing edits the name.
+    pub filename_editing: bool,
+    /// Cursor position (char index into `filename`) while editing it.
+    pub filename_cursor: usize,
     /// Optional password for a generated key; empty means an unencrypted PKCS#8.
     pub password: String,
     /// Every available existing key (across all algorithms); filtered to the
@@ -1137,7 +1143,9 @@ impl PubKeyState {
         if self.use_existing {
             self.fitting_keys().len()
         } else {
-            2
+            // Generate mode: field 0 is the source radio, field 1 the password.
+            // (The file name is its own column — see [`move_column`].)
+            1
         }
     }
 
@@ -1156,7 +1164,12 @@ impl PubKeyState {
     }
 
     fn move_column(&mut self, delta: isize) {
-        self.column = (self.column as isize + delta).clamp(0, 3) as usize;
+        // Generate mode exposes a 5th column (index 4): the key file-name field,
+        // rendered as a full-width row below the columns but reached with ←/→ as
+        // if it were the column past "issued objects". Use-existing has no such
+        // field, so it stops at column 3.
+        let max = if self.use_existing { 3 } else { 4 };
+        self.column = (self.column as isize + delta).clamp(0, max) as usize;
         // Keep the key-options focus valid for the (possibly different) column.
         self.option_field = self.option_field.min(self.max_option_field());
     }
@@ -1188,12 +1201,14 @@ impl PubKeyState {
                 let max = self.max_option_field() as isize;
                 self.option_field = (self.option_field as isize + delta).clamp(0, max) as usize;
             }
-            _ => {
+            3 => {
                 if !self.issued.is_empty() {
                     let n = self.issued.len() as isize;
                     self.issued_idx = (self.issued_idx as isize + delta).clamp(0, n - 1) as usize;
                 }
             }
+            // Column 4 is the single-line file-name field: no sub-rows to move.
+            _ => {}
         }
     }
 
@@ -1224,16 +1239,13 @@ impl PubKeyState {
             }
             return;
         }
+        // The file name (column 4) is edited only in its cursor-edit mode, via
+        // [`Self::filename_type`] — not through this direct-typing path.
         if self.column != 2 || self.use_existing {
             return;
         }
-        match self.option_field {
-            1 => {
-                self.filename.push(c);
-                self.filename_auto = false;
-            }
-            2 => self.password.push(c),
-            _ => {}
+        if self.option_field == 1 {
+            self.password.push(c);
         }
     }
 
@@ -1246,16 +1258,69 @@ impl PubKeyState {
         if self.column != 2 || self.use_existing {
             return;
         }
-        match self.option_field {
-            1 => {
-                self.filename.pop();
-                self.filename_auto = false;
-            }
-            2 => {
-                self.password.pop();
-            }
-            _ => {}
+        if self.option_field == 1 {
+            self.password.pop();
         }
+    }
+
+    /// Whether the file-name column is the current focus (generate mode only).
+    fn filename_focused(&self) -> bool {
+        self.column == 4 && !self.use_existing
+    }
+
+    /// Enter cursor-edit mode on the file-name field, placing the cursor at the
+    /// end of the current name. A no-op unless the field is focused.
+    fn filename_begin_edit(&mut self) {
+        if !self.filename_focused() {
+            return;
+        }
+        self.filename_editing = true;
+        self.filename_cursor = self.filename.chars().count();
+    }
+
+    /// Leave cursor-edit mode (Enter/Esc while editing).
+    fn filename_end_edit(&mut self) {
+        self.filename_editing = false;
+    }
+
+    /// Move the file-name cursor by `delta`, clamped to the name's bounds.
+    /// `delta` of `isize::MIN`/`MAX` jumps to the start/end (Home/End).
+    fn filename_move_cursor(&mut self, delta: isize) {
+        let len = self.filename.chars().count() as isize;
+        self.filename_cursor =
+            (self.filename_cursor as isize).saturating_add(delta).clamp(0, len) as usize;
+    }
+
+    /// Insert `c` at the file-name cursor (used only in edit mode).
+    fn filename_type(&mut self, c: char) {
+        if c.is_control() {
+            return;
+        }
+        let byte = self
+            .filename
+            .char_indices()
+            .nth(self.filename_cursor)
+            .map(|(i, _)| i)
+            .unwrap_or(self.filename.len());
+        self.filename.insert(byte, c);
+        self.filename_cursor += 1;
+        self.filename_auto = false;
+    }
+
+    /// Delete the character before the file-name cursor (Backspace in edit mode).
+    fn filename_backspace(&mut self) {
+        if self.filename_cursor == 0 {
+            return;
+        }
+        let byte = self
+            .filename
+            .char_indices()
+            .nth(self.filename_cursor - 1)
+            .map(|(i, _)| i)
+            .expect("cursor within bounds");
+        self.filename.remove(byte);
+        self.filename_cursor -= 1;
+        self.filename_auto = false;
     }
 }
 
@@ -2794,6 +2859,8 @@ impl App {
             use_existing: false,
             filename: PubKeyState::default_filename(&self.cert_file_stem(), alg),
             filename_auto: true,
+            filename_editing: false,
+            filename_cursor: 0,
             password: String::new(),
             existing,
             issued,
@@ -3118,6 +3185,47 @@ impl App {
         let stem = self.cert_file_stem();
         if let Mode::EditPubKey(ref mut s) = self.mode {
             s.backspace(&stem);
+        }
+    }
+
+    /// Whether the file-name column is focused (Space there enters edit mode).
+    pub fn pubkey_filename_focused(&self) -> bool {
+        matches!(self.mode, Mode::EditPubKey(ref s) if s.filename_focused())
+    }
+
+    /// Whether the file-name field is in cursor-edit mode (it then captures the
+    /// arrow keys, Enter, and typed characters).
+    pub fn pubkey_filename_editing(&self) -> bool {
+        matches!(self.mode, Mode::EditPubKey(ref s) if s.filename_editing)
+    }
+
+    pub fn pubkey_filename_begin_edit(&mut self) {
+        if let Mode::EditPubKey(ref mut s) = self.mode {
+            s.filename_begin_edit();
+        }
+    }
+
+    pub fn pubkey_filename_end_edit(&mut self) {
+        if let Mode::EditPubKey(ref mut s) = self.mode {
+            s.filename_end_edit();
+        }
+    }
+
+    pub fn pubkey_filename_move_cursor(&mut self, delta: isize) {
+        if let Mode::EditPubKey(ref mut s) = self.mode {
+            s.filename_move_cursor(delta);
+        }
+    }
+
+    pub fn pubkey_filename_type(&mut self, c: char) {
+        if let Mode::EditPubKey(ref mut s) = self.mode {
+            s.filename_type(c);
+        }
+    }
+
+    pub fn pubkey_filename_backspace(&mut self) {
+        if let Mode::EditPubKey(ref mut s) = self.mode {
+            s.filename_backspace();
         }
     }
 
@@ -3618,7 +3726,20 @@ impl App {
     /// (its scalar corrupted, or its structure broken) loses its entry, so
     /// its key↔certificate link disappears; a key whose public key changed
     /// gets the new identity. Encrypted keys are never in `key_files`.
+    ///
+    /// When the open document is unmodified (`!dirty`), its live content equals
+    /// what the directory scan already read from disk, so an existing scanned
+    /// entry is reused as-is. This matters for browser live-preview: deriving a
+    /// key's identity reloads it through the backend, and for HSS/LMS and XMSS
+    /// keys that reload recomputes the whole public key (the LMS Merkle tree) —
+    /// seconds of work that would otherwise run on every arrow-key press.
     fn refresh_own_key_file(&mut self) {
+        if self.file_open
+            && !self.dirty
+            && self.key_files.iter().any(|k| k.path == self.path)
+        {
+            return; // unchanged on disk — the scanned entry is still valid
+        }
         self.key_files.retain(|k| k.path != self.path);
         if self.file_open {
             if let Some(key) = usable_key_id(&self.roots) {
@@ -8581,6 +8702,37 @@ mod tests {
         let roots = ber::parse_forest(&der, 0).unwrap();
         let s = x509::parse_signable(&roots, &der).unwrap();
         verify::verify_signature(&s.sig_alg, pubkey, &s.tbs, &s.signature)
+    }
+
+    #[test]
+    fn unchanged_key_file_reuses_the_scanned_entry_instead_of_reloading() {
+        // Deriving a key's identity reloads it through the backend, and for
+        // HSS/LMS and XMSS that reload recomputes the whole public key — too
+        // slow to redo on every browser arrow-key press. A clean, already-
+        // scanned file must therefore reuse its scanned `key_files` entry.
+        // Proxy for "was not reloaded": a sentinel entry survives untouched.
+        let mut app = open_real_file(Path::new("testdata/cert_rsa.der"));
+        app.file_open = true;
+        app.dirty = false;
+        let sentinel = x509::PublicKeyId::Ec(vec![0xAB; 4]);
+        app.key_files.retain(|k| k.path != app.path);
+        app.key_files.push(x509::KeyFile { path: app.path.clone(), key: sentinel.clone() });
+
+        app.refresh_own_key_file();
+        assert_eq!(
+            app.key_files.iter().find(|k| k.path == app.path).map(|k| &k.key),
+            Some(&sentinel),
+            "clean, already-scanned file must reuse its entry (no reload)"
+        );
+
+        // With unsaved edits the identity is recomputed from live content: the
+        // open certificate is not a private key, so the stale entry is dropped.
+        app.dirty = true;
+        app.refresh_own_key_file();
+        assert!(
+            app.key_files.iter().all(|k| k.path != app.path),
+            "a modified document recomputes from live content and drops the stale entry"
+        );
     }
 
     #[test]

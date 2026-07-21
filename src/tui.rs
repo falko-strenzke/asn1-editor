@@ -250,9 +250,26 @@ fn handle_pubkey_key(app: &mut App, key: KeyEvent) {
         }
         return;
     }
+    // The file-name field's cursor-edit mode captures navigation: ←/→ move the
+    // cursor, typing edits the name, Enter/Esc leave the mode (Esc keeps the
+    // name — it does not cancel the whole dialog while editing).
+    if app.pubkey_filename_editing() {
+        match key.code {
+            KeyCode::Enter | KeyCode::Esc => app.pubkey_filename_end_edit(),
+            KeyCode::Left => app.pubkey_filename_move_cursor(-1),
+            KeyCode::Right => app.pubkey_filename_move_cursor(1),
+            KeyCode::Home => app.pubkey_filename_move_cursor(isize::MIN),
+            KeyCode::End => app.pubkey_filename_move_cursor(isize::MAX),
+            KeyCode::Backspace => app.pubkey_filename_backspace(),
+            KeyCode::Char(c) => app.pubkey_filename_type(c),
+            _ => {}
+        }
+        return;
+    }
     // Arrow keys always navigate rows/columns; Enter applies the whole dialog.
     // In the HSS/LMS editor, Space opens a choice popup for the focused field
-    // (or adds a level), and +/- add/remove a level.
+    // (or adds a level), and +/- add/remove a level. On the file-name column
+    // Space enters its cursor-edit mode instead of toggling anything.
     let hss = app.pubkey_in_hsslms_editor();
     match key.code {
         KeyCode::Esc => app.cancel_pubkey(),
@@ -264,7 +281,9 @@ fn handle_pubkey_key(app: &mut App, key: KeyEvent) {
         KeyCode::Char('+') if hss => app.pubkey_hss_add_level(),
         KeyCode::Char('-') if hss => app.pubkey_hss_remove_level(),
         KeyCode::Char(' ') => {
-            if !app.pubkey_hss_activate() {
+            if app.pubkey_filename_focused() {
+                app.pubkey_filename_begin_edit();
+            } else if !app.pubkey_hss_activate() {
                 app.pubkey_toggle();
             }
         }
@@ -805,12 +824,10 @@ fn draw_edit_pubkey(frame: &mut Frame, app: &App, area: Rect) {
     ];
     if !s.use_existing {
         let mask: String = "•".repeat(s.password.chars().count());
-        // The file-name field is focusable here; its value (the full path) is
-        // shown in the wide row below the columns so long names stay visible.
-        opt_lines.push(row("file name (edit ↓ below)".to_string(), s.option_field == 1, active1));
-        opt_lines.push(Line::default());
+        // The file name lives in its own column (the full-width row below), so
+        // this column carries just the source radio and the password.
         opt_lines.push(Line::from(Span::styled(" password (blank = unencrypted)", Style::new().dim())));
-        opt_lines.push(row(field_value(&mask), s.option_field == 2, active1));
+        opt_lines.push(row(field_value(&mask), s.option_field == 1, active1));
     } else {
         let fitting = s.fitting_keys();
         if fitting.is_empty() {
@@ -842,31 +859,58 @@ fn draw_edit_pubkey(frame: &mut Frame, app: &App, area: Rect) {
     }
     frame.render_widget(Paragraph::new(issued_lines), issued_col);
 
-    // Full-width key-file row (generate mode): the file name plus its path
-    // relative to the CWD, wrapped to the whole dialog width so nothing is cut
-    // off. Highlighted while the file-name field is the active focus.
+    // Full-width key-file row: its own column (index 4, reached with ←/→ past
+    // the issued-objects column). The file name plus its CWD-relative path,
+    // wrapped to the whole dialog width so nothing is cut off. Focused-but-idle
+    // it is reversed as a whole (like the active cells in the columns above);
+    // in cursor-edit mode only the character under the cursor is reversed.
     if !s.use_existing && keyfile_area.height > 0 {
-        let active_fn = s.column == 2 && s.option_field == 1;
         let path = app.rekey_key_path_display(&s.filename);
-        let value_style = if active_fn {
-            Style::new().fg(Color::Yellow).bold()
+        let value = if s.filename_editing {
+            // The file name is the trailing segment of the shown path; place a
+            // block cursor within it at `filename_cursor`.
+            let prefix_len = path.chars().count().saturating_sub(s.filename.chars().count());
+            let cursor = Style::new().add_modifier(Modifier::REVERSED).bold();
+            let mut spans = Vec::new();
+            let mut before = String::new();
+            let mut under = String::new();
+            let mut after = String::new();
+            for (i, c) in path.chars().enumerate() {
+                match (i).cmp(&(prefix_len + s.filename_cursor)) {
+                    std::cmp::Ordering::Less => before.push(c),
+                    std::cmp::Ordering::Equal => under.push(c),
+                    std::cmp::Ordering::Greater => after.push(c),
+                }
+            }
+            spans.push(Span::raw(before));
+            // Cursor at end of the name: show a reversed space as the block.
+            spans.push(Span::styled(if under.is_empty() { " ".to_string() } else { under }, cursor));
+            if !after.is_empty() {
+                spans.push(Span::raw(after));
+            }
+            spans
         } else {
-            Style::new()
+            let style = if s.column == 4 {
+                Style::new().add_modifier(Modifier::REVERSED).bold()
+            } else {
+                Style::new()
+            };
+            vec![Span::styled(field_value(&path), style)]
         };
-        let lines = header_field(
-            "Key file: ",
-            vec![Span::styled(field_value(&path), value_style)],
-            keyfile_area.width as usize,
-        );
+        let lines = header_field("Key file: ", value, keyfile_area.width as usize);
         frame.render_widget(Paragraph::new(lines), keyfile_area);
     }
 
     let hint_text = if s.hss_picker.is_some() {
         "↑↓ choose  Space/⏎ select  Esc cancel"
+    } else if s.filename_editing {
+        "←→ cursor  Home/End  type to edit the file name  ⏎/Esc leave field"
+    } else if s.column == 4 {
+        "Space edit file name  ←→ column  ⏎ apply  Esc cancel"
     } else if s.is_hsslms() && s.column == 1 {
         "↑↓ field  ←→ column  Space edit value  + add level  - remove level  ⏎ apply  Esc cancel"
     } else {
-        "←→ column  ↑↓ move  Space toggle  type to edit size/name/password  ⏎ apply  Esc cancel"
+        "←→ column  ↑↓ move  Space toggle  type to edit size/password  ⏎ apply  Esc cancel"
     };
     let hint = Line::from(Span::styled(hint_text, Style::new().dim()));
     frame.render_widget(Paragraph::new(hint), hint_area);
@@ -3403,11 +3447,53 @@ mod tests {
         let mut term = Terminal::new(TestBackend::new(120, 30)).unwrap();
         term.draw(|f| draw(f, &mut app)).unwrap();
         let text = buffer_text(term.backend().buffer());
-        // The full path is visible in the wide key-file row, uncut…
+        // The full path is visible in the wide key-file row, uncut.
         assert!(text.contains("Key file:"), "key-file row label:\n{text}");
         assert!(text.contains(long), "full file name must be visible:\n{text}");
-        // …and the key-options column now carries only a focusable pointer.
-        assert!(text.contains("file name (edit"), "column pointer to the row below:\n{text}");
+
+        // The file name is reachable with ←/→ as the 5th column (index 4),
+        // past the four visible columns.
+        for _ in 0..6 {
+            app.pubkey_move_column(1);
+        }
+        assert!(app.pubkey_filename_focused(), "→ should stop on the file-name column");
+
+        // Focused but idle, typing does nothing — the field is modal.
+        app.pubkey_insert_char('Z');
+        if let Mode::EditPubKey(ref s) = app.mode {
+            assert_eq!(s.filename, long, "typing before entering edit mode is inert");
+        }
+
+        // Space enters cursor-edit mode; the cursor starts at the end, so typing
+        // appends and ← inserts one position to the left.
+        app.pubkey_filename_begin_edit();
+        assert!(app.pubkey_filename_editing());
+        // The cursor-rendering branch must draw the (still complete) name.
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        assert!(buffer_text(term.backend().buffer()).contains(long), "name visible while editing");
+        app.pubkey_filename_type('X');
+        app.pubkey_filename_move_cursor(-1); // step left over the 'X'
+        app.pubkey_filename_type('Y'); // …insert 'Y' before it
+        if let Mode::EditPubKey(ref s) = app.mode {
+            assert_eq!(s.filename, format!("{long}YX"), "cursor-positioned editing");
+        }
+
+        // While editing, ← is a cursor move, not a column change.
+        app.pubkey_filename_move_cursor(-100);
+        if let Mode::EditPubKey(ref s) = app.mode {
+            assert_eq!(s.column, 4, "editing keeps the file-name column focused");
+            assert_eq!(s.filename_cursor, 0, "Home-style jump to the start");
+        }
+
+        // Enter leaves edit mode without cancelling the dialog; then ← changes
+        // column again.
+        app.pubkey_filename_end_edit();
+        assert!(!app.pubkey_filename_editing());
+        assert!(matches!(app.mode, Mode::EditPubKey(_)), "leaving edit keeps the dialog open");
+        app.pubkey_move_column(-1);
+        if let Mode::EditPubKey(ref s) = app.mode {
+            assert_eq!(s.column, 3, "← now leaves the file-name column");
+        }
     }
 
     #[test]
