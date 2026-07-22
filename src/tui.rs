@@ -2446,6 +2446,20 @@ const HEX_SELECTION_STYLE: Style = Style::new().fg(Color::White).bg(Color::Blue)
 /// the selection changes or the editor closes.
 const HEX_FRESH_STYLE: Style = Style::new().fg(Color::Black).bg(Color::LightYellow);
 
+/// Style for a selected cell, which the cursor may also be on.
+///
+/// A selection outranks the cursor here, rather than the other way round:
+/// reversing the cursor cell would punch a hole in the marked run, leaving
+/// half an octet coloured. The cursor stays findable inside the selection by
+/// being underlined instead.
+fn cursor_within_selection(at_cursor: bool) -> Style {
+    if at_cursor {
+        HEX_SELECTION_STYLE.add_modifier(Modifier::UNDERLINED | Modifier::BOLD)
+    } else {
+        HEX_SELECTION_STYLE
+    }
+}
+
 /// The two colours the hex dump alternates between when a value's fields are
 /// known ([`hashsig::describe_node`]), so that consecutive fields — and the
 /// tokens naming them in the right-hand gutter — are told apart at a glance.
@@ -3244,12 +3258,10 @@ fn hex_editor_lines(h: &mut HexEditor, text_rows: usize) -> Vec<Line<'static>> {
         )];
         for i in start..=end {
             if i < end {
-                // The cursor wins over both markings, a selection over the
-                // "just pasted" one — though selecting anything clears that.
-                let style = if i == h.cursor {
+                let style = if h.is_selected(i) {
+                    cursor_within_selection(i == h.cursor)
+                } else if i == h.cursor {
                     Style::new().add_modifier(Modifier::REVERSED)
-                } else if h.is_selected(i) {
-                    HEX_SELECTION_STYLE
                 } else if h.is_fresh(i) {
                     HEX_FRESH_STYLE
                 } else {
@@ -3285,12 +3297,12 @@ fn text_editor_lines(t: &TextEditor, width: usize) -> Vec<Line<'static>> {
     let mut col = 0;
     for (i, &c) in t.buf.iter().enumerate() {
         let display = if c == '\n' { '␤' } else if c.is_control() { '·' } else { c };
-        // As in the hex editor: the cursor wins over both markings, and a
-        // selection over the "just added" one.
-        let style = if i == t.cursor {
+        // As in the hex editor: a selection outranks the cursor, and both
+        // outrank the "just added" marking.
+        let style = if t.is_selected(i) {
+            cursor_within_selection(i == t.cursor)
+        } else if i == t.cursor {
             Style::new().add_modifier(Modifier::REVERSED)
-        } else if t.is_selected(i) {
-            HEX_SELECTION_STYLE
         } else if t.is_fresh(i) {
             HEX_FRESH_STYLE
         } else {
@@ -4447,6 +4459,74 @@ mod tests {
         assert!(count(&term, Color::Blue) > 0);
     }
 
+    /// A hex selection must never show half an octet — neither by covering
+    /// one digit of a pair, nor by the cursor punching a hole in the marked
+    /// run when it sits inside it.
+    #[test]
+    fn a_hex_selection_is_always_marked_in_whole_octets() {
+        use crate::input::Container;
+        use ratatui::{backend::TestBackend, Terminal};
+        let doc = [0x04, 0x04, 0x11, 0x22, 0x33, 0x44];
+        let mut app = App::new_single_file(
+            PathBuf::from("doc.der"),
+            PathBuf::from("/nonexistent/out"),
+            Container::Raw,
+            parse_forest(&doc, 0).unwrap(),
+            doc.len(),
+        );
+        app.start_edit();
+        let mut term = Terminal::new(TestBackend::new(120, 20)).unwrap();
+        let none = event::KeyModifiers::NONE;
+        let shift = event::KeyModifiers::SHIFT;
+        // Every digit of the dump that carries the selection background.
+        let blue_digits = |term: &Terminal<TestBackend>| {
+            let buf = term.backend().buffer();
+            let area = buf.area;
+            (0..area.height)
+                .flat_map(|y| (0..area.width).map(move |x| (x, y)))
+                .filter(|&(x, y)| buf[(x, y)].style().bg == Some(Color::Blue))
+                .map(|(x, y)| buf[(x, y)].symbol().to_string())
+                .filter(|s| s != " ")
+                .collect::<Vec<_>>()
+        };
+
+        // Selecting leftwards puts the cursor on the first selected digit.
+        handle_edit_key(&mut app, KeyEvent::new(KeyCode::End, none));
+        handle_edit_key(&mut app, KeyEvent::new(KeyCode::Left, shift));
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        assert_eq!(blue_digits(&term), ["4", "4"], "the whole octet under the cursor is marked");
+
+        // Shift+Home from between two digits takes the octet the cursor is on
+        // whole, rather than the single digit to its left.
+        handle_edit_key(&mut app, KeyEvent::new(KeyCode::Home, none));
+        handle_edit_key(&mut app, KeyEvent::new(KeyCode::Right, none));
+        handle_edit_key(&mut app, KeyEvent::new(KeyCode::Right, none));
+        handle_edit_key(&mut app, KeyEvent::new(KeyCode::Right, none));
+        let Mode::Edit(EditState { editor: Editor::Hex(ref h), .. }) = app.mode else { panic!() };
+        assert_eq!(h.cursor, 3, "the cursor sits inside the second octet");
+        handle_edit_key(&mut app, KeyEvent::new(KeyCode::Home, shift));
+        let Mode::Edit(EditState { editor: Editor::Hex(ref h), .. }) = app.mode else { panic!() };
+        assert_eq!(h.selection(), Some((0, 4)), "both octets, not one and a half");
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        assert_eq!(blue_digits(&term), ["1", "1", "2", "2"]);
+
+        // The same going the other way: Shift+End from mid-octet.
+        handle_edit_key(&mut app, KeyEvent::new(KeyCode::Home, none));
+        for _ in 0..5 {
+            handle_edit_key(&mut app, KeyEvent::new(KeyCode::Right, none));
+        }
+        handle_edit_key(&mut app, KeyEvent::new(KeyCode::End, shift));
+        let Mode::Edit(EditState { editor: Editor::Hex(ref h), .. }) = app.mode else { panic!() };
+        assert_eq!(h.selection(), Some((4, 8)));
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        assert_eq!(blue_digits(&term), ["3", "3", "4", "4"]);
+
+        // What a half-octet selection would have deleted is a whole one.
+        handle_edit_key(&mut app, KeyEvent::new(KeyCode::Delete, none));
+        let Mode::Edit(EditState { editor: Editor::Hex(ref h), .. }) = app.mode else { panic!() };
+        assert_eq!(h.digits.iter().collect::<String>(), "1122");
+    }
+
     /// The integer / OID / text editors show a selection and a fresh addition
     /// exactly as the hex editor does, over characters rather than octets.
     #[test]
@@ -4480,9 +4560,9 @@ mod tests {
         assert_eq!(t.selection(), Some((2, 4)));
         term.draw(|f| draw(f, &mut app)).unwrap();
         // Selecting leftwards leaves the cursor on the first selected
-        // character, and the cursor's own styling outranks the selection —
-        // so one of the two shows blue and the other shows as the cursor.
-        assert_eq!(count(&term, Color::Blue), 1);
+        // character; it must still be shown as selected, not punched out of
+        // the marked run.
+        assert_eq!(count(&term, Color::Blue), 2, "both selected characters are marked");
 
         // Typing over the selection replaces it and marks what was typed.
         handle_edit_key(&mut app, KeyEvent::new(KeyCode::Char('7'), event::KeyModifiers::NONE));

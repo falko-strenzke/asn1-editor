@@ -362,7 +362,6 @@ const UNDO_DEPTH: usize = 256;
 /// The buffer and cursor are passed in rather than owned: the two editors keep
 /// their own (`digits`, `buf`) and the borrow checker is happy to lend them
 /// alongside this struct as separate fields of the same editor.
-#[derive(Default)]
 pub struct EditHistory {
     /// Where a Shift-extended selection began. The selection runs between it
     /// and the cursor, in whichever direction; `None` means none is active.
@@ -371,17 +370,30 @@ pub struct EditHistory {
     /// undo — so it can be shown as new. Cleared as soon as the user selects
     /// anything, and with the editor itself, so it never outlives the edit.
     pub fresh: Option<(usize, usize)>,
+    /// The unit a selection is quantised to: two hex digits make one octet,
+    /// while text selects character by character.
+    unit: usize,
     /// Buffer states before each change, newest last (see [`UNDO_DEPTH`]).
     undo: Vec<(Vec<char>, usize)>,
 }
 
 impl EditHistory {
+    pub fn new(unit: usize) -> Self {
+        EditHistory { anchor: None, fresh: None, unit: unit.max(1), undo: Vec::new() }
+    }
+
     /// The selected range as `start..end`, or `None` when nothing is selected
     /// (including when the anchor and the cursor coincide).
+    ///
+    /// The range is widened to whole units, so a hex selection can never cover
+    /// half an octet however it was made — not by Shift+Home/End from between
+    /// two digits, and not by the octet the cursor itself sits on. The end is
+    /// not clamped to the buffer; the callers that index it do that, since a
+    /// value may hold an odd number of digits.
     pub fn selection(&self, cursor: usize) -> Option<(usize, usize)> {
         let anchor = self.anchor?;
         let (start, end) = (anchor.min(cursor), anchor.max(cursor));
-        (start < end).then_some((start, end))
+        (start < end).then_some((start - start % self.unit, end.div_ceil(self.unit) * self.unit))
     }
 
     pub fn is_selected(&self, cursor: usize, i: usize) -> bool {
@@ -458,7 +470,7 @@ impl EditHistory {
     /// The selected items as a string, or `None` when nothing is selected.
     pub fn selected_text(&self, buf: &[char], cursor: usize) -> Option<String> {
         let (start, end) = self.selection(cursor)?;
-        Some(buf[start..end].iter().collect())
+        Some(buf[start..end.min(buf.len())].iter().collect())
     }
 
     /// Remove the selected items, leaving the cursor where they began.
@@ -466,7 +478,7 @@ impl EditHistory {
     pub fn delete_selection(&mut self, buf: &mut Vec<char>, cursor: &mut usize) -> bool {
         let Some((start, end)) = self.selection(*cursor) else { return false };
         self.record(buf, *cursor);
-        self.cut_out(buf, cursor, start, end);
+        self.cut_out(buf, cursor, start, end.min(buf.len()));
         true
     }
 
@@ -483,7 +495,7 @@ impl EditHistory {
     pub fn insert(&mut self, buf: &mut Vec<char>, cursor: &mut usize, items: &[char]) {
         self.record(buf, *cursor);
         if let Some((start, end)) = self.selection(*cursor) {
-            self.cut_out(buf, cursor, start, end);
+            self.cut_out(buf, cursor, start, end.min(buf.len()));
         }
         let at = *cursor;
         for (offset, &c) in items.iter().enumerate() {
@@ -569,7 +581,8 @@ impl HexEditor {
     pub const UNIT: usize = 2;
 
     pub fn selection(&self) -> Option<(usize, usize)> {
-        self.sel.selection(self.cursor)
+        let (start, end) = self.sel.selection(self.cursor)?;
+        Some((start, end.min(self.digits.len())))
     }
 
     pub fn is_selected(&self, i: usize) -> bool {
@@ -652,7 +665,8 @@ impl TextEditor {
     pub const UNIT: usize = 1;
 
     pub fn selection(&self) -> Option<(usize, usize)> {
-        self.sel.selection(self.cursor)
+        let (start, end) = self.sel.selection(self.cursor)?;
+        Some((start, end.min(self.buf.len())))
     }
 
     pub fn is_selected(&self, i: usize) -> bool {
@@ -711,13 +725,13 @@ impl Editor {
             .chars()
             .filter(|c| !c.is_whitespace())
             .collect();
-        Editor::Hex(HexEditor { digits, cursor: 0, scroll: 0, sel: EditHistory::default() })
+        Editor::Hex(HexEditor { digits, cursor: 0, scroll: 0, sel: EditHistory::new(HexEditor::UNIT) })
     }
 
     pub fn text(format: TextFormat, initial: String) -> Self {
         let buf: Vec<char> = initial.chars().collect();
         let cursor = buf.len();
-        Editor::Text(TextEditor { format, buf, cursor, sel: EditHistory::default() })
+        Editor::Text(TextEditor { format, buf, cursor, sel: EditHistory::new(TextEditor::UNIT) })
     }
 
     /// Printable character typed by the user.
