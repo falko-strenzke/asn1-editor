@@ -114,7 +114,7 @@ fn event_loop(terminal: &mut DefaultTerminal, app: &mut App) -> io::Result<()> {
             Event::Key(key) => key,
             Event::Paste(text) => {
                 match app.mode {
-                    Mode::Edit(ref mut edit) => edit.editor.paste(&text),
+                    Mode::Edit(_) => app.paste_into_editor(&text),
                     Mode::Password(ref mut p) => p.paste(&text),
                     Mode::EditPubKey(_) => {
                         for c in text.chars() {
@@ -518,17 +518,34 @@ fn handle_edit_key(app: &mut App, key: KeyEvent) {
         }
         _ => {}
     }
+    // Ctrl+A and Ctrl+V have to be recognised before the plain-character arm
+    // below, which would otherwise take 'a' for a hex digit.
+    if key.modifiers.contains(KeyModifiers::CONTROL) {
+        match key.code {
+            KeyCode::Char('a') | KeyCode::Char('A') => {
+                app.select_all_in_editor();
+                return;
+            }
+            KeyCode::Char('v') | KeyCode::Char('V') => {
+                app.paste_from_clipboard();
+                return;
+            }
+            _ => {}
+        }
+    }
+    // Shift turns the cursor keys into selecting ones (hex editor only).
+    let extend = key.modifiers.contains(KeyModifiers::SHIFT);
     let Mode::Edit(ref mut edit) = app.mode else { return };
     match key.code {
         KeyCode::Char(c) => edit.editor.insert_char(c),
         KeyCode::Backspace => edit.editor.backspace(),
         KeyCode::Delete => edit.editor.delete(),
-        KeyCode::Left | KeyCode::BackTab => edit.editor.move_horizontal(-1),
-        KeyCode::Right | KeyCode::Tab => edit.editor.move_horizontal(1),
-        KeyCode::Up => edit.editor.move_vertical(-1),
-        KeyCode::Down => edit.editor.move_vertical(1),
-        KeyCode::Home => edit.editor.home(),
-        KeyCode::End => edit.editor.end(),
+        KeyCode::Left | KeyCode::BackTab => edit.editor.move_horizontal(-1, extend),
+        KeyCode::Right | KeyCode::Tab => edit.editor.move_horizontal(1, extend),
+        KeyCode::Up => edit.editor.move_vertical(-1, extend),
+        KeyCode::Down => edit.editor.move_vertical(1, extend),
+        KeyCode::Home => edit.editor.home(extend),
+        KeyCode::End => edit.editor.end(extend),
         _ => {}
     }
 }
@@ -2405,6 +2422,12 @@ fn draw_tree(frame: &mut Frame, app: &mut App, area: Rect) {
 const HEX_MATCH_STYLE: Style =
     Style::new().fg(Color::Black).bg(Color::Yellow);
 
+/// Digits selected in the hex editor (Shift + cursor keys, Ctrl+A).
+const HEX_SELECTION_STYLE: Style = Style::new().fg(Color::White).bg(Color::Blue);
+/// Digits the last paste brought in, until the selection changes or the
+/// editor closes.
+const HEX_PASTED_STYLE: Style = Style::new().fg(Color::Black).bg(Color::LightYellow);
+
 /// The two colours the hex dump alternates between when a value's fields are
 /// known ([`hashsig::describe_node`]), so that consecutive fields — and the
 /// tokens naming them in the right-hand gutter — are told apart at a glance.
@@ -3140,13 +3163,13 @@ fn editor_title_hint(edit: &EditState) -> (String, &'static str) {
                 ber::type_name_of(class, tag),
                 if constructed { ", must be valid TLVs, may stay empty" } else { ", may stay empty" },
             ),
-            "[Enter] insert   [Esc] cancel   length octets are computed automatically",
+            "[Enter] insert  [Esc] cancel  [Shift+←→↑↓] select  [Ctrl+A] all  [Ctrl+V] paste  [Del] cut",
         );
     }
     match edit.editor {
         Editor::Hex(_) => (
             " EDIT — content octets (hex) ".to_string(),
-            "[Enter] apply   [Esc] cancel   [←→↑↓] move   type hex digits to insert",
+            "[Enter] apply  [Esc] cancel  [Shift+←→↑↓] select  [Ctrl+A] all  [Ctrl+V] paste  [Del] cut",
         ),
         Editor::Text(ref t) => match t.format {
             TextFormat::Base64 => (
@@ -3203,14 +3226,29 @@ fn hex_editor_lines(h: &mut HexEditor, text_rows: usize) -> Vec<Line<'static>> {
         )];
         for i in start..=end {
             if i < end {
+                // The cursor wins over both markings, a selection over the
+                // "just pasted" one — though selecting anything clears that.
                 let style = if i == h.cursor {
                     Style::new().add_modifier(Modifier::REVERSED)
+                } else if h.is_selected(i) {
+                    HEX_SELECTION_STYLE
+                } else if h.is_pasted(i) {
+                    HEX_PASTED_STYLE
                 } else {
                     Style::new()
                 };
                 spans.push(Span::styled(h.digits[i].to_string(), style));
                 if i % 2 == 1 && i + 1 < end {
-                    spans.push(Span::raw(" "));
+                    // Keep a run of marked octets visually continuous by
+                    // marking the space between them too.
+                    let gap = if h.is_selected(i) && h.is_selected(i + 1) {
+                        HEX_SELECTION_STYLE
+                    } else if h.is_pasted(i) && h.is_pasted(i + 1) {
+                        HEX_PASTED_STYLE
+                    } else {
+                        Style::new()
+                    };
+                    spans.push(Span::styled(" ", gap));
                 }
             } else if i == h.cursor && i == h.digits.len() {
                 // Cursor sitting after the last digit.
@@ -3360,6 +3398,9 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
         Mode::Help(_) => "↑↓ topic  PgUp/PgDn or [ ] scroll  Esc close",
         Mode::TypePicker(_) => "←→ column  ↑↓ select  0-9 tag number  ⏎ continue  Esc cancel",
         Mode::EditMenu(_) => "↑↓ or 1-5 select  ⏎ choose  Esc cancel",
+        Mode::Edit(EditState { editor: Editor::Hex(_), .. }) => {
+            "Enter apply  Esc cancel  Shift+arrows select  Ctrl+A all  Ctrl+V paste  Del cut"
+        }
         Mode::Edit(_) => "Enter apply  Esc cancel",
         Mode::Password(_) => "type password  ⏎ decrypt  Esc cancel",
         Mode::Resign(_) => "⏎ create new signature (if available)  Esc cancel",
@@ -4329,6 +4370,59 @@ mod tests {
     }
 
     /// The three keys that reach the menu bar, and nothing else.
+    #[test]
+    fn the_hex_editor_paints_the_selection_blue_and_a_fresh_paste_yellow() {
+        use crate::input::Container;
+        use ratatui::{backend::TestBackend, Terminal};
+        // OCTET STRING of four bytes.
+        let doc = [0x04, 0x04, 0x11, 0x22, 0x33, 0x44];
+        let mut app = App::new_single_file(
+            PathBuf::from("doc.der"),
+            PathBuf::from("/nonexistent/out"),
+            Container::Raw,
+            parse_forest(&doc, 0).unwrap(),
+            doc.len(),
+        );
+        app.start_edit();
+        let mut term = Terminal::new(TestBackend::new(120, 20)).unwrap();
+        let count = |term: &Terminal<TestBackend>, bg: Color| {
+            let buf = term.backend().buffer();
+            let area = buf.area;
+            (0..area.height)
+                .flat_map(|y| (0..area.width).map(move |x| (x, y)))
+                .filter(|&(x, y)| buf[(x, y)].style().bg == Some(bg))
+                .count()
+        };
+
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        assert_eq!(count(&term, Color::Blue), 0, "nothing is selected to begin with");
+
+        // Shift+Right four times selects the first two octets: four digits
+        // plus the space between them.
+        let shift_right = KeyEvent::new(KeyCode::Right, event::KeyModifiers::SHIFT);
+        for _ in 0..4 {
+            handle_edit_key(&mut app, shift_right);
+        }
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        assert_eq!(count(&term, Color::Blue), 5, "four digits and the gap between the octets");
+        assert_eq!(count(&term, Color::LightYellow), 0);
+
+        // Pasting over the selection marks what arrived, and unmarks the rest.
+        app.paste_into_editor("AABBCC");
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        assert!(app.status.contains("pasted 3 octets over 2"), "{}", app.status);
+        assert_eq!(count(&term, Color::Blue), 0, "the selection is consumed by the paste");
+        // Six digits plus the two gaps inside them; the cursor now sits just
+        // past the pasted run, so it takes none of those cells.
+        assert_eq!(count(&term, Color::LightYellow), 8);
+
+        // Selecting anything ends the "just pasted" marking.
+        handle_edit_key(&mut app, shift_right);
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        assert_eq!(count(&term, Color::LightYellow), 0, "the marking is gone");
+        assert!(count(&term, Color::Blue) > 0);
+    }
+
     #[test]
     fn the_menu_toggle_accepts_alt_f10_and_alt_m_only() {
         let none = event::KeyModifiers::NONE;

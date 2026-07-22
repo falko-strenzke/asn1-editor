@@ -344,6 +344,170 @@ fn describe_hss_signature(bytes: &[u8]) -> Option<Description> {
     })
 }
 
+/// `u32 L || u64 idx || (u32 lmsType || u32 otsType) × L || SEED[m] || I[16]`
+/// — Botan's own HSS/LMS private-key encoding. RFC 8554 specifies no private
+/// key format (§9 leaves it to the implementation), so this layout is Botan's
+/// and is what the key files this editor writes contain.
+fn describe_hss_private_key(bytes: &[u8]) -> Option<Description> {
+    let mut r = Reader::new(bytes);
+    let levels = r.take_u32("L".into())?;
+    if levels == 0 || levels > HSS_MAX_LEVELS {
+        return None;
+    }
+    r.take(8, "idx".into())?;
+    let index = u64::from_be_bytes(bytes.get(4..12)?.try_into().ok()?);
+    let mut params = Vec::new();
+    for level in 0..levels {
+        let suffix = if levels > 1 { format!("[{}]", level) } else { String::new() };
+        let lms = lms_set(r.take_u32(format!("lmsType{}", suffix))?)?;
+        let ots = ots_set(r.take_u32(format!("otsType{}", suffix))?)?;
+        params.push((lms, ots));
+    }
+    let (top_lms, _) = params.first()?;
+    let m = top_lms.m;
+    r.take(m, "SEED".into())?;
+    r.take(16, "I".into())?;
+    if !r.at_end() {
+        return None;
+    }
+
+    // The total number of one-time keys is the product of the levels' leaf
+    // counts: each leaf of a tree carries a whole subtree below it.
+    let capacity: u128 =
+        params.iter().map(|(lms, _)| 1u128 << lms.h).product();
+    let mut notes = vec![
+        format!(
+            "L = {} — the number of HSS levels. The private key stores only the top-level \
+             seed and identifier; every lower tree is re-derived from them as it is needed.",
+            levels
+        ),
+        format!(
+            "idx = {} — the number of signatures this key has already produced, out of {}. \
+             It is the whole of the key's state: each signature consumes one one-time key, \
+             and the advanced index must be written back or the next signature would reuse \
+             one, which would let an attacker forge signatures. Never restore this file from \
+             a backup and never keep a second copy of it.",
+            index, capacity
+        ),
+    ];
+    for (level, (lms, ots)) in params.iter().enumerate() {
+        if levels > 1 {
+            notes.push(format!("Level {}:", level));
+        }
+        notes.push(lms_note(lms));
+        notes.push(ots_note(ots));
+    }
+    notes.push(format!(
+        "SEED is the {}-byte secret from which every one-time key is derived — the actual \
+         secret of this key file. I is the 16-byte identifier of the top-level tree, which \
+         is public and also appears in the public key.",
+        m
+    ));
+    notes.push(
+        "Layout (Botan's own; RFC 8554 specifies no private-key format): u32 L || u64 idx || \
+         (u32 lmsType || u32 otsType) per level || SEED[m] || I[16]"
+            .to_string(),
+    );
+    Some(Description {
+        heading: "HSS/LMS private key (Botan encoding)".to_string(),
+        notes,
+        fields: r.fields,
+    })
+}
+
+/// `u32 oid || root[n] || SEED[n] || u32 idx || SK_PRF[n] || SK_seed[n] ||
+/// u8 wots` — Botan's XMSS private-key encoding. RFC 8391 §4.1.3 sketches a
+/// private key but leaves the encoding open; Botan's begins with the complete
+/// public key, so a key file also carries everything a verifier needs.
+fn describe_xmss_private_key(bytes: &[u8]) -> Option<Description> {
+    let mut r = Reader::new(bytes);
+    let oid = r.take_u32("oid".into())?;
+    let &(_, name, hash, n, h, len) = XMSS_SETS.iter().find(|s| s.0 == oid)?;
+    // Keys made before Botan 3 have no WOTS+ derivation-method octet.
+    let legacy = match bytes.len() {
+        l if l == 4 * n + 9 => false,
+        l if l == 4 * n + 8 => true,
+        _ => return None,
+    };
+    r.take(n, "root".into())?;
+    r.take(n, "SEED".into())?;
+    let idx = u32::from_be_bytes(bytes.get(4 + 2 * n..8 + 2 * n)?.try_into().ok()?);
+    if u64::from(idx) >= 1u64 << h {
+        return None;
+    }
+    r.take(4, "idx".into())?;
+    r.take(n, "SK_PRF".into())?;
+    r.take(n, "SK_seed".into())?;
+    let wots = if legacy {
+        None
+    } else {
+        let at = r.pos;
+        r.take(1, "wots".into())?;
+        Some(bytes[at])
+    };
+    if !r.at_end() {
+        return None;
+    }
+
+    let mut notes = vec![
+        format!(
+            "Parameter set {} (OID 0x{:08X}) — {}, node size n = {} bytes, tree height \
+             h = {} (2^{} = {} one-time keys), len = {} WOTS+ hash chains, Winternitz w = 16.",
+            name,
+            oid,
+            hash,
+            n,
+            h,
+            h,
+            1u64 << h,
+            len
+        ),
+        format!(
+            "idx = {} — the next unused leaf, i.e. the number of signatures already made out \
+             of {}. It is the whole of the key's state: reusing a leaf index for a second \
+             message lets an attacker forge signatures, so the advanced key must be written \
+             back after every signature. Never restore this file from a backup and never \
+             keep a second copy of it.",
+            idx,
+            1u64 << h
+        ),
+        "The key opens with its own public key — oid, root and SEED — so a key file alone is \
+         enough to derive the certificate's public key. SK_seed is the secret every one-time \
+         key is derived from and SK_PRF the secret that randomizes message hashing; those two \
+         are what must stay secret."
+            .to_string(),
+    ];
+    match wots {
+        Some(1) => notes.push(
+            "wots = 1 — WOTS+ keys are derived the Botan 2.x way (as sketched in RFC 8391), \
+             which is open to a multi-target attack. Keys made by Botan 2 must keep this mode \
+             or their signatures stop verifying."
+                .to_string(),
+        ),
+        Some(2) => notes.push(
+            "wots = 2 — WOTS+ keys are derived as NIST SP 800-208 specifies, which closes the \
+             multi-target attack on the RFC 8391 derivation. This is what new keys use."
+                .to_string(),
+        ),
+        Some(other) => notes.push(format!("wots = {} — an unknown WOTS+ derivation method.", other)),
+        None => notes.push(
+            "The trailing WOTS+ derivation-method octet is absent, which marks a key written \
+             before Botan 3; it is read as the Botan 2.x derivation."
+                .to_string(),
+        ),
+    }
+    notes.push(
+        "Layout (Botan's own; RFC 8391 specifies no private-key format): u32 oid || root[n] || \
+         SEED[n] || u32 idx || SK_PRF[n] || SK_seed[n] || u8 wots"
+            .to_string(),
+    );
+    Some(Description {
+        heading: "XMSS private key (Botan encoding)".to_string(),
+        notes,
+        fields: r.fields,
+    })
+}
+
 /// `u32 oid || root[n] || SEED[n]` — the XMSS public key of RFC 8391 §4.1.7,
 /// which names its own parameter set.
 fn describe_xmss_public_key(bytes: &[u8]) -> Option<Description> {
@@ -482,13 +646,17 @@ fn ots_note(set: &OtsSet) -> String {
 // Entry points
 // ---------------------------------------------------------------------------
 
-/// Recognise `bytes` as an XMSS or HSS/LMS public key or signature. The four
-/// forms are tried in order of how strongly they are self-describing, and each
-/// must consume the value exactly, so at most one can match.
+/// Recognise `bytes` as an XMSS or HSS/LMS public key, private key or
+/// signature. The six forms are tried in order of how strongly they are
+/// self-describing — the XMSS signature, the only one identified by its length
+/// alone, goes last — and each must consume the value exactly, so at most one
+/// can match.
 pub fn describe(bytes: &[u8]) -> Option<Description> {
     describe_hss_public_key(bytes)
+        .or_else(|| describe_hss_private_key(bytes))
         .or_else(|| describe_hss_signature(bytes))
         .or_else(|| describe_xmss_public_key(bytes))
+        .or_else(|| describe_xmss_private_key(bytes))
         .or_else(|| describe_xmss_signature(bytes))
 }
 
@@ -537,15 +705,16 @@ pub fn describe_node(node: &Node) -> Option<Description> {
         shift_fields(&mut described, base);
         return Some(described);
     }
-    // Botan's XMSS SPKI nests a DER OCTET STRING inside the BIT STRING; the
-    // tree shows it as an encapsulated child, but the enclosing BIT STRING
-    // should document the key too.
+    // Botan nests a DER OCTET STRING inside the element holding an XMSS key —
+    // the subjectPublicKey BIT STRING of an SPKI, the privateKey OCTET STRING
+    // of a PKCS#8. The tree shows the inner one as an encapsulated child, but
+    // the enclosing element should document the key too.
     let header = octet_string_header(payload)?;
     let mut described = describe(&payload[header..])?;
     shift_fields(&mut described, base + header);
     described.notes.push(
-        "These bytes sit inside a DER OCTET STRING within the BIT STRING — the encoding \
-         Botan produces for an XMSS public key."
+        "Within this element the key sits inside a further DER OCTET STRING — the extra \
+         wrapper Botan puts around XMSS keys."
             .to_string(),
     );
     Some(described)
@@ -674,6 +843,78 @@ mod tests {
         // 1 unused-bits octet + 3 OCTET STRING header octets (04 81 84).
         assert_tiles(&through.fields, 4, 4 + key.len());
         assert!(through.notes.last().unwrap().contains("DER OCTET STRING"));
+    }
+
+    #[test]
+    fn an_lms_private_key_shows_its_parameters_and_how_far_its_state_has_advanced() {
+        let (pkcs8, _) = crate::hsslms::generate("SHA-256,HW(5,8)").unwrap();
+        let roots = ber::parse_forest(&pkcs8, 0).unwrap();
+        // PKCS#8 PrivateKeyInfo { version, algorithm, privateKey OCTET STRING }.
+        let key = roots[0].children.last().unwrap();
+        let described = describe_node(key).expect("the privateKey OCTET STRING holds the key");
+        assert_eq!(described.heading, "HSS/LMS private key (Botan encoding)");
+        assert_tiles(&described.fields, 0, key.content_octets().len());
+        assert_eq!(
+            described.fields.iter().map(|f| f.short.as_str()).collect::<Vec<_>>(),
+            ["L", "idx", "lmsType", "otsType", "SEED", "I"]
+        );
+        assert!(note_containing(&described, "LMS_SHA256_M32_H5").contains("tree height h = 5"));
+        assert!(note_containing(&described, "LMOTS_SHA256_N32_W8").contains("Winternitz w = 8"));
+        // A freshly generated key has signed nothing yet; signing advances it.
+        assert!(note_containing(&described, "idx = 0").contains("out of 32"), "{:?}", described.notes);
+        let (_, advanced) = crate::hsslms::sign(&pkcs8, b"one").unwrap();
+        let roots = ber::parse_forest(&advanced, 0).unwrap();
+        let after = describe_node(roots[0].children.last().unwrap()).expect("still an LMS key");
+        assert!(note_containing(&after, "idx = 1").contains("state"), "{:?}", after.notes);
+
+        // Two levels label each one, and the capacity is the product.
+        let (pkcs8, _) = crate::hsslms::generate("SHA-256,HW(5,8),HW(5,8)").unwrap();
+        let roots = ber::parse_forest(&pkcs8, 0).unwrap();
+        let two = describe_node(roots[0].children.last().unwrap()).expect("a two-level key");
+        let shorts: Vec<&str> = two.fields.iter().map(|f| f.short.as_str()).collect();
+        assert_eq!(shorts, ["L", "idx", "lmsType[0]", "otsType[0]", "lmsType[1]", "otsType[1]", "SEED", "I"]);
+        assert!(note_containing(&two, "L = 2").contains("HSS levels"));
+        assert!(note_containing(&two, "idx = 0").contains("out of 1024"), "{:?}", two.notes);
+    }
+
+    /// XMSS key generation is far too slow for a test, so build the byte
+    /// layout Botan writes and check it is read back field for field.
+    #[test]
+    fn an_xmss_private_key_is_read_including_its_wots_derivation_octet() {
+        // XMSS-SHA2_10_256: n = 32 → 4 + 32 + 32 + 4 + 32 + 32 + 1 bytes.
+        let mut key = 1u32.to_be_bytes().to_vec();
+        key.extend(std::iter::repeat_n(0xAA, 64)); // root || SEED
+        key.extend(600u32.to_be_bytes()); // idx, within 2^10
+        key.extend(std::iter::repeat_n(0xBB, 64)); // SK_PRF || SK_seed
+        key.push(2); // NIST SP 800-208 derivation
+        assert_eq!(key.len(), 4 * 32 + 9);
+
+        let described = describe(&key).expect("an XMSS private key");
+        assert_eq!(described.heading, "XMSS private key (Botan encoding)");
+        assert_tiles(&described.fields, 0, key.len());
+        assert_eq!(
+            described.fields.iter().map(|f| f.short.as_str()).collect::<Vec<_>>(),
+            ["oid", "root", "SEED", "idx", "SK_PRF", "SK_seed", "wots"]
+        );
+        assert!(note_containing(&described, "XMSS-SHA2_10_256").contains("n = 32"));
+        assert!(note_containing(&described, "idx = 600").contains("out of 1024"));
+        assert!(note_containing(&described, "wots = 2").contains("SP 800-208"));
+
+        // Without the trailing octet it is a pre-Botan-3 key, still readable.
+        let mut legacy = key.clone();
+        legacy.pop();
+        let old = describe(&legacy).expect("a legacy XMSS private key");
+        assert_eq!(old.fields.last().unwrap().short, "SK_seed");
+        assert!(note_containing(&old, "before Botan 3").contains("Botan 2.x"));
+
+        // A leaf index past the end of the tree is not a key.
+        let mut bad = key.clone();
+        bad[68..72].copy_from_slice(&1024u32.to_be_bytes());
+        assert!(describe(&bad).is_none());
+        // Neither is the right length under an unknown parameter-set OID.
+        let mut unknown = key.clone();
+        unknown[..4].copy_from_slice(&0x99u32.to_be_bytes());
+        assert!(describe(&unknown).is_none());
     }
 
     #[test]

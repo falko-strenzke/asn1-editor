@@ -22,6 +22,7 @@
 pub mod app;
 pub mod ber;
 pub mod browser;
+pub mod clipboard;
 pub mod cost;
 pub mod dump;
 pub mod hashsig;
