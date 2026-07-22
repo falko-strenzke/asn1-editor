@@ -20,6 +20,7 @@ use std::time::{Duration, Instant};
 
 use ratatui::crossterm::event::{
     self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind,
+    KeyModifiers,
 };
 use ratatui::crossterm::execute;
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -47,8 +48,6 @@ use crate::pathval::PathStatus;
 use crate::pathval_botan::BotanPathStatus;
 use crate::verify::{FileRelations, SignatureStatus};
 
-/// Bytes of hex shown in the browse-mode content pane before truncating.
-const CONTENT_HEX_LIMIT: usize = 4096;
 /// Total width of one [`hex_dump_lines`] line: the offset column (8 hex
 /// digits + 2 spaces), the hex column (47 chars padded + 2 spaces) and the
 /// `|…|` ASCII gutter (1 + 16 + 1). Long `Decoded` values wrap to this width.
@@ -158,9 +157,37 @@ fn event_loop(terminal: &mut DefaultTerminal, app: &mut App) -> io::Result<()> {
     }
 }
 
+/// The content pane's scroll keys, shared by both panes: `[` / `]` move by
+/// four lines and their shifted forms jump to the very start / end. Returns
+/// whether `key` was one of them.
+///
+/// Terminals disagree on how a shifted bracket arrives — as `{` / `}`, or as
+/// `[` / `]` carrying the Shift modifier — so both readings are accepted.
+fn handle_content_scroll_key(app: &mut App, key: KeyEvent) -> bool {
+    let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+    match key.code {
+        // The end is asked for by overshooting; the draw clamps it to the
+        // last screenful (see [`App::content_scroll`]).
+        KeyCode::Char('{') => app.content_scroll = 0,
+        KeyCode::Char('}') => app.content_scroll = usize::MAX,
+        KeyCode::Char('[') if shift => app.content_scroll = 0,
+        KeyCode::Char(']') if shift => app.content_scroll = usize::MAX,
+        KeyCode::Char('[') => app.content_scroll = app.content_scroll.saturating_sub(4),
+        KeyCode::Char(']') => app.content_scroll = app.content_scroll.saturating_add(4),
+        _ => return false,
+    }
+    true
+}
+
 fn handle_browser_key(app: &mut App, key: KeyEvent) {
     if !matches!(key.code, KeyCode::Enter | KeyCode::Char(' ')) {
         app.open_confirm = false;
+    }
+    // The content pane previews the selected file from here too, so its
+    // scroll keys work without switching panes — and returning early skips
+    // the (costly) re-preview below, which the selection has not moved for.
+    if handle_content_scroll_key(app, key) {
+        return;
     }
     match key.code {
         KeyCode::Up | KeyCode::Char('k') => app.browser.move_by(-1),
@@ -187,6 +214,9 @@ fn handle_document_key(app: &mut App, key: KeyEvent) {
     if key.code != KeyCode::Char('d') {
         app.delete_confirm = false;
     }
+    if handle_content_scroll_key(app, key) {
+        return;
+    }
     match key.code {
         KeyCode::Up | KeyCode::Char('k') => app.move_by(-1),
         KeyCode::Down | KeyCode::Char('j') => app.move_by(1),
@@ -207,8 +237,6 @@ fn handle_document_key(app: &mut App, key: KeyEvent) {
         KeyCode::Char('s') => app.save(),
         KeyCode::Char('z') => app.start_decrypt(),
         KeyCode::Char('/') => app.start_filter(),
-        KeyCode::Char('[') => app.content_scroll = app.content_scroll.saturating_sub(4),
-        KeyCode::Char(']') => app.content_scroll = app.content_scroll.saturating_add(4),
         _ => {}
     }
 }
@@ -2052,11 +2080,10 @@ fn field_color(i: usize) -> Style {
     Style::new().fg(FIELD_COLORS[i % FIELD_COLORS.len()])
 }
 
-/// Per-byte flags marking every occurrence of `needle` in the shown prefix
-/// of `bytes` (the tree filter's hex reading), for dump highlighting.
+/// Per-byte flags marking every occurrence of `needle` in `bytes` (the tree
+/// filter's hex reading), for dump highlighting.
 fn hex_match_marks(bytes: &[u8], needle: &[u8]) -> Vec<bool> {
-    let shown = bytes.len().min(CONTENT_HEX_LIMIT);
-    let mut marks = vec![false; shown];
+    let mut marks = vec![false; bytes.len()];
     if needle.is_empty() || needle.len() > bytes.len() {
         return marks;
     }
@@ -2070,22 +2097,24 @@ fn hex_match_marks(bytes: &[u8], needle: &[u8]) -> Vec<bool> {
     marks
 }
 
-/// Which field of a decoded value each of the first `shown` bytes belongs to,
-/// as an index into `fields` (`None` where no field claims the byte).
-fn field_owners(shown: usize, fields: &[hashsig::Field]) -> Vec<Option<usize>> {
-    let mut owners = vec![None; shown];
-    for (i, field) in fields.iter().enumerate() {
-        let end = field.start.saturating_add(field.len).min(shown);
-        for owner in owners.iter_mut().take(end).skip(field.start.min(shown)) {
-            *owner = Some(i);
-        }
-    }
-    owners
+/// Which field of a decoded value byte `i` belongs to, as an index into
+/// `fields`. The fields are sorted and non-overlapping, so a binary search
+/// finds the candidate and one bounds check confirms it.
+fn field_owner(fields: &[hashsig::Field], i: usize) -> Option<usize> {
+    let k = fields.partition_point(|f| f.start <= i).checked_sub(1)?;
+    (i < fields[k].start + fields[k].len).then_some(k)
 }
 
-/// Hex dump of `bytes`; positions flagged in `marks` (from the tree filter's
-/// hex reading) are highlighted in both the hex and the right-hand column.
-/// Pass an empty slice for a plain dump.
+/// The number of hex-dump lines `len` content octets occupy.
+fn hex_dump_row_count(len: usize) -> usize {
+    len.div_ceil(16)
+}
+
+/// Hex dump of the `rows` (16-byte lines) of `bytes` — the caller renders only
+/// the lines the content pane can show, so the cost of a dump does not grow
+/// with the size of the value. Positions flagged in `marks` (from the tree
+/// filter's hex reading) are highlighted in both the hex and the right-hand
+/// column; pass an empty slice for a plain dump.
 ///
 /// With `fields` non-empty — a value `hashsig.rs` could decode — each byte
 /// takes its field's colour, and the gutter lists the fields *starting* on
@@ -2096,18 +2125,22 @@ fn hex_dump_lines(
     bytes: &[u8],
     marks: &[bool],
     fields: &[hashsig::Field],
+    rows: std::ops::Range<usize>,
 ) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
-    let shown = bytes.len().min(CONTENT_HEX_LIMIT);
     let marked = |i: usize| marks.get(i).copied().unwrap_or(false);
-    let owners = field_owners(shown, fields);
-    for (i, chunk) in bytes[..shown].chunks(16).enumerate() {
+    let windowed = bytes
+        .chunks(16)
+        .enumerate()
+        .skip(rows.start)
+        .take(rows.end.saturating_sub(rows.start));
+    for (i, chunk) in windowed {
         let mut spans = vec![Span::styled(format!("{:08X}  ", i * 16), Style::new().dim())];
         for (j, b) in chunk.iter().enumerate() {
             let style = if marked(i * 16 + j) {
                 HEX_MATCH_STYLE
             } else {
-                owners[i * 16 + j].map(field_color).unwrap_or_default()
+                field_owner(fields, i * 16 + j).map(field_color).unwrap_or_default()
             };
             spans.push(Span::styled(format!("{:02X}", b), style));
             if j + 1 < chunk.len() {
@@ -2139,12 +2172,6 @@ fn hex_dump_lines(
             }
         }
         lines.push(Line::from(spans));
-    }
-    if shown < bytes.len() {
-        lines.push(Line::from(Span::styled(
-            format!("… {} more bytes not shown …", bytes.len() - shown),
-            Style::new().dim().italic(),
-        )));
     }
     lines
 }
@@ -2514,8 +2541,11 @@ fn botan_path_status_lines(
     header_field(label, vec![Span::styled(text, style)], width)
 }
 
-fn draw_content_browse(frame: &mut Frame, app: &App, area: Rect) {
+fn draw_content_browse(frame: &mut Frame, app: &mut App, area: Rect) {
     let mut lines: Vec<Line> = Vec::new();
+    // Content octets, filter marks and decoded fields of the selected element,
+    // set below and turned into dump lines only for the rows on screen.
+    let mut dump: Option<(Vec<u8>, Vec<bool>, Vec<hashsig::Field>)> = None;
     let selected_row = app.rows.get(app.selected);
     if selected_row.is_some_and(|r| r.elided) {
         lines.push(Line::from(Span::styled(
@@ -2713,8 +2743,10 @@ fn draw_content_browse(frame: &mut Frame, app: &App, area: Rect) {
             .then(|| FilterMatcher::new(&app.filter))
             .and_then(|m| m.hex_bytes().map(|n| hex_match_marks(&content, n)))
             .unwrap_or_default();
-        let fields = hash_based.as_ref().map(|d| &d.fields[..]).unwrap_or_default();
-        lines.extend(hex_dump_lines(&content, &marks, fields));
+        // The dump itself is rendered last, one screenful at a time — see
+        // below — so that showing a multi-megabyte value costs no more than
+        // showing a short one.
+        dump = Some((content, marks, hash_based.map(|d| d.fields).unwrap_or_default()));
     } else if !app.file_open {
         lines.push(Line::from(
             "no file open — move ↑↓ over a file in the Files pane on the left to preview it",
@@ -2722,14 +2754,35 @@ fn draw_content_browse(frame: &mut Frame, app: &App, area: Rect) {
     } else {
         lines.push(Line::from("no element selected"));
     }
-    let para = Paragraph::new(lines)
-        .block(
-            Block::default()
-                .borders(Borders::ALL)
-                .border_style(pane_border_style(app.focus == Focus::Document))
-                .title(" Content "),
-        )
-        .scroll((app.content_scroll, 0));
+
+    // The pane scrolls by dropping leading lines rather than through
+    // `Paragraph::scroll`, so the whole value — however large — stays
+    // reachable (that offset is a `u16`) and unseen lines are never built.
+    let rows = usize::from(area.height.saturating_sub(2)); // borders
+    let header = lines.len();
+    let total = header + dump.as_ref().map_or(0, |(c, ..)| hex_dump_row_count(c.len()));
+    // Clamping here, where the pane's height and the line count are both
+    // known, is what stops scrolling past the end: the last screenful is as
+    // far as it goes, and 'shift + ]' just asks for more than there is.
+    app.content_scroll = app.content_scroll.min(total.saturating_sub(rows));
+    let first = app.content_scroll;
+    let last = first.saturating_add(rows).min(total);
+
+    let mut view: Vec<Line> = lines.drain(first.min(header)..last.min(header)).collect();
+    if let Some((content, marks, fields)) = &dump {
+        view.extend(hex_dump_lines(
+            content,
+            marks,
+            fields,
+            first.saturating_sub(header)..last.saturating_sub(header),
+        ));
+    }
+    let para = Paragraph::new(view).block(
+        Block::default()
+            .borders(Borders::ALL)
+            .border_style(pane_border_style(app.focus == Focus::Document))
+            .title(" Content "),
+    );
     frame.render_widget(para, area);
 }
 
@@ -2959,13 +3012,13 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
     let hints = match app.mode {
         // Single-file mode: no browser pane, no re-signing — trimmed hints.
         Mode::Browse if app.single_file => {
-            "q quit  ↑↓ move  ←→ fold  ⏎ toggle  e edit  E edit-menu  i/I insert  d delete  J/K reorder  s save  z decrypt  [ ] scroll"
+            "q quit  ↑↓ move  ←→ fold  ⏎ toggle  e edit  E edit-menu  i/I insert  d delete  J/K reorder  s save  z decrypt  [ ] scroll  { } start/end"
         }
         Mode::Browse if app.focus == Focus::Browser => {
             "q quit  Tab switch pane  ↑↓ move+preview  ←→ fold  ⏎ switch to file/fold  z decrypt/re-sign  t trust"
         }
         Mode::Browse => {
-            "q quit  Tab switch pane  ↑↓ move  ←→ fold  ⏎ toggle  e edit  E edit-menu  i/I insert  d delete  J/K reorder  s save  z decrypt/re-sign  [ ] scroll"
+            "q quit  Tab switch pane  ↑↓ move  ←→ fold  ⏎ toggle  e edit  E edit-menu  i/I insert  d delete  J/K reorder  s save  z decrypt/re-sign  [ ] scroll  { } start/end"
         }
         Mode::TypePicker(_) => "←→ column  ↑↓ select  0-9 tag number  ⏎ continue  Esc cancel",
         Mode::EditMenu(_) => "↑↓ or 1-5 select  ⏎ choose  Esc cancel",
@@ -3935,6 +3988,114 @@ mod tests {
         app.filter_clear();
         term.draw(|f| draw(f, &mut app)).unwrap();
         assert_eq!(highlighted(&term), 0, "no highlight without a filter");
+    }
+
+    #[test]
+    fn the_content_pane_dumps_every_byte_and_scrolls_no_further_than_the_end() {
+        use crate::input::Container;
+        use ratatui::{backend::TestBackend, Terminal};
+        // An OCTET STRING far longer than one screen: 8 KiB = 512 dump lines.
+        // 0xAB bytes cannot be read as nested ASN.1, so the value stays a
+        // single primitive element.
+        let doc = ber::encode_node(&ber::univ(ber::TAG_OCTET_STRING, false, vec![0xAB; 8192]));
+        let roots = parse_forest(&doc, 0).unwrap();
+        let mut app = App::new_single_file(
+            PathBuf::from("big.der"),
+            PathBuf::from("/nonexistent/out"),
+            Container::Raw,
+            roots,
+            doc.len(),
+        );
+        let mut term = Terminal::new(TestBackend::new(160, 30)).unwrap();
+        let press = |app: &mut App, c: char, mods: event::KeyModifiers| {
+            handle_document_key(app, KeyEvent::new(KeyCode::Char(c), mods));
+            // The clamp lives in the draw, so every press is followed by one,
+            // exactly as the event loop does it.
+        };
+        let plain = event::KeyModifiers::NONE;
+        let shift = event::KeyModifiers::SHIFT;
+
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let top = buffer_text(term.backend().buffer());
+        assert!(top.contains("Content octets (8192 bytes)"), "header missing:\n{top}");
+        assert!(!top.contains("not shown"), "the dump must not be truncated:\n{top}");
+        assert!(top.contains("00000000  AB"), "the dump must start at offset 0:\n{top}");
+
+        // 'shift + ]' jumps to the very end: the last line of the dump is the
+        // one at offset 8192 − 16 = 0x1FF0, and the header has scrolled off.
+        press(&mut app, '}', shift);
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let bottom = buffer_text(term.backend().buffer());
+        assert!(bottom.contains("00001FF0  AB"), "the last dump line is missing:\n{bottom}");
+        assert!(!bottom.contains("Content octets"), "the header should be scrolled past");
+        let at_end = app.content_scroll;
+        assert!(at_end > 0);
+
+        // Scrolling further down changes nothing — the end is the end.
+        for _ in 0..20 {
+            press(&mut app, ']', plain);
+            term.draw(|f| draw(f, &mut app)).unwrap();
+        }
+        assert_eq!(app.content_scroll, at_end, "the scroll must stop at the last screenful");
+        assert_eq!(buffer_text(term.backend().buffer()), bottom, "the view must not move");
+
+        // 'shift + [' goes back to the very beginning.
+        press(&mut app, '{', shift);
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        assert_eq!(app.content_scroll, 0);
+        assert_eq!(buffer_text(term.backend().buffer()), top);
+
+        // Terminals that report a shifted bracket as the bracket itself plus
+        // the Shift modifier reach the same two ends.
+        press(&mut app, ']', shift);
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        assert_eq!(app.content_scroll, at_end, "shift + ] must jump to the end");
+        press(&mut app, '[', shift);
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        assert_eq!(app.content_scroll, 0, "shift + [ must jump to the start");
+
+        // Unshifted, the same keys still step by four lines.
+        press(&mut app, ']', plain);
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        assert_eq!(app.content_scroll, 4);
+        press(&mut app, '[', plain);
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        assert_eq!(app.content_scroll, 0);
+    }
+
+    /// The content pane previews the file the Files pane is on, so its scroll
+    /// keys have to work without switching panes.
+    #[test]
+    fn the_content_pane_scrolls_while_the_files_pane_has_focus() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("testdata/chain");
+        let mut app = App::new_dir(dir);
+        let mut term = Terminal::new(TestBackend::new(160, 30)).unwrap();
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        // Move onto a file, so the content pane has something long to show.
+        let down = KeyEvent::new(KeyCode::Down, event::KeyModifiers::NONE);
+        for _ in 0..20 {
+            if app.file_open {
+                break;
+            }
+            handle_browser_key(&mut app, down);
+        }
+        assert!(app.file_open, "no file to preview in testdata/chain");
+        assert_eq!(app.focus, Focus::Browser);
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let top = buffer_text(term.backend().buffer());
+
+        let press = |app: &mut App, c: char| {
+            handle_browser_key(app, KeyEvent::new(KeyCode::Char(c), event::KeyModifiers::SHIFT));
+        };
+        press(&mut app, '}');
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        assert!(app.content_scroll > 0, "shift + ] must scroll the preview to its end");
+        assert_ne!(buffer_text(term.backend().buffer()), top, "the view must move");
+        press(&mut app, '{');
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        assert_eq!(app.content_scroll, 0);
+        assert_eq!(buffer_text(term.backend().buffer()), top);
     }
 
     #[test]

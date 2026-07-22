@@ -1713,8 +1713,11 @@ pub struct App {
     pub quit_confirm: bool,
     /// Set after the first 'd'; the second 'd' actually deletes.
     pub delete_confirm: bool,
-    /// Scroll offset of the content pane in browse mode.
-    pub content_scroll: u16,
+    /// Scroll offset of the content pane in browse mode, in lines. The pane
+    /// clamps it to the last screenful while drawing — the only place where
+    /// both the line count and the pane's height are known — so setting it
+    /// past the end (as 'shift + ]' does) simply lands on the last screen.
+    pub content_scroll: usize,
     /// Tree-filter string ('/'): while non-empty, `rebuild_rows` shows only
     /// matching elements and their ancestors, eliding the rest as `[...]`.
     pub filter: String,
