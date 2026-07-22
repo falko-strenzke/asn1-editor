@@ -40,6 +40,7 @@ use crate::ber::{
     self, Class, Node, TAG_BIT_STRING, TAG_BOOLEAN, TAG_GENERALIZED_TIME, TAG_INTEGER, TAG_NULL,
     TAG_OID, TAG_UTC_TIME,
 };
+use crate::hashsig;
 use crate::keygen;
 use crate::oid;
 use crate::pathval::PathStatus;
@@ -2041,6 +2042,16 @@ fn draw_tree(frame: &mut Frame, app: &mut App, area: Rect) {
 const HEX_MATCH_STYLE: Style =
     Style::new().fg(Color::Black).bg(Color::Yellow);
 
+/// The two colours the hex dump alternates between when a value's fields are
+/// known ([`hashsig::describe_node`]), so that consecutive fields — and the
+/// tokens naming them in the right-hand gutter — are told apart at a glance.
+const FIELD_COLORS: [Color; 2] = [Color::Cyan, Color::Magenta];
+
+/// The colour of the `i`-th field of a decoded value.
+fn field_color(i: usize) -> Style {
+    Style::new().fg(FIELD_COLORS[i % FIELD_COLORS.len()])
+}
+
 /// Per-byte flags marking every occurrence of `needle` in the shown prefix
 /// of `bytes` (the tree filter's hex reading), for dump highlighting.
 fn hex_match_marks(bytes: &[u8], needle: &[u8]) -> Vec<bool> {
@@ -2059,17 +2070,45 @@ fn hex_match_marks(bytes: &[u8], needle: &[u8]) -> Vec<bool> {
     marks
 }
 
+/// Which field of a decoded value each of the first `shown` bytes belongs to,
+/// as an index into `fields` (`None` where no field claims the byte).
+fn field_owners(shown: usize, fields: &[hashsig::Field]) -> Vec<Option<usize>> {
+    let mut owners = vec![None; shown];
+    for (i, field) in fields.iter().enumerate() {
+        let end = field.start.saturating_add(field.len).min(shown);
+        for owner in owners.iter_mut().take(end).skip(field.start.min(shown)) {
+            *owner = Some(i);
+        }
+    }
+    owners
+}
+
 /// Hex dump of `bytes`; positions flagged in `marks` (from the tree filter's
-/// hex reading) are highlighted in both the hex and the ASCII column. Pass an
-/// empty slice for a plain dump.
-fn hex_dump_lines(bytes: &[u8], marks: &[bool]) -> Vec<Line<'static>> {
+/// hex reading) are highlighted in both the hex and the right-hand column.
+/// Pass an empty slice for a plain dump.
+///
+/// With `fields` non-empty — a value `hashsig.rs` could decode — each byte
+/// takes its field's colour, and the gutter lists the fields *starting* on
+/// that line by name instead of showing the bytes' ASCII reading: for these
+/// long concatenations of hash values the ASCII column carries no information,
+/// while the field names show where each component begins.
+fn hex_dump_lines(
+    bytes: &[u8],
+    marks: &[bool],
+    fields: &[hashsig::Field],
+) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     let shown = bytes.len().min(CONTENT_HEX_LIMIT);
     let marked = |i: usize| marks.get(i).copied().unwrap_or(false);
+    let owners = field_owners(shown, fields);
     for (i, chunk) in bytes[..shown].chunks(16).enumerate() {
         let mut spans = vec![Span::styled(format!("{:08X}  ", i * 16), Style::new().dim())];
         for (j, b) in chunk.iter().enumerate() {
-            let style = if marked(i * 16 + j) { HEX_MATCH_STYLE } else { Style::new() };
+            let style = if marked(i * 16 + j) {
+                HEX_MATCH_STYLE
+            } else {
+                owners[i * 16 + j].map(field_color).unwrap_or_default()
+            };
             spans.push(Span::styled(format!("{:02X}", b), style));
             if j + 1 < chunk.len() {
                 spans.push(Span::raw(" "));
@@ -2078,13 +2117,27 @@ fn hex_dump_lines(bytes: &[u8], marks: &[bool]) -> Vec<Line<'static>> {
         // Pad the hex column to its full width (16*3-1) plus the separator.
         let hex_w = chunk.len() * 3 - 1;
         spans.push(Span::raw(" ".repeat(47 - hex_w + 2)));
-        spans.push(Span::styled("|", Style::new().dim()));
-        for (j, &b) in chunk.iter().enumerate() {
-            let c = if (0x20..=0x7E).contains(&b) { b as char } else { '.' };
-            let style = if marked(i * 16 + j) { HEX_MATCH_STYLE } else { Style::new().dim() };
-            spans.push(Span::styled(c.to_string(), style));
+        if fields.is_empty() {
+            spans.push(Span::styled("|", Style::new().dim()));
+            for (j, &b) in chunk.iter().enumerate() {
+                let c = if (0x20..=0x7E).contains(&b) { b as char } else { '.' };
+                let style = if marked(i * 16 + j) { HEX_MATCH_STYLE } else { Style::new().dim() };
+                spans.push(Span::styled(c.to_string(), style));
+            }
+            spans.push(Span::styled("|", Style::new().dim()));
+        } else {
+            let line_end = i * 16 + chunk.len();
+            let starting = fields
+                .iter()
+                .enumerate()
+                .filter(|(_, f)| (i * 16..line_end).contains(&f.start));
+            for (n, (k, field)) in starting.enumerate() {
+                if n > 0 {
+                    spans.push(Span::raw(" "));
+                }
+                spans.push(Span::styled(field.short.clone(), field_color(k)));
+            }
         }
-        spans.push(Span::styled("|", Style::new().dim()));
         lines.push(Line::from(spans));
     }
     if shown < bytes.len() {
@@ -2631,6 +2684,19 @@ fn draw_content_browse(frame: &mut Frame, app: &App, area: Rect) {
                 extended_key_usage::describe(&eku),
             ));
         }
+        // XMSS / HSS-LMS values have no ASN.1 inside to show their structure,
+        // so document it here and let the dump below colour the fields.
+        let hash_based = hashsig::describe_node(node);
+        if let Some(described) = &hash_based {
+            let mut notes = described.notes.clone();
+            notes.push(
+                "In the dump below each field takes one of two alternating colours, and the \
+                 column on the right — where a plain dump shows the bytes' ASCII reading — \
+                 names the fields that begin on that line."
+                    .to_string(),
+            );
+            lines.extend(extension_section(&described.heading, notes));
+        }
         lines.push(Line::default());
         let content = node.content_octets();
         lines.push(Line::from(Span::styled(
@@ -2647,7 +2713,8 @@ fn draw_content_browse(frame: &mut Frame, app: &App, area: Rect) {
             .then(|| FilterMatcher::new(&app.filter))
             .and_then(|m| m.hex_bytes().map(|n| hex_match_marks(&content, n)))
             .unwrap_or_default();
-        lines.extend(hex_dump_lines(&content, &marks));
+        let fields = hash_based.as_ref().map(|d| &d.fields[..]).unwrap_or_default();
+        lines.extend(hex_dump_lines(&content, &marks, fields));
     } else if !app.file_open {
         lines.push(Line::from(
             "no file open — move ↑↓ over a file in the Files pane on the left to preview it",
@@ -3868,6 +3935,77 @@ mod tests {
         app.filter_clear();
         term.draw(|f| draw(f, &mut app)).unwrap();
         assert_eq!(highlighted(&term), 0, "no highlight without a filter");
+    }
+
+    #[test]
+    fn content_pane_documents_an_lms_public_key_and_names_its_fields_in_the_dump() {
+        use crate::input::Container;
+        use ratatui::{backend::TestBackend, Terminal};
+        // Single-level LMS, tree height 5, Winternitz width 8 — the fastest
+        // parameter set, and one whose whole key fits in three dump lines.
+        let (_, spki) = crate::hsslms::generate("SHA-256,HW(5,8)").unwrap();
+        let roots = parse_forest(&spki, 0).unwrap();
+        let mut app = App::new(
+            PathBuf::from("/nonexistent/in"),
+            PathBuf::from("/nonexistent/out"),
+            Container::Raw,
+            roots,
+            spki.len(),
+        );
+        let idx = (0..app.rows.len())
+            .find(|&i| {
+                app.select(i);
+                app.selected_node().is_some_and(|n| n.is_universal(TAG_BIT_STRING))
+            })
+            .expect("the subjectPublicKey BIT STRING");
+        app.select(idx);
+        let mut term = Terminal::new(TestBackend::new(200, 60)).unwrap();
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let buf = term.backend().buffer().clone();
+        let text = buffer_text(&buf);
+
+        // The prose resolves the typecodes to their parameters.
+        assert!(text.contains("HSS/LMS public key (RFC 8554"), "heading missing:\n{text}");
+        assert!(text.contains("LMS_SHA256_M32_H5"), "LMS parameter set missing:\n{text}");
+        assert!(text.contains("tree height h = 5"), "tree height missing:\n{text}");
+        assert!(text.contains("LMOTS_SHA256_N32_W8"), "LM-OTS parameter set missing:\n{text}");
+        assert!(text.contains("Winternitz w = 8 bits"), "Winternitz width missing:\n{text}");
+
+        // The dump's right-hand column names the fields starting on each line
+        // instead of showing the (meaningless) ASCII reading of hash bytes.
+        let row = text
+            .lines()
+            .find(|l| l.contains("L lmsType otsType I"))
+            .unwrap_or_else(|| panic!("no dump line names the first fields:\n{text}"));
+        assert!(!row.contains('|'), "the ASCII gutter must be replaced:\n{row}");
+        assert!(
+            text.lines().any(|l| l.contains("00000010  ") && l.contains("T[1]  ")),
+            "the root node's field name missing from the second dump line:\n{text}"
+        );
+
+        // Consecutive fields alternate between the two colours, in the hex
+        // bytes as well as in the tokens naming them.
+        let y = text.lines().position(|l| l.contains("L lmsType otsType I")).unwrap() as u16;
+        let fg = |x: usize| buf[(x as u16, y)].style().fg;
+        // Cell columns, not byte offsets: the row carries multi-byte borders.
+        let column = |needle: &str| {
+            let at = row.find(needle).expect("substring on the dump line");
+            row[..at].chars().count()
+        };
+        let hex = column("00000000  ") + 10;
+        // Content octet 0 is the BIT STRING's unused-bits octet (no field);
+        // L, lmsType and otsType are the next three four-byte fields.
+        assert!(
+            !FIELD_COLORS.contains(&fg(hex).unwrap_or(Color::Reset)),
+            "the unused-bits octet belongs to no field"
+        );
+        assert_eq!(fg(hex + 3), Some(FIELD_COLORS[0]), "L takes the first colour");
+        assert_eq!(fg(hex + 15), Some(FIELD_COLORS[1]), "lmsType takes the second");
+        assert_eq!(fg(hex + 27), Some(FIELD_COLORS[0]), "otsType alternates back");
+        let tokens = column("L lmsType otsType I");
+        assert_eq!(fg(tokens), Some(FIELD_COLORS[0]), "the token matches its bytes");
+        assert_eq!(fg(tokens + 2), Some(FIELD_COLORS[1]));
+        assert_eq!(fg(tokens + 10), Some(FIELD_COLORS[0]));
     }
 
     #[test]
