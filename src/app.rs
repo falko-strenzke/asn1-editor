@@ -5686,16 +5686,28 @@ fn resign_issued_file(
 /// The public-key identity of the plaintext private key in `roots`. Tries the
 /// structural extraction first (cheap, no crypto; also covers SEC1 keys and
 /// PKCS#8 keys that embed their public part); for a key whose public key is not
-/// recoverable from the private key alone — ML-DSA/SLH-DSA, or an EC/Ed25519
-/// key without its optional `publicKey` — it derives the `SubjectPublicKeyInfo`
-/// with OpenSSL and reads the identity from there, which is exactly the
-/// identity the certificate side computes. This is what lets a re-keyed
-/// certificate's new PQ key match it for the key↔certificate link and re-signing.
+/// recoverable from the private key alone it derives the `SubjectPublicKeyInfo`
+/// and reads the identity from there — via **Botan** for the stateful
+/// hash-based schemes (HSS/LMS, XMSS), which OpenSSL cannot load, and via
+/// **OpenSSL** for ML-DSA/SLH-DSA and an EC/Ed25519 key stored without its
+/// optional `publicKey`. Either way the identity matches what the certificate
+/// side computes, which is what lets a key file link to (and re-sign) the
+/// certificate that carries its public key.
 fn private_key_public_id(roots: &[Node]) -> Option<x509::PublicKeyId> {
     if let Some(id) = x509::public_key_id_of_private_key(roots) {
         return Some(id);
     }
     let pkcs8 = x509::to_pkcs8_der(roots)?;
+    // HSS/LMS and XMSS: OpenSSL cannot decode these keys and their public part
+    // is not in the private key, so the identity comes from Botan's SPKI (under
+    // the same X.509 OID the certificate uses). This is the expensive path — the
+    // load recomputes the whole public key — so it runs only for these OIDs.
+    if verify::pkcs8_is_hsslms(&pkcs8) {
+        return crate::hsslms::spki_from_pkcs8(&pkcs8).and_then(|s| public_key_id_from_spki(&s));
+    }
+    if verify::pkcs8_is_xmss(&pkcs8) {
+        return crate::xmss::spki_from_pkcs8(&pkcs8).and_then(|s| public_key_id_from_spki(&s));
+    }
     let pkey = openssl::pkey::PKey::private_key_from_pkcs8(&pkcs8).ok()?;
     let spki = pkey.public_key_to_der().ok()?;
     public_key_id_from_spki(&spki)
@@ -5707,6 +5719,14 @@ fn private_key_public_id(roots: &[Node]) -> Option<x509::PublicKeyId> {
 /// re-signing.
 fn usable_key_id(roots: &[Node]) -> Option<x509::PublicKeyId> {
     let pkcs8 = x509::to_pkcs8_der(roots)?;
+    // For HSS/LMS and XMSS, deriving the identity already loads the key through
+    // Botan (proving it usable), so skip the separate `private_key_usable` —
+    // that would load a second time, and each load recomputes the whole public
+    // key. `private_key_public_id` returns `None` for an unloadable key, which
+    // is exactly the "not usable" verdict.
+    if verify::pkcs8_is_hsslms(&pkcs8) || verify::pkcs8_is_xmss(&pkcs8) {
+        return private_key_public_id(roots);
+    }
     if !verify::private_key_usable(&pkcs8) {
         return None;
     }
@@ -5715,8 +5735,9 @@ fn usable_key_id(roots: &[Node]) -> Option<x509::PublicKeyId> {
 
 /// Scan `dir` for plaintext key files, keeping only cryptographically usable
 /// keys — a broken key never gets a key↔certificate link. Each key's public
-/// identity is derived with [`private_key_public_id`], so post-quantum keys
-/// (whose public key is not in the private key) are included too.
+/// identity is derived with [`usable_key_id`], so post-quantum keys (whose
+/// public key is not in the private key, including the Botan-only HSS/LMS and
+/// XMSS schemes) are included too.
 fn scan_usable_key_files(dir: &Path) -> Vec<x509::KeyFile> {
     x509::scan_dir_private_key_paths(dir)
         .into_iter()
@@ -5724,11 +5745,7 @@ fn scan_usable_key_files(dir: &Path) -> Vec<x509::KeyFile> {
             let raw = std::fs::read(&path).ok()?;
             let (der, _) = input::load(&raw).ok()?;
             let roots = ber::parse_forest(&der, 0).ok()?;
-            let pkcs8 = x509::to_pkcs8_der(&roots)?;
-            if !verify::private_key_usable(&pkcs8) {
-                return None;
-            }
-            let key = private_key_public_id(&roots)?;
+            let key = usable_key_id(&roots)?;
             Some(x509::KeyFile { path, key })
         })
         .collect()
@@ -8739,6 +8756,27 @@ mod tests {
             app.key_files.iter().any(|k| k.path == app.path),
             "a modified key is re-derived from live content"
         );
+    }
+
+    #[test]
+    fn lms_key_file_links_to_its_certificate_by_matching_public_id() {
+        // A key file and a certificate are linked when their `PublicKeyId`s
+        // match. For an LMS key OpenSSL cannot derive the public key and the
+        // private key does not embed it, so the identity must come from Botan —
+        // and it must equal the identity the certificate side derives from the
+        // same SubjectPublicKeyInfo. (Regression: the link was missing because
+        // `private_key_public_id` gave up on LMS keys, leaving them out of the
+        // key index entirely.)
+        let (pkcs8, spki) = crate::hsslms::generate("SHA-256,HW(5,8)").unwrap();
+        let roots = ber::parse_forest(&pkcs8, 0).unwrap();
+
+        let key_id = private_key_public_id(&roots).expect("LMS key identity via Botan");
+        let cert_id = public_key_id_from_spki(&spki).expect("certificate-side identity");
+        assert_eq!(key_id, cert_id, "key and certificate must share one PublicKeyId");
+
+        // The scan-level helper agrees, and treats the key as usable (a single
+        // Botan load), so the scan includes it in `key_files`.
+        assert_eq!(usable_key_id(&roots), Some(cert_id));
     }
 
     #[test]
