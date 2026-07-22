@@ -137,6 +137,54 @@ pub fn read() -> Result<Vec<u8>, String> {
     }
 }
 
+/// The helpers [`write`] tries, in the same order and for the same reasons as
+/// [`HELPERS`]. Each takes the text on standard input.
+#[cfg(not(windows))]
+const WRITERS: &[(&str, &[&str])] = &[
+    ("wl-copy", &[]),
+    ("xclip", &["-selection", "clipboard", "-in"]),
+    ("xsel", &["--clipboard", "--input"]),
+    ("pbcopy", &[]),
+];
+
+/// On Windows, `clip` (which ships with the system) reads standard input
+/// straight onto the clipboard, so PowerShell is not needed for this half.
+#[cfg(windows)]
+const WRITERS: &[(&str, &[&str])] = &[("clip", &[])];
+
+/// Put `text` on the system clipboard, for Ctrl+C and Ctrl+X.
+///
+/// The helper is fed on standard input and waited for: `xclip` in particular
+/// forks a process that keeps serving the selection, so the write is only
+/// certain once the parent has exited.
+pub fn write(text: &str) -> Result<(), String> {
+    use std::io::Write;
+    let mut tried = Vec::new();
+    for (command, args) in WRITERS {
+        let child = std::process::Command::new(command)
+            .args(*args)
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .spawn();
+        let Ok(mut child) = child else { continue };
+        let written = child
+            .stdin
+            .take()
+            .map(|mut pipe| pipe.write_all(text.as_bytes()))
+            .unwrap_or(Ok(()));
+        match (written, child.wait()) {
+            (Ok(()), Ok(status)) if status.success() => return Ok(()),
+            _ => tried.push(*command),
+        }
+    }
+    if tried.is_empty() {
+        Err(NO_HELPER.to_string())
+    } else {
+        Err(format!("{} could not write to the clipboard", tried.join(", ")))
+    }
+}
+
 /// PowerShell terminates its output with a newline of its own, which is not
 /// part of the clipboard. Dropping one trailing line ending keeps a binary
 /// paste from picking up a stray `0D 0A`; the hex and base64 readings ignore

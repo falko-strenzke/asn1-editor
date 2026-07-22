@@ -348,6 +348,210 @@ pub enum Editor {
     DateTime(DateTimeEditor),
 }
 
+/// How many editing steps Ctrl+Z can walk back. One step is one keystroke or
+/// one paste — enough to undo a mistyped run without keeping whole edits of a
+/// large value alive indefinitely.
+const UNDO_DEPTH: usize = 256;
+
+/// The editing state a flat buffer needs beyond its contents: what is
+/// selected, what was just inserted, and how to get back. The hex editor and
+/// the text editors are both a `Vec<char>` with a cursor — hex digits in one
+/// case, characters in the other — so selecting, cutting, pasting and undoing
+/// are the same operations over both, and live here once.
+///
+/// The buffer and cursor are passed in rather than owned: the two editors keep
+/// their own (`digits`, `buf`) and the borrow checker is happy to lend them
+/// alongside this struct as separate fields of the same editor.
+#[derive(Default)]
+pub struct EditHistory {
+    /// Where a Shift-extended selection began. The selection runs between it
+    /// and the cursor, in whichever direction; `None` means none is active.
+    pub anchor: Option<usize>,
+    /// The range most recently inserted — typed, pasted or brought back by an
+    /// undo — so it can be shown as new. Cleared as soon as the user selects
+    /// anything, and with the editor itself, so it never outlives the edit.
+    pub fresh: Option<(usize, usize)>,
+    /// Buffer states before each change, newest last (see [`UNDO_DEPTH`]).
+    undo: Vec<(Vec<char>, usize)>,
+}
+
+impl EditHistory {
+    /// The selected range as `start..end`, or `None` when nothing is selected
+    /// (including when the anchor and the cursor coincide).
+    pub fn selection(&self, cursor: usize) -> Option<(usize, usize)> {
+        let anchor = self.anchor?;
+        let (start, end) = (anchor.min(cursor), anchor.max(cursor));
+        (start < end).then_some((start, end))
+    }
+
+    pub fn is_selected(&self, cursor: usize, i: usize) -> bool {
+        self.selection(cursor).is_some_and(|(start, end)| (start..end).contains(&i))
+    }
+
+    /// Whether item `i` was just inserted and is still marked as new.
+    pub fn is_fresh(&self, i: usize) -> bool {
+        self.fresh.is_some_and(|(start, end)| (start..end).contains(&i))
+    }
+
+    pub fn clear_selection(&mut self) {
+        self.anchor = None;
+    }
+
+    /// Remember the state before a change, so Ctrl+Z can return to it.
+    fn record(&mut self, buf: &[char], cursor: usize) {
+        if self.undo.len() == UNDO_DEPTH {
+            self.undo.remove(0);
+        }
+        self.undo.push((buf.to_vec(), cursor));
+    }
+
+    /// Move the cursor by `delta` steps of `unit` items. Without `extend` this
+    /// is plain movement by a single item and any selection is dropped; with
+    /// it, the cursor first snaps to a `unit` boundary in the direction of
+    /// travel — which is what makes Shift+←→ in the hex editor select whole
+    /// octets even when the cursor sits between two digits.
+    pub fn step(&mut self, cursor: &mut usize, delta: isize, extend: bool, unit: usize, len: usize) {
+        if !extend {
+            self.anchor = None;
+            *cursor = (*cursor as isize + delta).clamp(0, len as isize) as usize;
+            return;
+        }
+        let base = match self.anchor {
+            Some(_) => *cursor,
+            None => {
+                // Take the whole unit the cursor is inside, from whichever
+                // end the movement is heading away from.
+                let snapped = if delta >= 0 {
+                    *cursor - *cursor % unit
+                } else {
+                    (*cursor).div_ceil(unit) * unit
+                };
+                let snapped = snapped.min(len);
+                self.anchor = Some(snapped);
+                snapped
+            }
+        };
+        *cursor = (base as isize + delta * unit as isize).clamp(0, len as isize) as usize;
+        self.fresh = None;
+    }
+
+    /// Move the cursor to `to` (Home/End), selecting on the way when `extend`.
+    pub fn jump(&mut self, cursor: &mut usize, to: usize, extend: bool, len: usize) {
+        let to = to.min(len);
+        if extend {
+            if self.anchor.is_none() {
+                self.anchor = Some(*cursor);
+            }
+            self.fresh = None;
+        } else {
+            self.anchor = None;
+        }
+        *cursor = to;
+    }
+
+    pub fn select_all(&mut self, cursor: &mut usize, len: usize) {
+        self.anchor = Some(0);
+        *cursor = len;
+        self.fresh = None;
+    }
+
+    /// The selected items as a string, or `None` when nothing is selected.
+    pub fn selected_text(&self, buf: &[char], cursor: usize) -> Option<String> {
+        let (start, end) = self.selection(cursor)?;
+        Some(buf[start..end].iter().collect())
+    }
+
+    /// Remove the selected items, leaving the cursor where they began.
+    /// Returns whether anything was selected.
+    pub fn delete_selection(&mut self, buf: &mut Vec<char>, cursor: &mut usize) -> bool {
+        let Some((start, end)) = self.selection(*cursor) else { return false };
+        self.record(buf, *cursor);
+        self.cut_out(buf, cursor, start, end);
+        true
+    }
+
+    /// Drop `start..end` without recording — for callers that already have.
+    fn cut_out(&mut self, buf: &mut Vec<char>, cursor: &mut usize, start: usize, end: usize) {
+        buf.drain(start..end);
+        *cursor = start;
+        self.anchor = None;
+        self.fresh = None;
+    }
+
+    /// Insert `items` at the cursor, replacing the selection if there is one,
+    /// and mark what went in as new.
+    pub fn insert(&mut self, buf: &mut Vec<char>, cursor: &mut usize, items: &[char]) {
+        self.record(buf, *cursor);
+        if let Some((start, end)) = self.selection(*cursor) {
+            self.cut_out(buf, cursor, start, end);
+        }
+        let at = *cursor;
+        for (offset, &c) in items.iter().enumerate() {
+            buf.insert(at + offset, c);
+        }
+        *cursor = at + items.len();
+        self.mark_fresh(at, *cursor);
+    }
+
+    /// Mark `start..end` as newly added, joining it to an adjacent run so a
+    /// typed sequence reads as one block rather than only its last item.
+    fn mark_fresh(&mut self, start: usize, end: usize) {
+        if end <= start {
+            return;
+        }
+        self.fresh = Some(match self.fresh {
+            Some((from, to)) if to == start => (from, end),
+            Some((from, to)) if end == from => (start, to),
+            _ => (start, end),
+        });
+    }
+
+    /// Remove one item before or at the cursor (Backspace / Delete), or the
+    /// selection when there is one. `before` picks which side.
+    pub fn remove_one(&mut self, buf: &mut Vec<char>, cursor: &mut usize, before: bool) {
+        if self.delete_selection(buf, cursor) {
+            return;
+        }
+        let at = if before { cursor.checked_sub(1) } else { (*cursor < buf.len()).then_some(*cursor) };
+        let Some(at) = at else { return };
+        self.record(buf, *cursor);
+        buf.remove(at);
+        *cursor = at;
+        self.fresh = None;
+    }
+
+    /// Step back one change, marking whatever reappeared as newly added — an
+    /// undo puts items back, and they are as new as any others. Returns
+    /// whether there was anything to undo.
+    pub fn undo(&mut self, buf: &mut Vec<char>, cursor: &mut usize) -> bool {
+        let Some((previous, previous_cursor)) = self.undo.pop() else { return false };
+        let restored = restored_range(buf, &previous);
+        *buf = previous;
+        *cursor = previous_cursor.min(buf.len());
+        self.anchor = None;
+        self.fresh = restored;
+        true
+    }
+}
+
+/// The range of `after` that `before` does not already contain, found by
+/// trimming the common head and tail — what an undo brought back, so it can be
+/// marked as new. `None` when nothing was added (the change only removed).
+fn restored_range(before: &[char], after: &[char]) -> Option<(usize, usize)> {
+    if after.len() <= before.len() {
+        return None;
+    }
+    let head = before.iter().zip(after).take_while(|(a, b)| a == b).count();
+    let tail = before[head..]
+        .iter()
+        .rev()
+        .zip(after[head..].iter().rev())
+        .take_while(|(a, b)| a == b)
+        .count();
+    let (start, end) = (head, after.len() - tail);
+    (start < end).then_some((start, end))
+}
+
 pub struct HexEditor {
     /// Hex digits typed so far (no spaces).
     pub digits: Vec<char>,
@@ -355,93 +559,53 @@ pub struct HexEditor {
     pub cursor: usize,
     /// First visible editor line, kept up to date by the renderer.
     pub scroll: usize,
-    /// Where a Shift-extended selection began. The selection runs between it
-    /// and [`Self::cursor`], in whichever direction; `None` means none is
-    /// active. Selection is in *digits*, the unit the cursor moves in — two
-    /// per octet.
-    pub anchor: Option<usize>,
-    /// The digits the last paste inserted, as a `start..end` range, so they
-    /// can be shown as new. Cleared as soon as the user selects anything —
-    /// and with the editor itself, so the marking never outlives the edit.
-    pub pasted: Option<(usize, usize)>,
+    /// Selection, freshly-added marking and undo history. Its positions are
+    /// in *digits*, the unit the cursor moves in — two per octet.
+    pub sel: EditHistory,
 }
 
 impl HexEditor {
-    /// The selected digit range as `start..end`, or `None` when nothing is
-    /// selected (including when the anchor and the cursor coincide).
+    /// Selecting works in whole octets: two hex digits.
+    pub const UNIT: usize = 2;
+
     pub fn selection(&self) -> Option<(usize, usize)> {
-        let anchor = self.anchor?;
-        let (start, end) = (anchor.min(self.cursor), anchor.max(self.cursor));
-        (start < end).then_some((start, end))
+        self.sel.selection(self.cursor)
     }
 
     pub fn is_selected(&self, i: usize) -> bool {
-        self.selection().is_some_and(|(start, end)| (start..end).contains(&i))
+        self.sel.is_selected(self.cursor, i)
     }
 
-    /// Whether digit `i` came from the last paste and is still marked as new.
-    pub fn is_pasted(&self, i: usize) -> bool {
-        self.pasted.is_some_and(|(start, end)| (start..end).contains(&i))
+    pub fn is_fresh(&self, i: usize) -> bool {
+        self.sel.is_fresh(i)
     }
 
-    pub fn clear_selection(&mut self) {
-        self.anchor = None;
-    }
-
-    /// Move the cursor to `to`, extending the selection from wherever it was
-    /// anchored (starting one at the current position if there is none).
-    /// Selecting is also what ends the "newly pasted" marking.
-    fn extend_to(&mut self, to: usize) {
-        if self.anchor.is_none() {
-            self.anchor = Some(self.cursor);
-        }
-        self.cursor = to.min(self.digits.len());
-        self.pasted = None;
+    /// The selected octets as hex text, grouped in pairs so that what lands on
+    /// the clipboard is both readable and re-pastable.
+    pub fn selected_hex(&self) -> Option<String> {
+        let digits = self.sel.selected_text(&self.digits, self.cursor)?;
+        let pairs: Vec<String> =
+            digits.as_bytes().chunks(2).map(|p| String::from_utf8_lossy(p).into_owned()).collect();
+        Some(pairs.join(" "))
     }
 
     pub fn select_all(&mut self) {
-        self.anchor = Some(0);
-        self.cursor = self.digits.len();
-        self.pasted = None;
+        self.sel.select_all(&mut self.cursor, self.digits.len());
     }
 
-    /// Remove the selected digits, leaving the cursor where they began.
-    /// Returns whether anything was selected.
     pub fn delete_selection(&mut self) -> bool {
-        let Some((start, end)) = self.selection() else { return false };
-        self.digits.drain(start..end);
-        self.cursor = start;
-        self.anchor = None;
-        self.pasted = None;
-        true
+        self.sel.delete_selection(&mut self.digits, &mut self.cursor)
     }
 
-    /// Move the cursor by `delta` digits, selecting on the way when `extend`
-    /// and dropping any selection otherwise.
-    fn step(&mut self, delta: isize, extend: bool) {
-        let to = (self.cursor as isize + delta).clamp(0, self.digits.len() as isize) as usize;
-        self.jump(to, extend);
-    }
-
-    fn jump(&mut self, to: usize, extend: bool) {
-        if extend {
-            self.extend_to(to);
-        } else {
-            self.cursor = to.min(self.digits.len());
-            self.anchor = None;
-        }
-    }
-
-    /// Insert `digits` at the cursor, replacing the selection if there is one,
-    /// and mark what was inserted as newly pasted.
+    /// Insert hex digits at the cursor, replacing the selection if there is
+    /// one, and mark what went in as new.
     pub fn insert_digits(&mut self, digits: &str) {
-        self.delete_selection();
-        let at = self.cursor;
-        for (offset, c) in digits.chars().filter(|c| c.is_ascii_hexdigit()).enumerate() {
-            self.digits.insert(at + offset, c.to_ascii_uppercase());
+        let items: Vec<char> =
+            digits.chars().filter(|c| c.is_ascii_hexdigit()).map(|c| c.to_ascii_uppercase()).collect();
+        if items.is_empty() {
+            return;
         }
-        self.cursor = at + digits.chars().filter(|c| c.is_ascii_hexdigit()).count();
-        self.pasted = (self.cursor > at).then_some((at, self.cursor));
+        self.sel.insert(&mut self.digits, &mut self.cursor, &items);
     }
 }
 
@@ -477,6 +641,55 @@ pub struct TextEditor {
     pub format: TextFormat,
     pub buf: Vec<char>,
     pub cursor: usize,
+    /// Selection, freshly-added marking and undo history, in characters —
+    /// the same machinery the hex editor uses over digits.
+    pub sel: EditHistory,
+}
+
+impl TextEditor {
+    /// Selecting works in single characters: there is no wider unit here as
+    /// there is in hex, where two digits make an octet.
+    pub const UNIT: usize = 1;
+
+    pub fn selection(&self) -> Option<(usize, usize)> {
+        self.sel.selection(self.cursor)
+    }
+
+    pub fn is_selected(&self, i: usize) -> bool {
+        self.sel.is_selected(self.cursor, i)
+    }
+
+    pub fn is_fresh(&self, i: usize) -> bool {
+        self.sel.is_fresh(i)
+    }
+
+    /// The selected characters, for the clipboard.
+    pub fn selected_text(&self) -> Option<String> {
+        self.sel.selected_text(&self.buf, self.cursor)
+    }
+
+    pub fn select_all(&mut self) {
+        self.sel.select_all(&mut self.cursor, self.buf.len());
+    }
+
+    /// Insert text at the cursor, replacing the selection if there is one.
+    /// Control characters are dropped, except the newlines the raw format
+    /// keeps as data.
+    pub fn insert_text(&mut self, text: &str) {
+        let keep_newlines = self.format == TextFormat::Raw;
+        let items: Vec<char> = text
+            .chars()
+            .filter_map(|c| match c {
+                '\n' | '\r' if keep_newlines => Some('\n'),
+                c if c.is_control() => None,
+                c => Some(c),
+            })
+            .collect();
+        if items.is_empty() {
+            return;
+        }
+        self.sel.insert(&mut self.buf, &mut self.cursor, &items);
+    }
 }
 
 pub const DATE_FIELDS: [&str; 6] = ["Year", "Month", "Day", "Hour", "Minute", "Second"];
@@ -498,31 +711,29 @@ impl Editor {
             .chars()
             .filter(|c| !c.is_whitespace())
             .collect();
-        Editor::Hex(HexEditor { digits, cursor: 0, scroll: 0, anchor: None, pasted: None })
+        Editor::Hex(HexEditor { digits, cursor: 0, scroll: 0, sel: EditHistory::default() })
     }
 
     pub fn text(format: TextFormat, initial: String) -> Self {
         let buf: Vec<char> = initial.chars().collect();
         let cursor = buf.len();
-        Editor::Text(TextEditor { format, buf, cursor })
+        Editor::Text(TextEditor { format, buf, cursor, sel: EditHistory::default() })
     }
 
     /// Printable character typed by the user.
     pub fn insert_char(&mut self, c: char) {
         match self {
+            // Typing over a selection replaces it, and what is typed is
+            // marked as newly added just as a paste would be.
             Editor::Hex(h) => {
                 if c.is_ascii_hexdigit() {
-                    // Typing over a selection replaces it, as in any editor.
-                    h.delete_selection();
-                    h.digits.insert(h.cursor, c.to_ascii_uppercase());
-                    h.cursor += 1;
-                    h.pasted = None;
+                    let c = c.to_ascii_uppercase();
+                    h.sel.insert(&mut h.digits, &mut h.cursor, &[c]);
                 }
             }
             Editor::Text(t) => {
                 if !c.is_control() {
-                    t.buf.insert(t.cursor, c);
-                    t.cursor += 1;
+                    t.sel.insert(&mut t.buf, &mut t.cursor, &[c]);
                 }
             }
             Editor::DateTime(d) => {
@@ -542,21 +753,8 @@ impl Editor {
 
     pub fn backspace(&mut self) {
         match self {
-            Editor::Hex(h) => {
-                if h.delete_selection() {
-                    return;
-                }
-                if h.cursor > 0 {
-                    h.cursor -= 1;
-                    h.digits.remove(h.cursor);
-                }
-            }
-            Editor::Text(t) => {
-                if t.cursor > 0 {
-                    t.cursor -= 1;
-                    t.buf.remove(t.cursor);
-                }
-            }
+            Editor::Hex(h) => h.sel.remove_one(&mut h.digits, &mut h.cursor, true),
+            Editor::Text(t) => t.sel.remove_one(&mut t.buf, &mut t.cursor, true),
             Editor::DateTime(d) => {
                 d.fields[d.active].pop();
                 d.pristine = false; // further digits append
@@ -566,19 +764,8 @@ impl Editor {
 
     pub fn delete(&mut self) {
         match self {
-            Editor::Hex(h) => {
-                if h.delete_selection() {
-                    return;
-                }
-                if h.cursor < h.digits.len() {
-                    h.digits.remove(h.cursor);
-                }
-            }
-            Editor::Text(t) => {
-                if t.cursor < t.buf.len() {
-                    t.buf.remove(t.cursor);
-                }
-            }
+            Editor::Hex(h) => h.sel.remove_one(&mut h.digits, &mut h.cursor, false),
+            Editor::Text(t) => t.sel.remove_one(&mut t.buf, &mut t.cursor, false),
             Editor::DateTime(d) => {
                 d.fields[d.active].clear();
                 d.pristine = false;
@@ -591,9 +778,13 @@ impl Editor {
     /// the other editors have no selection and ignore it.
     pub fn move_horizontal(&mut self, delta: isize, extend: bool) {
         match self {
-            Editor::Hex(h) => h.step(delta, extend),
+            Editor::Hex(h) => {
+                let len = h.digits.len();
+                h.sel.step(&mut h.cursor, delta, extend, HexEditor::UNIT, len);
+            }
             Editor::Text(t) => {
-                t.cursor = (t.cursor as isize + delta).clamp(0, t.buf.len() as isize) as usize;
+                let len = t.buf.len();
+                t.sel.step(&mut t.cursor, delta, extend, TextEditor::UNIT, len);
             }
             Editor::DateTime(d) => {
                 d.active = (d.active as isize + delta).rem_euclid(6) as usize;
@@ -605,7 +796,14 @@ impl Editor {
     /// Up/down: hex row, or numeric adjust of the active date/time field.
     pub fn move_vertical(&mut self, delta: isize, extend: bool) {
         match self {
-            Editor::Hex(h) => h.step(delta * EDIT_DIGITS_PER_LINE as isize, extend),
+            Editor::Hex(h) => {
+                let len = h.digits.len();
+                // A row is a whole number of octets, so the vertical step is
+                // the same whether it selects or merely moves.
+                let rows = delta * (EDIT_DIGITS_PER_LINE / HexEditor::UNIT) as isize;
+                let step = if extend { rows } else { rows * HexEditor::UNIT as isize };
+                h.sel.step(&mut h.cursor, step, extend, HexEditor::UNIT, len);
+            }
             Editor::Text(_) => {}
             Editor::DateTime(d) => {
                 let v = d.fields[d.active].parse::<i64>().unwrap_or(0) - delta as i64;
@@ -617,8 +815,14 @@ impl Editor {
 
     pub fn home(&mut self, extend: bool) {
         match self {
-            Editor::Hex(h) => h.jump(0, extend),
-            Editor::Text(t) => t.cursor = 0,
+            Editor::Hex(h) => {
+                let len = h.digits.len();
+                h.sel.jump(&mut h.cursor, 0, extend, len);
+            }
+            Editor::Text(t) => {
+                let len = t.buf.len();
+                t.sel.jump(&mut t.cursor, 0, extend, len);
+            }
             Editor::DateTime(d) => {
                 d.active = 0;
                 d.pristine = true;
@@ -628,8 +832,14 @@ impl Editor {
 
     pub fn end(&mut self, extend: bool) {
         match self {
-            Editor::Hex(h) => h.jump(h.digits.len(), extend),
-            Editor::Text(t) => t.cursor = t.buf.len(),
+            Editor::Hex(h) => {
+                let len = h.digits.len();
+                h.sel.jump(&mut h.cursor, len, extend, len);
+            }
+            Editor::Text(t) => {
+                let len = t.buf.len();
+                t.sel.jump(&mut t.cursor, len, extend, len);
+            }
             Editor::DateTime(d) => {
                 d.active = 5;
                 d.pristine = true;
@@ -1121,23 +1331,38 @@ pub const HELP_TOPICS: &[HelpTopic] = &[
             "In every editor the first line shows live feedback on what the current text \
              encodes to, Enter applies the change and Esc abandons it.",
             "",
-            "The hex editor selects as well: Shift with the cursor keys marks digits (shown on \
-             a blue background) and Ctrl+A marks all of them. Delete or Backspace removes what \
-             is marked, and typing or pasting replaces it.",
+            "Every value editor — hex, and the integer, OID, string and base64 fields alike — \
+             selects, copies and undoes the same way. Shift with the cursor keys marks \
+             content (shown on a blue background) and Ctrl+A marks all of it; Delete or \
+             Backspace removes what is marked, and typing or pasting replaces it. The hex \
+             editor selects in whole octets, the others character by character.",
             "",
-            "Ctrl+V pastes the system clipboard. What arrives is rarely hex, so it is read in \
-             three steps: text that is nothing but hex digits (spacing ignored) is taken as \
-             hex; failing that, text that decodes as base64 — a blob copied out of a PEM file, \
-             say — is decoded; failing that, the bytes themselves are converted to hex. The \
-             status line says which of the three was used, because the same input can mean \
-             very different bytes under each. Pasted digits are shown on a yellow background \
-             until you select something or leave the editor.",
+            "Ctrl+C copies the selection and Ctrl+X cuts it. The hex editor puts its octets on \
+             the clipboard as hex text, so they can be pasted back — or into anything else — \
+             and still read as octets. A cut removes nothing if the clipboard could not be \
+             written, so a failed cut cannot lose the data.",
             "",
-            "A terminal program has no clipboard of its own, so Ctrl+V asks whichever helper \
-             the system provides: wl-paste, xclip, xsel or pbpaste on Unix-like systems, \
-             PowerShell's Get-Clipboard on Windows. Where none can be run the editor says so; \
-             the terminal's own paste, usually Ctrl+Shift+V, arrives by a different route and \
-             is read exactly the same way.",
+            "Ctrl+Z steps back one change at a time: one keystroke, or one whole paste. \
+             Whatever an undo brings back is marked as newly added, just as if it had been \
+             typed.",
+            "",
+            "Ctrl+V pastes the system clipboard. In a text field the characters go in as they \
+             are. In the hex editor what arrives is rarely hex, so it is read in three steps: \
+             text that is nothing but hex digits (spacing ignored) is taken as hex; failing \
+             that, text that decodes as base64 — a blob copied out of a PEM file, say — is \
+             decoded; failing that, the bytes themselves are converted to hex. The status line \
+             says which of the three was used, because the same input can mean very different \
+             bytes under each.",
+            "",
+            "Newly added content — typed, pasted or restored by an undo — is shown on a yellow \
+             background until you select something or leave the editor.",
+            "",
+            "A terminal program has no clipboard of its own, so Ctrl+C, Ctrl+X and Ctrl+V ask \
+             whichever helper the system provides: wl-copy/wl-paste, xclip, xsel or \
+             pbcopy/pbpaste on Unix-like systems, clip and PowerShell's Get-Clipboard on \
+             Windows. Where none can be run the editor says so; the terminal's own paste, \
+             usually Ctrl+Shift+V, arrives by a different route and is read exactly the same \
+             way.",
             "",
             "Editing a certificate's subjectPublicKeyInfo with 'e' opens the re-keying \
              dialog instead — see \"Signatures and keys\".",
@@ -1260,11 +1485,14 @@ pub const HELP_TOPICS: &[HelpTopic] = &[
             "  z                     decrypt, or re-sign",
             "  /                     search the files' contents",
             "",
-            "Hex editor:",
-            "  Shift+← → ↑ ↓         select digits (Shift+Home/End to an end)",
+            "Value editors:",
+            "  Shift+← → ↑ ↓         select (octets in hex, characters elsewhere)",
+            "  Shift+Home, Shift+End select to the start / to the end",
             "  Ctrl+A                select everything",
-            "  Ctrl+V                paste the clipboard (read as hex, base64 or raw bytes)",
-            "  Delete, Backspace     remove the selection, else one digit",
+            "  Ctrl+C  Ctrl+X        copy / cut the selection",
+            "  Ctrl+V                paste (in hex: read as hex, base64 or raw bytes)",
+            "  Ctrl+Z                undo one change",
+            "  Delete, Backspace     remove the selection, else one item",
             "",
             "Structure pane:",
             "  ↑ ↓ k j               move, PageUp/PageDown by fifteen, Home/g End/G to ends",
@@ -5680,20 +5908,12 @@ impl App {
     }
 
     /// Text arriving as a bracketed paste (the terminal's own paste, usually
-    /// Ctrl+Shift+V). In the hex editor it goes through the same
-    /// interpretation as Ctrl+V; the other editors take it as the characters
-    /// it is.
+    /// Ctrl+Shift+V) — read exactly as Ctrl+V reads the clipboard.
     pub fn paste_into_editor(&mut self, text: &str) {
-        if matches!(self.mode, Mode::Edit(EditState { editor: Editor::Hex(_), .. })) {
-            self.paste_bytes(text.as_bytes());
-            return;
-        }
-        if let Mode::Edit(ref mut edit) = self.mode {
-            edit.editor.paste(text);
-        }
+        self.paste_bytes(text.as_bytes());
     }
 
-    /// Ctrl+V in the hex editor: read the system clipboard and paste it.
+    /// Ctrl+V: read the system clipboard and paste it into the open editor.
     pub fn paste_from_clipboard(&mut self) {
         match clipboard::read() {
             Ok(data) => self.paste_bytes(&data),
@@ -5701,45 +5921,146 @@ impl App {
         }
     }
 
-    /// Paste `data` into the hex editor, reading it as hex, base64 or raw
-    /// bytes ([`clipboard::hex_digits`]) and saying in the status line which
-    /// reading was used — the three can produce very different bytes from the
-    /// same input, so the choice must not be silent.
+    /// Paste `data` into the open editor, replacing the selection if there is
+    /// one.
+    ///
+    /// The hex editor reads it as hex, base64 or raw bytes
+    /// ([`clipboard::hex_digits`]) and says which reading was used — the three
+    /// can produce very different bytes from the same input, so the choice
+    /// must not be silent. A text editor takes the characters as they are;
+    /// there is nothing to guess.
     fn paste_bytes(&mut self, data: &[u8]) {
-        let (digits, kind) = clipboard::hex_digits(data);
-        if digits.is_empty() {
-            self.status = "nothing to paste".to_string();
-            return;
-        }
         let Mode::Edit(ref mut edit) = self.mode else { return };
-        let Editor::Hex(ref mut hex) = edit.editor else { return };
-        let replaced = hex.selection().map(|(start, end)| (end - start).div_ceil(2));
-        hex.insert_digits(&digits);
-        let octets = digits.len().div_ceil(2);
-        self.status = match replaced {
-            Some(n) => format!(
-                "pasted {} octet{} over {} ({})",
-                octets,
-                if octets == 1 { "" } else { "s" },
-                n,
-                kind.describe()
-            ),
-            None => format!(
-                "pasted {} octet{} ({})",
-                octets,
-                if octets == 1 { "" } else { "s" },
-                kind.describe()
-            ),
+        self.status = match edit.editor {
+            Editor::Hex(ref mut hex) => {
+                let (digits, kind) = clipboard::hex_digits(data);
+                if digits.is_empty() {
+                    self.status = "nothing to paste".to_string();
+                    return;
+                }
+                let replaced = hex.selection().map(|(start, end)| (end - start).div_ceil(2));
+                hex.insert_digits(&digits);
+                let octets = digits.len().div_ceil(2);
+                format!(
+                    "pasted {} octet{}{} ({})",
+                    octets,
+                    if octets == 1 { "" } else { "s" },
+                    over(replaced, "octet"),
+                    kind.describe()
+                )
+            }
+            Editor::Text(ref mut text) => {
+                let Ok(pasted) = std::str::from_utf8(data) else {
+                    self.status = "the clipboard does not hold text".to_string();
+                    return;
+                };
+                let replaced = text.selection().map(|(start, end)| end - start);
+                let before = text.buf.len();
+                text.insert_text(pasted);
+                let chars = text.buf.len() + replaced.unwrap_or(0) - before;
+                if chars == 0 {
+                    self.status = "nothing to paste".to_string();
+                    return;
+                }
+                format!(
+                    "pasted {} character{}{}",
+                    chars,
+                    if chars == 1 { "" } else { "s" },
+                    over(replaced, "character")
+                )
+            }
+            Editor::DateTime(_) => return,
         };
     }
 
-    /// Ctrl+A in the hex editor.
+    /// Ctrl+A: select the whole value being edited.
     pub fn select_all_in_editor(&mut self) {
-        if let Mode::Edit(EditState { editor: Editor::Hex(ref mut hex), .. }) = self.mode {
-            hex.select_all();
-            let octets = hex.digits.len().div_ceil(2);
-            self.status = format!("{} octet{} selected", octets, if octets == 1 { "" } else { "s" });
+        let Mode::Edit(ref mut edit) = self.mode else { return };
+        self.status = match edit.editor {
+            Editor::Hex(ref mut hex) => {
+                hex.select_all();
+                let octets = hex.digits.len().div_ceil(2);
+                format!("{} octet{} selected", octets, if octets == 1 { "" } else { "s" })
+            }
+            Editor::Text(ref mut text) => {
+                text.select_all();
+                let chars = text.buf.len();
+                format!("{} character{} selected", chars, if chars == 1 { "" } else { "s" })
+            }
+            Editor::DateTime(_) => return,
+        };
+    }
+
+    /// Ctrl+C: put the selection on the clipboard. The hex editor copies its
+    /// octets as hex text so they can be pasted back (or into anything else)
+    /// and still read as hex; a text editor copies the characters themselves.
+    pub fn copy_selection(&mut self) {
+        let Some((text, what)) = self.selection_for_clipboard() else {
+            self.status = "nothing selected to copy".to_string();
+            return;
+        };
+        self.status = match clipboard::write(&text) {
+            Ok(()) => format!("copied {}", what),
+            Err(reason) => reason,
+        };
+    }
+
+    /// Ctrl+X: copy the selection, then remove it. Nothing is removed if the
+    /// clipboard could not be written — a cut that lost the data would be
+    /// unrecoverable.
+    pub fn cut_selection(&mut self) {
+        let Some((text, what)) = self.selection_for_clipboard() else {
+            self.status = "nothing selected to cut".to_string();
+            return;
+        };
+        if let Err(reason) = clipboard::write(&text) {
+            self.status = format!("{} — nothing was removed", reason);
+            return;
         }
+        if let Mode::Edit(ref mut edit) = self.mode {
+            match edit.editor {
+                Editor::Hex(ref mut hex) => {
+                    hex.delete_selection();
+                }
+                Editor::Text(ref mut text) => {
+                    text.sel.delete_selection(&mut text.buf, &mut text.cursor);
+                }
+                Editor::DateTime(_) => {}
+            }
+        }
+        self.status = format!("cut {}", what);
+    }
+
+    /// The selection as clipboard text, with wording for the status line.
+    fn selection_for_clipboard(&self) -> Option<(String, String)> {
+        let Mode::Edit(ref edit) = self.mode else { return None };
+        match edit.editor {
+            Editor::Hex(ref hex) => {
+                let text = hex.selected_hex()?;
+                let (start, end) = hex.selection()?;
+                let octets = (end - start).div_ceil(2);
+                Some((text, format!("{} octet{}", octets, if octets == 1 { "" } else { "s" })))
+            }
+            Editor::Text(ref text) => {
+                let selected = text.selected_text()?;
+                let chars = selected.chars().count();
+                Some((selected, format!("{} character{}", chars, if chars == 1 { "" } else { "s" })))
+            }
+            Editor::DateTime(_) => None,
+        }
+    }
+
+    /// Ctrl+Z: step back one change. Whatever the undo put back is marked as
+    /// newly added, exactly as if it had just been typed or pasted.
+    pub fn undo_edit(&mut self) {
+        let Mode::Edit(ref mut edit) = self.mode else { return };
+        let undone = match edit.editor {
+            Editor::Hex(ref mut hex) => hex.sel.undo(&mut hex.digits, &mut hex.cursor),
+            Editor::Text(ref mut text) => text.sel.undo(&mut text.buf, &mut text.cursor),
+            Editor::DateTime(_) => false,
+        };
+        self.status =
+            if undone { "undid the last change".to_string() } else { "nothing to undo".to_string() };
     }
 
     pub fn commit_edit(&mut self) {
@@ -6189,6 +6510,15 @@ fn unused_path(dir: &Path, stem: &str, ext: &str) -> PathBuf {
         .map(|n| dir.join(format!("{}-{}.{}", stem, n, ext)))
         .find(|p| !p.exists())
         .expect("an unused name exists in an unbounded sequence")
+}
+
+/// The `" over N units"` a paste's status line adds when it replaced a
+/// selection, and nothing when it did not.
+fn over(replaced: Option<usize>, unit: &str) -> String {
+    match replaced {
+        Some(n) => format!(" over {} {}{}", n, unit, if n == 1 { "" } else { "s" }),
+        None => String::new(),
+    }
 }
 
 /// Create `path` as an empty file, failing if anything already occupies it.
@@ -8379,33 +8709,43 @@ mod tests {
     }
 
     #[test]
-    fn shift_arrows_select_digits_which_delete_removes() {
+    fn shift_arrows_select_whole_octets_which_delete_removes() {
         let mut app = hex_editor_app(&[0x11, 0x22, 0x33]);
         {
             let Mode::Edit(ref mut edit) = app.mode else { panic!() };
-            // Nothing is selected until Shift is held.
-            edit.editor.move_horizontal(2, false);
+            // Plain movement stays digit-wise and selects nothing.
+            edit.editor.move_horizontal(3, false);
             assert!(hex_state(&app).selection().is_none());
+            assert_eq!(hex_state(&app).cursor, 3, "the cursor sits inside the second octet");
+            // Shift selects by octet, and from mid-octet it takes the whole
+            // one the cursor is inside rather than half of it.
             let Mode::Edit(ref mut edit) = app.mode else { panic!() };
-            edit.editor.move_horizontal(2, true); // select "22"
+            edit.editor.move_horizontal(1, true);
         }
-        assert_eq!(hex_state(&app).selection(), Some((2, 4)));
-        assert!(hex_state(&app).is_selected(2) && hex_state(&app).is_selected(3));
-        assert!(!hex_state(&app).is_selected(4));
-
-        // Moving without Shift drops the selection rather than extending it.
+        assert_eq!(hex_state(&app).selection(), Some((2, 4)), "one whole octet");
         {
+            // Extending takes the next whole octet.
+            let Mode::Edit(ref mut edit) = app.mode else { panic!() };
+            edit.editor.move_horizontal(1, true);
+            assert_eq!(hex_state(&app).selection(), Some((2, 6)));
+            // And shrinks back the same way.
             let Mode::Edit(ref mut edit) = app.mode else { panic!() };
             edit.editor.move_horizontal(-1, true);
-            assert_eq!(hex_state(&app).selection(), Some((2, 3)));
+            assert_eq!(hex_state(&app).selection(), Some((2, 4)));
+            // Moving without Shift drops the selection rather than extending.
             let Mode::Edit(ref mut edit) = app.mode else { panic!() };
             edit.editor.move_horizontal(1, false);
             assert!(hex_state(&app).selection().is_none());
-            // Select the middle octet again and delete it.
+        }
+
+        // Selecting leftwards from mid-octet also takes the whole octet.
+        let mut app = hex_editor_app(&[0x11, 0x22, 0x33]);
+        {
             let Mode::Edit(ref mut edit) = app.mode else { panic!() };
-            edit.editor.move_horizontal(-2, false);
+            edit.editor.move_horizontal(3, false);
             let Mode::Edit(ref mut edit) = app.mode else { panic!() };
-            edit.editor.move_horizontal(2, true);
+            edit.editor.move_horizontal(-1, true);
+            assert_eq!(hex_state(&app).selection(), Some((2, 4)));
             let Mode::Edit(ref mut edit) = app.mode else { panic!() };
             edit.editor.delete();
         }
@@ -8439,25 +8779,26 @@ mod tests {
         }
         app.paste_into_editor("AA BB");
         assert_eq!(hex_state(&app).digits.iter().collect::<String>(), "11AABB22");
-        assert_eq!(hex_state(&app).pasted, Some((2, 6)), "what arrived is marked");
-        assert!(hex_state(&app).is_pasted(2) && hex_state(&app).is_pasted(5));
-        assert!(!hex_state(&app).is_pasted(1) && !hex_state(&app).is_pasted(6));
+        assert_eq!(hex_state(&app).sel.fresh, Some((2, 6)), "what arrived is marked");
+        assert!(hex_state(&app).is_fresh(2) && hex_state(&app).is_fresh(5));
+        assert!(!hex_state(&app).is_fresh(1) && !hex_state(&app).is_fresh(6));
 
         // Moving about — even typing — leaves the marking; selecting ends it.
         {
             let Mode::Edit(ref mut edit) = app.mode else { panic!() };
             edit.editor.move_horizontal(-1, false);
-            assert!(hex_state(&app).pasted.is_some());
+            assert!(hex_state(&app).sel.fresh.is_some(), "plain movement keeps the marking");
             let Mode::Edit(ref mut edit) = app.mode else { panic!() };
             edit.editor.move_horizontal(1, true);
         }
-        assert_eq!(hex_state(&app).pasted, None, "selecting ends the marking");
+        assert_eq!(hex_state(&app).sel.fresh, None, "selecting ends the marking");
 
-        // A second paste marks only the newest arrival.
+        // Consecutive additions join into one run, so a typed or pasted
+        // sequence reads as one block rather than only its last piece.
         let mut app = hex_editor_app(&[]);
         app.paste_into_editor("AA");
         app.paste_into_editor("BB");
-        assert_eq!(hex_state(&app).pasted, Some((2, 4)));
+        assert_eq!(hex_state(&app).sel.fresh, Some((0, 4)));
         // And leaving the editor drops it with the rest of the state.
         app.cancel_edit();
         assert!(matches!(app.mode, Mode::Browse));
@@ -8482,6 +8823,164 @@ mod tests {
             edit.editor.backspace();
         }
         assert!(hex_state(&app).digits.is_empty());
+    }
+
+    #[test]
+    fn typed_octets_are_marked_as_new_just_as_pasted_ones_are() {
+        let mut app = hex_editor_app(&[0x11]);
+        {
+            let Mode::Edit(ref mut edit) = app.mode else { panic!() };
+            edit.editor.end(false);
+            let Mode::Edit(ref mut edit) = app.mode else { panic!() };
+            edit.editor.insert_char('a');
+            assert_eq!(hex_state(&app).sel.fresh, Some((2, 3)), "one typed digit is new");
+            let Mode::Edit(ref mut edit) = app.mode else { panic!() };
+            edit.editor.insert_char('b');
+        }
+        // A typed run reads as one block, not just its last digit.
+        assert_eq!(hex_state(&app).sel.fresh, Some((2, 4)));
+        assert_eq!(hex_state(&app).digits.iter().collect::<String>(), "11AB");
+        // And selecting ends the marking, as it does for a paste.
+        {
+            let Mode::Edit(ref mut edit) = app.mode else { panic!() };
+            edit.editor.move_horizontal(-1, true);
+        }
+        assert_eq!(hex_state(&app).sel.fresh, None);
+    }
+
+    #[test]
+    fn undo_steps_back_and_marks_what_it_brought_back_as_new() {
+        let mut app = hex_editor_app(&[0x11, 0x22]);
+        app.select_all_in_editor();
+        {
+            let Mode::Edit(ref mut edit) = app.mode else { panic!() };
+            edit.editor.delete(); // the whole value goes
+        }
+        assert!(hex_state(&app).digits.is_empty());
+
+        app.undo_edit();
+        assert!(app.status.contains("undid"), "{}", app.status);
+        assert_eq!(hex_state(&app).digits.iter().collect::<String>(), "1122");
+        // What came back is marked exactly as if it had just been added.
+        assert_eq!(hex_state(&app).sel.fresh, Some((0, 4)));
+        assert!(hex_state(&app).is_fresh(0) && hex_state(&app).is_fresh(3));
+        assert!(hex_state(&app).selection().is_none(), "an undo leaves nothing selected");
+
+        // Undo walks back one change at a time, and stops when it runs out.
+        let mut app = hex_editor_app(&[]);
+        {
+            let Mode::Edit(ref mut edit) = app.mode else { panic!() };
+            edit.editor.insert_char('A');
+            let Mode::Edit(ref mut edit) = app.mode else { panic!() };
+            edit.editor.insert_char('B');
+        }
+        app.undo_edit();
+        assert_eq!(hex_state(&app).digits.iter().collect::<String>(), "A");
+        app.undo_edit();
+        assert!(hex_state(&app).digits.is_empty());
+        app.undo_edit();
+        assert_eq!(app.status, "nothing to undo");
+
+        // A paste is one step, however much it brought in.
+        let mut app = hex_editor_app(&[0xFF]);
+        app.paste_into_editor("00 11 22");
+        assert_eq!(hex_state(&app).digits.iter().collect::<String>(), "001122FF");
+        app.undo_edit();
+        assert_eq!(hex_state(&app).digits.iter().collect::<String>(), "FF");
+        assert_eq!(hex_state(&app).sel.fresh, None, "an undo that only removed marks nothing");
+    }
+
+    /// Copy and cut go through the system clipboard, which the machine
+    /// running the tests may not have; what can be checked without one is
+    /// that a cut only removes when the write succeeded, and that nothing
+    /// selected is reported rather than silently ignored.
+    #[test]
+    fn cutting_nothing_is_reported_and_a_failed_write_removes_nothing() {
+        let mut app = hex_editor_app(&[0x11, 0x22]);
+        app.copy_selection();
+        assert_eq!(app.status, "nothing selected to copy");
+        app.cut_selection();
+        assert_eq!(app.status, "nothing selected to cut");
+        assert_eq!(hex_state(&app).digits.iter().collect::<String>(), "1122");
+
+        app.select_all_in_editor();
+        app.cut_selection();
+        // Either the clipboard took it and the octets are gone, or it did not
+        // and they are all still there — never half of each.
+        let left = hex_state(&app).digits.iter().collect::<String>();
+        if app.status.starts_with("cut ") {
+            assert!(left.is_empty(), "a successful cut removes the selection");
+        } else {
+            assert_eq!(left, "1122", "a failed cut must not lose the data");
+            assert!(app.status.contains("nothing was removed"), "{}", app.status);
+        }
+    }
+
+    #[test]
+    fn the_hex_selection_reaches_the_clipboard_as_readable_hex() {
+        let mut app = hex_editor_app(&[0xDE, 0xAD, 0xBE, 0xEF]);
+        {
+            let Mode::Edit(ref mut edit) = app.mode else { panic!() };
+            edit.editor.move_horizontal(2, true); // the first two octets
+        }
+        let Mode::Edit(EditState { editor: Editor::Hex(ref hex), .. }) = app.mode else { panic!() };
+        assert_eq!(hex.selected_hex().as_deref(), Some("DE AD"));
+        // What it produces reads back as hex, so it round-trips.
+        assert_eq!(crate::clipboard::hex_digits(b"DE AD").0, "DEAD");
+    }
+
+    /// The text editors — integer, OID, string, base64 — get the same
+    /// selection, paste, undo and marking as the hex editor, over characters.
+    #[test]
+    fn the_text_editors_select_paste_and_undo_over_characters() {
+        // 'e' on an INTEGER opens the decimal editor.
+        let data = [0x02, 0x02, 0x04, 0xD2]; // INTEGER 1234
+        let mut app = test_app(&data);
+        app.edit_selected();
+        fn text(app: &App) -> &TextEditor {
+            let Mode::Edit(EditState { editor: Editor::Text(ref t), .. }) = app.mode else {
+                panic!("no text editor open")
+            };
+            t
+        }
+        assert_eq!(text(&app).buf.iter().collect::<String>(), "1234");
+
+        // Ctrl+A selects the lot, and a paste replaces it.
+        app.select_all_in_editor();
+        assert!(app.status.contains("4 characters selected"), "{}", app.status);
+        assert_eq!(text(&app).selection(), Some((0, 4)));
+        app.paste_into_editor("99");
+        assert!(app.status.contains("pasted 2 characters over 4"), "{}", app.status);
+        assert_eq!(text(&app).buf.iter().collect::<String>(), "99");
+        // What arrived is marked as new, and selecting ends the marking.
+        assert_eq!(text(&app).sel.fresh, Some((0, 2)));
+        assert!(text(&app).is_fresh(0));
+        {
+            let Mode::Edit(ref mut edit) = app.mode else { panic!() };
+            edit.editor.move_horizontal(-1, true);
+        }
+        assert_eq!(text(&app).selection(), Some((1, 2)), "characters select one at a time");
+        assert_eq!(text(&app).sel.fresh, None);
+
+        // Undo walks back the paste, restoring what it replaced.
+        app.undo_edit();
+        assert_eq!(text(&app).buf.iter().collect::<String>(), "1234");
+        app.commit_edit();
+        assert_eq!(ber::encode_forest(&app.roots), data, "the undone edit is the original");
+    }
+
+    #[test]
+    fn a_pasted_oid_replaces_the_selected_arcs() {
+        // 'e' on an OID opens the dot-notation editor.
+        let data = [0x06, 0x03, 0x55, 0x04, 0x03]; // 2.5.4.3
+        let mut app = test_app(&data);
+        app.edit_selected();
+        app.select_all_in_editor();
+        app.paste_into_editor("1.2.840.113549.1.1.11");
+        assert!(app.status.contains("pasted 21 characters over 7"), "{}", app.status);
+        app.commit_edit();
+        let roots = &app.roots;
+        assert_eq!(ber::oid_arcs(&roots[0].value).unwrap(), [1, 2, 840, 113549, 1, 1, 11]);
     }
 
     #[test]
