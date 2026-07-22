@@ -20,7 +20,8 @@ use std::time::{Duration, Instant};
 
 use ratatui::crossterm::event::{
     self, DisableBracketedPaste, EnableBracketedPaste, Event, KeyCode, KeyEvent, KeyEventKind,
-    KeyModifiers,
+    KeyModifiers, KeyboardEnhancementFlags, ModifierKeyCode, PopKeyboardEnhancementFlags,
+    PushKeyboardEnhancementFlags,
 };
 use ratatui::crossterm::execute;
 use ratatui::layout::{Constraint, Layout, Rect};
@@ -32,7 +33,7 @@ use ratatui::{DefaultTerminal, Frame};
 use crate::app::{
     App, DateTimeEditor, EditKind, EditState, Editor, FilterMatcher, Focus, HexEditor, Mode,
     HssPicker, PickerTarget, PubKeyState, RowSource, TextEditor, TextFormat, DATE_FIELDS, EDIT_BYTES_PER_LINE,
-    EDIT_DIGITS_PER_LINE, PICKER_CLASSES, PICKER_UNIVERSAL,
+    EDIT_DIGITS_PER_LINE, HELP_TOPICS, PICKER_CLASSES, PICKER_UNIVERSAL, TOP_MENUS,
 };
 use crate::x509::{self, basic_constraints, extended_key_usage, key_usage};
 use crate::browser::FileStatus;
@@ -65,7 +66,22 @@ pub fn run(mut app: App) -> io::Result<()> {
     let mut terminal = ratatui::init();
     // Bracketed paste lets clipboard content reach the value editors.
     let _ = execute!(std::io::stdout(), EnableBracketedPaste);
+    // A bare Alt press — the menu bar's toggle — only reaches a program on
+    // terminals that speak the kitty keyboard protocol, and only once all keys
+    // are asked for as escape codes. Where that is unsupported the request is
+    // simply not made and F10 / Alt+M serve instead (see [`is_menu_toggle`]).
+    let enhanced =
+        matches!(ratatui::crossterm::terminal::supports_keyboard_enhancement(), Ok(true));
+    if enhanced {
+        let _ = execute!(
+            std::io::stdout(),
+            PushKeyboardEnhancementFlags(KeyboardEnhancementFlags::REPORT_ALL_KEYS_AS_ESCAPE_CODES)
+        );
+    }
     let result = event_loop(&mut terminal, &mut app);
+    if enhanced {
+        let _ = execute!(std::io::stdout(), PopKeyboardEnhancementFlags);
+    }
     let _ = execute!(std::io::stdout(), DisableBracketedPaste);
     ratatui::restore();
     result
@@ -119,7 +135,18 @@ fn event_loop(terminal: &mut DefaultTerminal, app: &mut App) -> io::Result<()> {
         if key.kind != KeyEventKind::Press {
             continue;
         }
+        // The menu bar's toggle is handled before the modes, so that the same
+        // key both opens and closes it. It is offered only while browsing (or
+        // with the bar already open): pressing it inside a dialog or an editor
+        // would discard work in progress.
+        if is_menu_toggle(key) && matches!(app.mode, Mode::Browse | Mode::MenuBar(_)) {
+            app.toggle_menu_bar();
+            continue;
+        }
         match app.mode {
+            Mode::MenuBar(_) => handle_menu_bar_key(app, key),
+            Mode::Help(_) => handle_help_key(app, key),
+            Mode::NewFile(_) => handle_new_file_key(app, key),
             Mode::Edit(_) => handle_edit_key(app, key),
             Mode::TypePicker(_) => handle_picker_key(app, key),
             Mode::EditMenu(_) => handle_menu_key(app, key),
@@ -154,6 +181,76 @@ fn event_loop(terminal: &mut DefaultTerminal, app: &mut App) -> io::Result<()> {
                 }
             }
         }
+    }
+}
+
+/// Whether `key` asks for the menu bar to be shown or hidden.
+///
+/// The Alt key itself is the documented toggle, but a bare modifier press only
+/// reaches a program on terminals implementing the kitty keyboard protocol
+/// (and only with the enhancement `run` asks for). F10 — the menu key of
+/// terminal applications since long before that protocol — and Alt+M work
+/// everywhere, so the feature is never out of reach.
+fn is_menu_toggle(key: KeyEvent) -> bool {
+    matches!(
+        key.code,
+        KeyCode::Modifier(ModifierKeyCode::LeftAlt | ModifierKeyCode::RightAlt) | KeyCode::F(10)
+    ) || (key.code == KeyCode::Char('m') && key.modifiers.contains(KeyModifiers::ALT))
+}
+
+/// The menu bar has the keyboard focus while it is shown: ←→ pick a heading,
+/// ↑↓ an entry of its drop-down, Enter runs it and Esc closes the bar.
+fn handle_menu_bar_key(app: &mut App, key: KeyEvent) {
+    let Mode::MenuBar(ref mut bar) = app.mode else { return };
+    match key.code {
+        KeyCode::Left => bar.move_menu(-1),
+        KeyCode::Right => bar.move_menu(1),
+        KeyCode::Up => bar.move_item(-1),
+        KeyCode::Down => bar.move_item(1),
+        KeyCode::Enter | KeyCode::Char(' ') => app.activate_menu_entry(),
+        KeyCode::Esc => app.toggle_menu_bar(),
+        _ => {}
+    }
+}
+
+/// The help window: ↑↓ choose a topic, PageUp/PageDown (or `[` / `]`) scroll
+/// the chosen topic's text, Esc closes.
+fn handle_help_key(app: &mut App, key: KeyEvent) {
+    let Mode::Help(ref mut help) = app.mode else { return };
+    match key.code {
+        KeyCode::Up | KeyCode::Char('k') => help.move_topic(-1),
+        KeyCode::Down | KeyCode::Char('j') => help.move_topic(1),
+        KeyCode::PageUp | KeyCode::Char('[') => help.scroll_body(-8),
+        KeyCode::PageDown | KeyCode::Char(']') => help.scroll_body(8),
+        KeyCode::Home => help.scroll = 0,
+        KeyCode::End => help.scroll = usize::MAX,
+        KeyCode::Esc | KeyCode::Enter | KeyCode::Char('q') => app.close_help(),
+        _ => {}
+    }
+}
+
+/// The new-file dialog: type a path, Enter creates it, Esc abandons it.
+fn handle_new_file_key(app: &mut App, key: KeyEvent) {
+    match key.code {
+        KeyCode::Esc => {
+            app.cancel_new_der();
+            return;
+        }
+        KeyCode::Enter => {
+            app.commit_new_der();
+            return;
+        }
+        _ => {}
+    }
+    let Mode::NewFile(ref mut state) = app.mode else { return };
+    match key.code {
+        KeyCode::Char(c) => state.insert_char(c),
+        KeyCode::Backspace => state.backspace(),
+        KeyCode::Left => state.move_cursor(-1),
+        KeyCode::Right => state.move_cursor(1),
+        KeyCode::Home => state.move_cursor(isize::MIN),
+        KeyCode::End => state.move_cursor(isize::MAX),
+        _ => {}
     }
 }
 
@@ -437,8 +534,17 @@ fn handle_edit_key(app: &mut App, key: KeyEvent) {
 }
 
 fn draw(frame: &mut Frame, app: &mut App) {
+    // The menu bar takes the top row only while it is shown, so the panes get
+    // the full height the rest of the time.
+    let (menu_bar, body) = if matches!(app.mode, Mode::MenuBar(_)) {
+        let [bar, body] =
+            Layout::vertical([Constraint::Length(1), Constraint::Min(3)]).areas(frame.area());
+        (Some(bar), body)
+    } else {
+        (None, frame.area())
+    };
     let [main, status] =
-        Layout::vertical([Constraint::Min(3), Constraint::Length(1)]).areas(frame.area());
+        Layout::vertical([Constraint::Min(3), Constraint::Length(1)]).areas(body);
     if app.single_file {
         // No browser pane: give the structure and content panes the full width.
         let [tree, content] =
@@ -501,6 +607,223 @@ fn draw(frame: &mut Frame, app: &mut App) {
     if matches!(app.mode, Mode::Progress(_)) {
         draw_progress(frame, app, main);
     }
+    if matches!(app.mode, Mode::Help(_)) {
+        draw_help(frame, app, main);
+    }
+    if matches!(app.mode, Mode::NewFile(_)) {
+        draw_new_file(frame, app, main);
+    }
+    // Last, so the open drop-down covers the panes beneath it.
+    if let Some(bar) = menu_bar {
+        draw_menu_bar(frame, app, bar, main);
+    }
+}
+
+/// Colour of the menu bar and of the borders of what it opens.
+const MENU_COLOR: Color = Color::LightCyan;
+
+/// The "new file" dialog of the menu's "File ▸ New DER" entry: the directory a
+/// relative name resolves against, the path field with its cursor, and — after
+/// a refused attempt — why the file could not be created.
+fn draw_new_file(frame: &mut Frame, app: &App, area: Rect) {
+    let Mode::NewFile(ref state) = app.mode else { return };
+    let width = area.width.saturating_sub(4).clamp(30, 84);
+    let inner_w = width.saturating_sub(2) as usize;
+
+    let mut lines = vec![
+        Line::from(vec![
+            Span::styled("Directory  ", Style::new().dim()),
+            Span::styled(app.new_file_dir().display().to_string(), Style::new().dim()),
+        ]),
+        Line::default(),
+    ];
+    // The cursor is a reversed cell within the text, or a reversed space when
+    // it sits past its end.
+    let mut field = vec![Span::styled("File       ", Style::new().bold())];
+    let cursor = Style::new().add_modifier(Modifier::REVERSED);
+    let chars: Vec<char> = state.path.chars().collect();
+    field.push(Span::raw(chars[..state.cursor.min(chars.len())].iter().collect::<String>()));
+    match chars.get(state.cursor) {
+        Some(&c) => {
+            field.push(Span::styled(c.to_string(), cursor));
+            field.push(Span::raw(chars[state.cursor + 1..].iter().collect::<String>()));
+        }
+        None => field.push(Span::styled(" ", cursor)),
+    }
+    lines.push(Line::from(field));
+    lines.push(Line::default());
+    if let Some(error) = &state.error {
+        for chunk in wrap_text(error, inner_w) {
+            lines.push(Line::from(Span::styled(chunk, Style::new().fg(Color::Red).bold())));
+        }
+        lines.push(Line::default());
+    }
+    let hint = "A relative name is created in the directory above; an absolute path is used as \
+                it stands. The file is created empty — 'i' then inserts its first element.";
+    for chunk in wrap_text(hint, inner_w) {
+        lines.push(Line::from(Span::styled(chunk, Style::new().dim())));
+    }
+
+    let height = (lines.len() as u16 + 2).min(area.height);
+    let popup = Rect {
+        x: area.x + (area.width.saturating_sub(width)) / 2,
+        y: area.y + (area.height.saturating_sub(height)) / 2,
+        width,
+        height,
+    };
+    frame.render_widget(Clear, popup);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::new().fg(MENU_COLOR))
+        .title(" NEW DER FILE ")
+        .title_bottom(" ⏎ create   Esc cancel ");
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+/// The menu bar in the top row, plus the drop-down of the open heading. The
+/// drop-down is drawn into `below` — the area the panes occupy — starting
+/// under its heading, so it reads as hanging from the bar.
+fn draw_menu_bar(frame: &mut Frame, app: &App, bar: Rect, below: Rect) {
+    let Mode::MenuBar(ref state) = app.mode else { return };
+
+    // Lay the headings out left to right, remembering where the open one
+    // starts so the drop-down can be aligned under it.
+    let mut spans = vec![Span::raw(" ")];
+    let mut column = 1u16;
+    let mut open_at = 0u16;
+    for (i, menu) in TOP_MENUS.iter().enumerate() {
+        let label = format!(" {} ", menu.label);
+        if i == state.menu {
+            open_at = column;
+        }
+        // Selection is shown the way the rest of the interface shows it —
+        // reversed — rather than with a fixed background, which would clash
+        // with one terminal theme or the other.
+        let style = if i == state.menu {
+            Style::new().add_modifier(Modifier::REVERSED).bold()
+        } else {
+            Style::new().fg(MENU_COLOR).bold()
+        };
+        column += label.chars().count() as u16;
+        spans.push(Span::styled(label, style));
+        spans.push(Span::raw(" "));
+        column += 1;
+    }
+    spans.push(Span::styled("  ←→ menu  ↑↓ entry  ⏎ run  Esc close", Style::new().dim()));
+    frame.render_widget(Paragraph::new(Line::from(spans)), bar);
+
+    // The drop-down: one row per entry, sized to the widest label + summary.
+    let menu = &TOP_MENUS[state.menu];
+    let label_w = menu.items.iter().map(|i| i.label.chars().count()).max().unwrap_or(0);
+    let width = menu
+        .items
+        .iter()
+        .map(|i| label_w + i.desc.chars().count() + 6)
+        .max()
+        .unwrap_or(20) as u16;
+    let width = width.min(below.width);
+    let height = (menu.items.len() as u16 + 2).min(below.height);
+    let popup = Rect {
+        x: below.x + open_at.min(below.width.saturating_sub(width)),
+        y: below.y,
+        width,
+        height,
+    };
+    frame.render_widget(Clear, popup);
+    let block = Block::default().borders(Borders::ALL).border_style(Style::new().fg(MENU_COLOR));
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+    let lines: Vec<Line> = menu
+        .items
+        .iter()
+        .enumerate()
+        .map(|(i, entry)| {
+            let style = if i == state.item {
+                Style::new().add_modifier(Modifier::REVERSED).bold()
+            } else {
+                Style::new().bold()
+            };
+            Line::from(vec![
+                Span::styled(format!(" {:<width$} ", entry.label, width = label_w), style),
+                Span::styled(format!(" {}", entry.desc), Style::new().dim()),
+            ])
+        })
+        .collect();
+    frame.render_widget(Paragraph::new(lines), inner);
+}
+
+/// The help window: the topic list on the left, the chosen topic's text on the
+/// right. Only the visible part of the text is built, and the scroll offset is
+/// clamped here, where the window's height is known — as the content pane does.
+fn draw_help(frame: &mut Frame, app: &mut App, area: Rect) {
+    let Mode::Help(ref state) = app.mode else { return };
+    let width = area.width.saturating_sub(4).clamp(24, 110);
+    let height = area.height.saturating_sub(2).max(6);
+    let popup = Rect {
+        x: area.x + (area.width.saturating_sub(width)) / 2,
+        y: area.y + (area.height.saturating_sub(height)) / 2,
+        width,
+        height,
+    };
+    frame.render_widget(Clear, popup);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::new().fg(MENU_COLOR))
+        .title(" HELP ")
+        .title_bottom(" ↑↓ topic   PgUp/PgDn or [ ] scroll   Esc close ");
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    let topics_w = (HELP_TOPICS.iter().map(|t| t.title.chars().count()).max().unwrap_or(10) + 3)
+        .min(inner.width as usize / 2) as u16;
+    let [list, text] =
+        Layout::horizontal([Constraint::Length(topics_w), Constraint::Min(10)]).areas(inner);
+    let items: Vec<ListItem> = HELP_TOPICS
+        .iter()
+        .enumerate()
+        .map(|(i, topic)| {
+            let style = if i == state.topic {
+                Style::new().add_modifier(Modifier::REVERSED).bold()
+            } else {
+                Style::new()
+            };
+            ListItem::new(Line::from(Span::styled(format!(" {}", topic.title), style)))
+        })
+        .collect();
+    frame.render_widget(List::new(items), list);
+    frame.render_widget(
+        Block::default().borders(Borders::LEFT).border_style(Style::new().fg(MENU_COLOR)),
+        text,
+    );
+
+    // Wrap the topic's paragraphs, then show the window's worth of lines.
+    let body_w = text.width.saturating_sub(3) as usize;
+    let mut body: Vec<Line> = Vec::new();
+    for paragraph in HELP_TOPICS[state.topic].body {
+        if paragraph.is_empty() {
+            body.push(Line::default());
+            continue;
+        }
+        // Pre-formatted lines (the key-binding tables) keep their layout; only
+        // running prose is re-wrapped.
+        if paragraph.starts_with("  ") {
+            body.push(Line::from(Span::raw(paragraph.to_string())));
+            continue;
+        }
+        for chunk in wrap_text(paragraph, body_w) {
+            body.push(Line::from(Span::raw(chunk)));
+        }
+    }
+    let rows = usize::from(text.height);
+    let max_scroll = body.len().saturating_sub(rows);
+    let Mode::Help(ref mut state) = app.mode else { return };
+    state.scroll = state.scroll.min(max_scroll);
+    let first = state.scroll;
+    let view: Vec<Line> = body.drain(first..(first + rows).min(body.len())).collect();
+    let text_area = Rect { x: text.x + 2, width: text.width.saturating_sub(2), ..text };
+    frame.render_widget(Paragraph::new(view), text_area);
 }
 
 /// Centered popup shown while a background re-key runs: the operation title,
@@ -584,6 +907,18 @@ fn draw_notice(frame: &mut Frame, app: &App, area: Rect) {
     let inner_w = max_w.saturating_sub(2);
     let mut body: Vec<Line> = Vec::new();
     for msg in &n.lines {
+        // Problems are listed as red bullets; informational text (the
+        // "Version" entry) is set as plain paragraphs.
+        if !n.warning {
+            if msg.is_empty() {
+                body.push(Line::default());
+                continue;
+            }
+            for chunk in wrap_text(msg, inner_w) {
+                body.push(Line::from(Span::raw(chunk)));
+            }
+            continue;
+        }
         for (i, chunk) in wrap_text(msg, inner_w).into_iter().enumerate() {
             let bullet = if i == 0 { "• " } else { "  " };
             body.push(Line::from(vec![
@@ -606,7 +941,7 @@ fn draw_notice(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(Clear, popup);
     let block = Block::default()
         .borders(Borders::ALL)
-        .border_style(Style::new().fg(Color::Yellow))
+        .border_style(Style::new().fg(if n.warning { Color::Yellow } else { MENU_COLOR }))
         .title(n.title.clone());
     let inner = block.inner(popup);
     frame.render_widget(block, popup);
@@ -3012,14 +3347,17 @@ fn draw_status(frame: &mut Frame, app: &App, area: Rect) {
     let hints = match app.mode {
         // Single-file mode: no browser pane, no re-signing — trimmed hints.
         Mode::Browse if app.single_file => {
-            "q quit  ↑↓ move  ←→ fold  ⏎ toggle  e edit  E edit-menu  i/I insert  d delete  J/K reorder  s save  z decrypt  [ ] scroll  { } start/end"
+            "q quit  Alt+m menu  ↑↓ move  ←→ fold  ⏎ toggle  e edit  E edit-menu  i/I insert  d delete  J/K reorder  s save  z decrypt  [ ] scroll  { } start/end"
         }
         Mode::Browse if app.focus == Focus::Browser => {
-            "q quit  Tab switch pane  ↑↓ move+preview  ←→ fold  ⏎ switch to file/fold  z decrypt/re-sign  t trust"
+            "q quit  Alt+m menu  Tab switch pane  ↑↓ move+preview  ←→ fold  ⏎ switch to file/fold  z decrypt/re-sign  t trust"
         }
         Mode::Browse => {
-            "q quit  Tab switch pane  ↑↓ move  ←→ fold  ⏎ toggle  e edit  E edit-menu  i/I insert  d delete  J/K reorder  s save  z decrypt/re-sign  [ ] scroll  { } start/end"
+            "q quit  Alt+m menu  Tab switch pane  ↑↓ move  ←→ fold  ⏎ toggle  e edit  E edit-menu  i/I insert  d delete  J/K reorder  s save  z decrypt/re-sign  [ ] scroll  { } start/end"
         }
+        Mode::MenuBar(_) => "←→ menu  ↑↓ entry  ⏎ run  Esc close",
+        Mode::NewFile(_) => "type a path  ←→ cursor  ⏎ create  Esc cancel",
+        Mode::Help(_) => "↑↓ topic  PgUp/PgDn or [ ] scroll  Esc close",
         Mode::TypePicker(_) => "←→ column  ↑↓ select  0-9 tag number  ⏎ continue  Esc cancel",
         Mode::EditMenu(_) => "↑↓ or 1-5 select  ⏎ choose  Esc cancel",
         Mode::Edit(_) => "Enter apply  Esc cancel",
@@ -3988,6 +4326,274 @@ mod tests {
         app.filter_clear();
         term.draw(|f| draw(f, &mut app)).unwrap();
         assert_eq!(highlighted(&term), 0, "no highlight without a filter");
+    }
+
+    /// The three keys that reach the menu bar, and nothing else.
+    #[test]
+    fn the_menu_toggle_accepts_alt_f10_and_alt_m_only() {
+        let none = event::KeyModifiers::NONE;
+        let alt = event::KeyModifiers::ALT;
+        assert!(is_menu_toggle(KeyEvent::new(KeyCode::F(10), none)));
+        assert!(is_menu_toggle(KeyEvent::new(KeyCode::Char('m'), alt)));
+        assert!(is_menu_toggle(KeyEvent::new(
+            KeyCode::Modifier(ModifierKeyCode::LeftAlt),
+            alt
+        )));
+        assert!(is_menu_toggle(KeyEvent::new(
+            KeyCode::Modifier(ModifierKeyCode::RightAlt),
+            alt
+        )));
+        // A plain 'm' types; other modifier keys and function keys do not open
+        // the bar.
+        assert!(!is_menu_toggle(KeyEvent::new(KeyCode::Char('m'), none)));
+        assert!(!is_menu_toggle(KeyEvent::new(KeyCode::F(9), none)));
+        assert!(!is_menu_toggle(KeyEvent::new(
+            KeyCode::Modifier(ModifierKeyCode::LeftShift),
+            none
+        )));
+    }
+
+    fn menu_app() -> App {
+        use crate::input::Container;
+        // SEQUENCE { INTEGER 1234 }
+        let doc = [0x30, 0x04, 0x02, 0x02, 0x04, 0xD2];
+        App::new_single_file(
+            PathBuf::from("doc.der"),
+            PathBuf::from("/nonexistent/out"),
+            Container::Raw,
+            parse_forest(&doc, 0).unwrap(),
+            doc.len(),
+        )
+    }
+
+    #[test]
+    fn the_menu_bar_appears_in_the_top_row_and_navigates_with_the_arrow_keys() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let mut app = menu_app();
+        let mut term = Terminal::new(TestBackend::new(120, 24)).unwrap();
+        let key = |c| KeyEvent::new(c, event::KeyModifiers::NONE);
+
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let without = buffer_text(term.backend().buffer());
+        assert!(!without.contains("About"), "no menu bar until it is asked for");
+
+        app.toggle_menu_bar();
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let text = buffer_text(term.backend().buffer());
+        let top = text.lines().next().unwrap();
+        assert!(top.contains("File") && top.contains("About"), "menu bar row: {top:?}");
+        // The first heading opens with it, so ↑↓ work straight away.
+        assert!(text.contains("New DER"), "the File menu should be open:\n{text}");
+        assert!(text.contains("start an empty document"), "entries carry a summary");
+
+        // → opens the next heading, and the entry selection restarts there.
+        handle_menu_bar_key(&mut app, key(KeyCode::Right));
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let text = buffer_text(term.backend().buffer());
+        assert!(text.contains("Help") && text.contains("Version"), "About should be open:\n{text}");
+        assert!(!text.contains("New DER"), "only one drop-down at a time");
+        let Mode::MenuBar(ref bar) = app.mode else { panic!("still on the bar") };
+        assert_eq!((bar.menu, bar.item), (1, 0));
+
+        // ↓ moves within the drop-down, and both directions wrap.
+        handle_menu_bar_key(&mut app, key(KeyCode::Down));
+        let Mode::MenuBar(ref bar) = app.mode else { panic!("still on the bar") };
+        assert_eq!(bar.item, 1);
+        handle_menu_bar_key(&mut app, key(KeyCode::Down));
+        let Mode::MenuBar(ref bar) = app.mode else { panic!("still on the bar") };
+        assert_eq!(bar.item, 0, "the entry selection wraps");
+        handle_menu_bar_key(&mut app, key(KeyCode::Right));
+        let Mode::MenuBar(ref bar) = app.mode else { panic!("still on the bar") };
+        assert_eq!(bar.menu, 0, "the headings wrap too");
+
+        // Esc closes the bar and gives the panes their row back.
+        handle_menu_bar_key(&mut app, key(KeyCode::Esc));
+        assert!(matches!(app.mode, Mode::Browse));
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        assert_eq!(buffer_text(term.backend().buffer()), without);
+    }
+
+    #[test]
+    fn the_file_menu_asks_where_the_new_document_goes_and_creates_it_there() {
+        let dir = std::env::temp_dir().join(format!("ae-new-der-{}", std::process::id()));
+        std::fs::remove_dir_all(&dir).ok();
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("taken.der"), [0x05u8, 0x00]).unwrap();
+        let mut app = App::new_dir(dir.clone());
+        assert!(!app.file_open);
+        let key = |c| KeyEvent::new(c, event::KeyModifiers::NONE);
+        let type_in = |app: &mut App, text: &str| {
+            for c in text.chars() {
+                handle_new_file_key(app, key(KeyCode::Char(c)));
+            }
+        };
+
+        app.toggle_menu_bar();
+        app.activate_menu_entry(); // File ▸ New DER
+        let Mode::NewFile(ref state) = app.mode else { panic!("the path dialog opens") };
+        assert_eq!(state.path, "untitled.der", "a name the directory does not hold is offered");
+        assert!(!app.file_open, "nothing is created until the dialog is accepted");
+
+        // A name already taken is refused, with the reason, and the dialog stays.
+        for _ in 0..state.path.chars().count() {
+            handle_new_file_key(&mut app, key(KeyCode::Backspace));
+        }
+        type_in(&mut app, "taken.der");
+        handle_new_file_key(&mut app, key(KeyCode::Enter));
+        let Mode::NewFile(ref state) = app.mode else { panic!("the dialog stays open") };
+        assert!(state.error.as_ref().unwrap().contains("already exists"), "{:?}", state.error);
+        assert_eq!(std::fs::read(dir.join("taken.der")).unwrap(), [0x05, 0x00], "untouched");
+
+        // So is a name under a directory that does not exist.
+        for _ in 0..state.path.chars().count() {
+            handle_new_file_key(&mut app, key(KeyCode::Backspace));
+        }
+        type_in(&mut app, "no/such/dir/x.der");
+        handle_new_file_key(&mut app, key(KeyCode::Enter));
+        let Mode::NewFile(ref state) = app.mode else { panic!("the dialog stays open") };
+        assert!(
+            state.error.as_ref().unwrap().contains("not an existing directory"),
+            "{:?}",
+            state.error
+        );
+
+        // A usable path creates the file straight away…
+        for _ in 0..state.path.chars().count() {
+            handle_new_file_key(&mut app, key(KeyCode::Backspace));
+        }
+        type_in(&mut app, "fresh.der");
+        // The cursor is editable: put "my-" in front of the name.
+        handle_new_file_key(&mut app, key(KeyCode::Home));
+        type_in(&mut app, "my-");
+        let Mode::NewFile(ref state) = app.mode else { panic!("the dialog stays open") };
+        assert_eq!((state.path.as_str(), state.cursor), ("my-fresh.der", 3));
+        handle_new_file_key(&mut app, key(KeyCode::Enter));
+
+        assert!(matches!(app.mode, Mode::Browse));
+        let created = dir.join("my-fresh.der");
+        assert!(created.exists(), "the file is created at once: {}", app.status);
+        assert_eq!(app.out_path, created);
+        assert!(app.file_open && app.roots.is_empty() && !app.dirty);
+        // …and shows up in the Files pane, selected, without waiting for a poll.
+        assert_eq!(
+            app.browser.selected_entry().map(|e| e.path.clone()),
+            Some(created.clone()),
+            "the new file must be the browser's selection"
+        );
+        assert_eq!(app.focus, Focus::Document, "editing is what comes next");
+
+        // An empty document is navigable (it used to panic) and editable.
+        app.move_by(1);
+        app.move_by(-1);
+        app.start_insert(false);
+        assert!(matches!(app.mode, Mode::TypePicker(_)));
+        app.mode = Mode::Browse;
+        app.save();
+        assert!(!app.dirty, "{}", app.status);
+
+        // The empty file re-opens as the same empty document.
+        app.open_file(created).expect("an empty file is an empty forest");
+        assert!(app.roots.is_empty());
+
+        // An absolute path is taken as it stands, not joined to the directory.
+        let elsewhere = dir.join("sub");
+        std::fs::create_dir_all(&elsewhere).unwrap();
+        app.toggle_menu_bar();
+        app.activate_menu_entry();
+        let Mode::NewFile(ref state) = app.mode else { panic!("the path dialog opens") };
+        for _ in 0..state.path.chars().count() {
+            handle_new_file_key(&mut app, key(KeyCode::Backspace));
+        }
+        type_in(&mut app, &elsewhere.join("deep.der").display().to_string());
+        handle_new_file_key(&mut app, key(KeyCode::Enter));
+        assert_eq!(app.out_path, elsewhere.join("deep.der"));
+        assert!(app.out_path.exists());
+
+        // Esc abandons the dialog without creating anything.
+        app.toggle_menu_bar();
+        app.activate_menu_entry();
+        handle_new_file_key(&mut app, key(KeyCode::Esc));
+        assert!(matches!(app.mode, Mode::Browse));
+        assert!(!dir.join("untitled.der").exists());
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn the_about_menu_reports_how_this_binary_was_built() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let mut app = menu_app();
+        let key = |c| KeyEvent::new(c, event::KeyModifiers::NONE);
+        app.toggle_menu_bar();
+        handle_menu_bar_key(&mut app, key(KeyCode::Right)); // About
+        handle_menu_bar_key(&mut app, key(KeyCode::Down)); // Version
+        handle_menu_bar_key(&mut app, key(KeyCode::Enter));
+
+        let mut term = Terminal::new(TestBackend::new(120, 24)).unwrap();
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let text = buffer_text(term.backend().buffer());
+        assert!(text.contains("VERSION"), "the popup is titled:\n{text}");
+        // Whichever kind of build this is, it names itself the same way the
+        // version module does.
+        let id = crate::version::build_id();
+        let head = id.split(" + ").next().unwrap();
+        assert!(text.contains(head), "the build id {head:?} is missing:\n{text}");
+        // Any key dismisses it, as with the start-up notice.
+        app.dismiss_notice();
+        assert!(matches!(app.mode, Mode::Browse));
+    }
+
+    #[test]
+    fn the_help_window_lists_topics_and_scrolls_the_chosen_one() {
+        use ratatui::{backend::TestBackend, Terminal};
+        let mut app = menu_app();
+        let key = |c| KeyEvent::new(c, event::KeyModifiers::NONE);
+        app.toggle_menu_bar();
+        handle_menu_bar_key(&mut app, key(KeyCode::Right)); // About
+        handle_menu_bar_key(&mut app, key(KeyCode::Enter)); // Help
+        assert!(matches!(app.mode, Mode::Help(_)));
+
+        let mut term = Terminal::new(TestBackend::new(120, 26)).unwrap();
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let text = buffer_text(term.backend().buffer());
+        assert!(text.contains("HELP"));
+        // Every topic is listed on the left…
+        for topic in HELP_TOPICS {
+            assert!(text.contains(topic.title), "topic {:?} missing:\n{text}", topic.title);
+        }
+        // …and the first one's text is on the right.
+        assert!(text.contains("asn1-editor shows a BER/DER encoding as a tree"), "{text}");
+
+        // ↓ picks the next topic and starts its text at the top again.
+        handle_help_key(&mut app, key(KeyCode::PageDown));
+        let Mode::Help(ref help) = app.mode else { panic!("still in help") };
+        assert_eq!(help.scroll, 8);
+        handle_help_key(&mut app, key(KeyCode::Down));
+        let Mode::Help(ref help) = app.mode else { panic!("still in help") };
+        assert_eq!((help.topic, help.scroll), (1, 0));
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        assert!(buffer_text(term.backend().buffer()).contains("the directory tree"));
+
+        // Topics wrap, so ↑ from the first reaches the last — the key-binding
+        // tables, which are longer than any window.
+        handle_help_key(&mut app, key(KeyCode::Up));
+        handle_help_key(&mut app, key(KeyCode::Up));
+        let Mode::Help(ref help) = app.mode else { panic!("still in help") };
+        assert_eq!(help.topic, HELP_TOPICS.len() - 1);
+
+        // End clamps to the last screenful rather than scrolling past it.
+        handle_help_key(&mut app, key(KeyCode::End));
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        let Mode::Help(ref help) = app.mode else { panic!("still in help") };
+        let at_end = help.scroll;
+        assert!(at_end > 0 && at_end < usize::MAX, "the scroll must be clamped: {at_end}");
+        let bottom = buffer_text(term.backend().buffer());
+        assert!(bottom.contains("Esc cancels"), "the end of the topic:\n{bottom}");
+        handle_help_key(&mut app, key(KeyCode::PageDown));
+        term.draw(|f| draw(f, &mut app)).unwrap();
+        assert_eq!(buffer_text(term.backend().buffer()), bottom, "the end is the end");
+
+        handle_help_key(&mut app, key(KeyCode::Esc));
+        assert!(matches!(app.mode, Mode::Browse));
     }
 
     #[test]

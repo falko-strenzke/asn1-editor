@@ -36,5 +36,6 @@ pub mod pkcs8;
 pub mod spec;
 pub mod tui;
 pub mod verify;
+pub mod version;
 pub mod x509;
 pub mod xmss;

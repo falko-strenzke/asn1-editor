@@ -769,8 +769,431 @@ pub struct MenuState {
     pub selected: usize,
 }
 
+/// What a top-menu entry does when activated (see [`TOP_MENUS`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum TopMenuAction {
+    /// Start an empty document, to be filled in with the insert actions.
+    NewDer,
+    /// Write the open document — the same action as 's'.
+    Save,
+    /// Open the browsable help window.
+    Help,
+    /// Show how this binary was built (see `version.rs`).
+    Version,
+}
+
+/// One entry of a top menu's drop-down.
+pub struct TopMenuItem {
+    pub label: &'static str,
+    /// One-line explanation, shown beside the label.
+    pub desc: &'static str,
+    pub action: TopMenuAction,
+}
+
+/// One heading of the menu bar, with the entries it drops down.
+pub struct TopMenu {
+    pub label: &'static str,
+    pub items: &'static [TopMenuItem],
+}
+
+/// The menu bar's contents. It is deliberately small: everything here is also
+/// reachable by a key press, and the bar exists to make those actions
+/// discoverable rather than to become the primary way of driving the editor.
+pub const TOP_MENUS: &[TopMenu] = &[
+    TopMenu {
+        label: "File",
+        items: &[
+            TopMenuItem {
+                label: "New DER",
+                desc: "start an empty document",
+                action: TopMenuAction::NewDer,
+            },
+            TopMenuItem {
+                label: "Save",
+                desc: "write the open document to its output file",
+                action: TopMenuAction::Save,
+            },
+        ],
+    },
+    TopMenu {
+        label: "About",
+        items: &[
+            TopMenuItem {
+                label: "Help",
+                desc: "features and key bindings, by topic",
+                action: TopMenuAction::Help,
+            },
+            TopMenuItem {
+                label: "Version",
+                desc: "how this binary was built",
+                action: TopMenuAction::Version,
+            },
+        ],
+    },
+];
+
+/// State of the top menu bar ([`Mode::MenuBar`]): which heading is open and
+/// which of its entries is selected. The bar takes keyboard focus while it is
+/// shown, so both are always meaningful.
+pub struct MenuBarState {
+    /// Index into [`TOP_MENUS`].
+    pub menu: usize,
+    /// Index into that menu's `items`.
+    pub item: usize,
+}
+
+impl MenuBarState {
+    fn menu(&self) -> &'static TopMenu {
+        &TOP_MENUS[self.menu]
+    }
+
+    /// Move between headings, wrapping — the bar is short enough that wrapping
+    /// is quicker than stopping at the ends. The entry selection restarts at
+    /// the top of the newly opened drop-down.
+    pub fn move_menu(&mut self, delta: isize) {
+        let n = TOP_MENUS.len() as isize;
+        self.menu = (self.menu as isize + delta).rem_euclid(n) as usize;
+        self.item = 0;
+    }
+
+    /// Move within the open drop-down, wrapping.
+    pub fn move_item(&mut self, delta: isize) {
+        let n = self.menu().items.len() as isize;
+        self.item = (self.item as isize + delta).rem_euclid(n) as usize;
+    }
+
+    pub fn selected_action(&self) -> TopMenuAction {
+        self.menu().items[self.item].action
+    }
+}
+
+/// State of the "new file" dialog ([`Mode::NewFile`]): the path being typed,
+/// the cursor within it, and why the last attempt to create it was refused.
+///
+/// A relative path is resolved against the directory the browser is showing;
+/// an absolute one is taken as it stands.
+pub struct NewFileState {
+    pub path: String,
+    /// Cursor position as a char index into `path`.
+    pub cursor: usize,
+    pub error: Option<String>,
+}
+
+impl NewFileState {
+    /// The byte offset of char index `at`, or the end of the string.
+    fn byte_at(&self, at: usize) -> usize {
+        self.path.char_indices().nth(at).map(|(i, _)| i).unwrap_or(self.path.len())
+    }
+
+    pub fn insert_char(&mut self, c: char) {
+        if c.is_control() {
+            return;
+        }
+        let at = self.byte_at(self.cursor);
+        self.path.insert(at, c);
+        self.cursor += 1;
+        self.error = None;
+    }
+
+    pub fn backspace(&mut self) {
+        if self.cursor == 0 {
+            return;
+        }
+        let at = self.byte_at(self.cursor - 1);
+        self.path.remove(at);
+        self.cursor -= 1;
+        self.error = None;
+    }
+
+    /// Move the cursor, clamped to the text. `isize::MIN`/`MAX` jump to the
+    /// ends (Home/End).
+    pub fn move_cursor(&mut self, delta: isize) {
+        let len = self.path.chars().count() as isize;
+        self.cursor = (self.cursor as isize).saturating_add(delta).clamp(0, len) as usize;
+    }
+}
+
+/// One topic of the help window: a heading and its body paragraphs. An empty
+/// paragraph renders as a blank line; the rest are wrapped to the window.
+pub struct HelpTopic {
+    pub title: &'static str,
+    pub body: &'static [&'static str],
+}
+
+/// The help window's contents: the topic list on its left, in this order.
+pub const HELP_TOPICS: &[HelpTopic] = &[
+    HelpTopic {
+        title: "Overview",
+        body: &[
+            "asn1-editor shows a BER/DER encoding as a tree, explains each element, and lets \
+             you change it — down to individual content octets — and write the result back.",
+            "",
+            "It reads raw DER/BER, PEM, base64 and hex input. The container is remembered, so \
+             a file that came in as PEM is written back as PEM.",
+            "",
+            "Started with a FILE it opens exactly that file and nothing else (single-file \
+             mode): no directory is scanned, the Files pane is hidden, and the cross-file \
+             actions — relation arrows, re-signing, re-keying — are unavailable.",
+            "",
+            "Started with a DIRECTORY it shows that directory in the Files pane with no \
+             document loaded. Moving over a file previews it; Enter opens it. This is the mode \
+             in which the editor can relate files to each other.",
+            "",
+            "Two command-line options: '-d' / '--dump' prints a dumpasn1-style dump instead of \
+             starting the interface, and '-o FILE' / '--out FILE' writes edits to FILE instead \
+             of overwriting the input.",
+        ],
+    },
+    HelpTopic {
+        title: "Panes and focus",
+        body: &[
+            "Files (directory mode only) — the directory tree, with a status marker per file \
+             and arrows showing how the selected file relates to the others.",
+            "",
+            "Structure — the open document as a tree of ASN.1 elements.",
+            "",
+            "Content — everything known about the selected element: its type and, when a \
+             specification matched, the field it fills; the identifier and length octets \
+             broken out bit by bit; the decoded value; and finally a hex dump of the content \
+             octets.",
+            "",
+            "Tab moves the keyboard focus between the Files and Structure panes; the focused \
+             pane has a highlighted border. The Content pane never takes focus — it always \
+             follows the selection — but its scroll keys work from either pane.",
+            "",
+            "The bottom line is the status line: the result of the last action on the left, \
+             the key bindings for the current mode on the right.",
+        ],
+    },
+    HelpTopic {
+        title: "Moving around",
+        body: &[
+            "↑ / ↓ (or k / j) move the selection, PageUp / PageDown move by fifteen, and \
+             Home / g and End / G jump to the first and last row.",
+            "",
+            "→ / l expands a constructed element, or steps into it when it is already open; \
+             ← / h collapses it, or steps out to its parent. Enter and Space toggle.",
+            "",
+            "'/' in the Structure pane filters the tree: only matching elements and their \
+             ancestors stay visible, the rest collapse to a '[...]' placeholder. The text is \
+             read every way it could make sense — as hex bytes, as text, as an integer and as \
+             an OID — and whichever readings match are used. Bytes matched by the hex reading \
+             are highlighted in the Content pane's dump as well. Enter or Tab returns to the \
+             tree with the filter still set; Esc clears it.",
+            "",
+            "'/' in the Files pane searches the *contents* of the files in the directory and \
+             lists only those that match.",
+        ],
+    },
+    HelpTopic {
+        title: "The Content pane",
+        body: &[
+            "'[' and ']' scroll the Content pane by four lines; their shifted forms jump to \
+             the very beginning and the very end. The whole value is always shown — nothing is \
+             truncated, however large the element.",
+            "",
+            "Above the dump the pane explains what it can: the ASN.1 type, the matching \
+             specification field, the identifier and length octets bit by bit, the decoded \
+             value (integers in decimal however long, times, OIDs with their names), and, for \
+             a certificate or CRL, whether its signature verifies and whether a trusted path \
+             to an anchor exists.",
+            "",
+            "Recognised X.509 extensions — Basic Constraints, Key Usage, Extended Key Usage — \
+             are spelled out in plain language.",
+            "",
+            "XMSS and HSS/LMS public keys and signatures are broken into their components: \
+             the parameters encoded in their typecodes are resolved (hash, tree height, \
+             Winternitz width), each field takes one of two alternating colours in the dump, \
+             and the column on the right — where an ordinary dump shows the ASCII reading — \
+             names the fields beginning on each line.",
+        ],
+    },
+    HelpTopic {
+        title: "Editing values",
+        body: &[
+            "'e' edits the selected element. Which editor opens depends on the element: a \
+             number, an OID, a text string, a boolean or a date gets a field editor for that \
+             kind of value; anything else gets the hex editor over its content octets.",
+            "",
+            "'E' opens the editor chooser instead, so the same element can be edited as hex, \
+             as base64, as raw binary, or through a structured editor when one applies — for \
+             example \"As Key Usage\" on that extension.",
+            "",
+            "In every editor the first line shows live feedback on what the current text \
+             encodes to, Enter applies the change and Esc abandons it.",
+            "",
+            "Editing a certificate's subjectPublicKeyInfo with 'e' opens the re-keying \
+             dialog instead — see \"Signatures and keys\".",
+            "",
+            "Lengths are recomputed on save, so an edit that changes a value's size stays \
+             consistent all the way up the tree. Indefinite-length (BER) input is re-encoded \
+             with definite lengths.",
+        ],
+    },
+    HelpTopic {
+        title: "Changing structure",
+        body: &[
+            "'i' inserts a new element after the selected one; 'I' inserts one as its first \
+             child. Both open a type picker with one column per bit field of the identifier \
+             octet — class, primitive/constructed, tag number — so any tag can be built, not \
+             just the familiar ones. In an empty document 'i' creates the first element.",
+            "",
+            "'d' deletes the selected element and everything under it. It asks first: the \
+             second 'd' carries it out.",
+            "",
+            "'J' and 'K' move the selected element down and up among its siblings.",
+            "",
+            "'s' writes the document to its output file — the input file, or whatever '-o' \
+             named. Nothing is written to disk until then; 'q' warns once when there are \
+             unsaved changes and quits on the second press.",
+        ],
+    },
+    HelpTopic {
+        title: "Files and relations",
+        body: &[
+            "In directory mode the Files pane draws what it has worked out about the selected \
+             file's cryptographic relations to the others:",
+            "",
+            "An incoming arrow marks a file that signed the selection; an outgoing arrow \
+             marks a file the selection signed. A red arrow marks a claimed issuance whose \
+             signature does not actually verify. An undirected link joins a private key to \
+             the certificate holding its public key.",
+            "",
+            "These are computed by really verifying signatures, not by comparing names, so \
+             they show what the files cryptographically are rather than what they claim.",
+            "",
+            "'t' marks the selected certificate as a trust anchor, or un-marks it. Path \
+             validation of the open document runs against the set of anchors so marked, with \
+             both OpenSSL and Botan; the Content pane reports each verdict separately.",
+        ],
+    },
+    HelpTopic {
+        title: "Signatures and keys",
+        body: &[
+            "'z' on a modified certificate or CRL offers to re-sign it with a key you choose, \
+             so an edited object becomes valid again.",
+            "",
+            "'e' on a certificate's subjectPublicKeyInfo opens the re-keying dialog: pick an \
+             algorithm family and its parameters, generate a new key or use an existing one, \
+             name the file the new private key is written to, and choose which of the \
+             certificates and CRLs this certificate issued should be re-signed with it.",
+            "",
+            "Classical algorithms (RSA, ECDSA, EdDSA) and the NIST post-quantum signatures \
+             (ML-DSA, SLH-DSA) are handled by aws-lc-rs and OpenSSL. The stateful hash-based \
+             schemes — XMSS and HSS/LMS — go through Botan.",
+            "",
+            "A stateful key consumes a one-time key with every signature, and reusing one is \
+             catastrophic. The editor therefore writes the advanced key state back to the key \
+             file after signing with it. Do not keep copies of such a key file.",
+        ],
+    },
+    HelpTopic {
+        title: "Encrypted containers",
+        body: &[
+            "'z' on an encrypted PKCS#8 private key or a PKCS#12 file prompts for the \
+             password and shows the decrypted structure in place, marked as decrypted. \
+             Nothing decrypted is ever written back in the clear.",
+            "",
+            "A CMS EnvelopedData is decrypted from the same 'z' menu, using a recipient \
+             private key from the directory.",
+            "",
+            "Until a container is unlocked its contents appear as a placeholder row, and the \
+             Content pane says which key or password would open it.",
+        ],
+    },
+    HelpTopic {
+        title: "The menu bar",
+        body: &[
+            "The bar in the top row is toggled with Alt+M, and takes the keyboard focus while \
+             it is shown: ← and → pick a heading, ↑ and ↓ an entry, Enter runs it, and Esc — \
+             or Alt+M again — closes the bar.",
+            "",
+            "The Alt key on its own does the same, but only on terminals that report a bare \
+             modifier press to the program; most do not. F10 also works, unless the terminal \
+             keeps that key for itself. Alt+M is the one binding that is always available.",
+            "",
+            "\"File ▸ New DER\" asks for a path and creates an empty file there, which appears \
+             in the Files pane at once. A relative name lands in the directory being browsed; \
+             an absolute path is used as it stands. The name offered is one that does not \
+             already exist, and an existing file is never overwritten — the dialog says so and \
+             stays open. 'i' then inserts the document's first element.",
+            "",
+            "\"File ▸ Save\" is the same action as 's'.",
+            "",
+            "\"About ▸ Version\" distinguishes an official build, made from a tagged release \
+             and identified by its version number, from a general build, which has no version \
+             of its own and is identified by the commit it was built from.",
+        ],
+    },
+    HelpTopic {
+        title: "All key bindings",
+        body: &[
+            "Anywhere:",
+            "  Alt+M (or Alt, F10)   show/hide the menu bar",
+            "  Tab                   switch focus between the Files and Structure panes",
+            "  q                     quit (twice when there are unsaved changes)",
+            "  [ ]                   scroll the Content pane by four lines",
+            "  Shift+[  Shift+]      scroll the Content pane to the start / to the end",
+            "",
+            "Files pane:",
+            "  ↑ ↓ k j               move, PageUp/PageDown by fifteen, Home/g End/G to ends",
+            "  → l  ← h              open / close a directory",
+            "  Enter, Space          open the selected file",
+            "  t                     mark or unmark a certificate as a trust anchor",
+            "  z                     decrypt, or re-sign",
+            "  /                     search the files' contents",
+            "",
+            "Structure pane:",
+            "  ↑ ↓ k j               move, PageUp/PageDown by fifteen, Home/g End/G to ends",
+            "  → l  ← h              expand / collapse, or step in / out",
+            "  Enter, Space          toggle the selected element",
+            "  e                     edit the selected element",
+            "  E                     choose how to edit it",
+            "  i  I                  insert a sibling / a first child",
+            "  d d                   delete the selected element",
+            "  J  K                  move it down / up among its siblings",
+            "  s                     save",
+            "  z                     decrypt, or re-sign",
+            "  /                     filter the tree",
+            "",
+            "In dialogs and editors: Enter applies, Esc cancels.",
+            "",
+            "In the help window: ↑ ↓ choose a topic, PageUp/PageDown or [ ] scroll the text, \
+             Esc closes.",
+        ],
+    },
+];
+
+/// State of the help window ([`Mode::Help`]): the topic shown and how far its
+/// body is scrolled. Changing topic starts its body at the top again.
+pub struct HelpState {
+    pub topic: usize,
+    pub scroll: usize,
+}
+
+impl HelpState {
+    pub fn move_topic(&mut self, delta: isize) {
+        let n = HELP_TOPICS.len() as isize;
+        self.topic = (self.topic as isize + delta).rem_euclid(n) as usize;
+        self.scroll = 0;
+    }
+
+    /// Scroll the body. Like the content pane, the lower bound is applied here
+    /// and the upper one while drawing, where the window's height is known.
+    pub fn scroll_body(&mut self, delta: isize) {
+        self.scroll = (self.scroll as isize + delta).max(0) as usize;
+    }
+}
+
 pub enum Mode {
     Browse,
+    /// The top menu bar has keyboard focus: ←→ pick a heading, ↑↓ an entry,
+    /// Enter runs it, Esc (or the toggle key again) closes the bar.
+    MenuBar(MenuBarState),
+    /// The browsable help window (menu "About ▸ Help").
+    Help(HelpState),
+    /// Path prompt of the menu's "File ▸ New DER" entry.
+    NewFile(NewFileState),
     /// Type-picker popup of the insert and retag actions.
     TypePicker(PickerState),
     /// Edit-mode chooser popup ('E').
@@ -833,6 +1256,9 @@ pub struct ProgressState {
 pub struct NoticeState {
     pub title: String,
     pub lines: Vec<String>,
+    /// Whether the lines report problems — drawn as red bullets — or are
+    /// plain informational text, as the "Version" entry's are.
+    pub warning: bool,
 }
 
 /// One signed object (certificate or CRL) issued by the certificate being
@@ -3830,7 +4256,7 @@ impl App {
             errors.len(),
             if errors.len() == 1 { "" } else { "s" }
         );
-        self.mode = Mode::Notice(NoticeState { title, lines: errors });
+        self.mode = Mode::Notice(NoticeState { title, lines: errors, warning: true });
     }
 
     /// Dismiss the start-up notice popup, returning to normal browsing.
@@ -3838,6 +4264,140 @@ impl App {
         if matches!(self.mode, Mode::Notice(_)) {
             self.mode = Mode::Browse;
         }
+    }
+
+    // -- the top menu bar -------------------------------------------------
+
+    /// Show or hide the menu bar (the Alt key). Showing it gives it the
+    /// keyboard focus; hiding it returns to browsing. Any other mode — a
+    /// dialog, an editor — is left alone: the caller only offers the toggle
+    /// where it makes sense.
+    pub fn toggle_menu_bar(&mut self) {
+        match self.mode {
+            // Closing leaves the status line alone: it still holds the result
+            // of whatever was done before the bar was opened.
+            Mode::MenuBar(_) => self.mode = Mode::Browse,
+            Mode::Browse => {
+                self.mode = Mode::MenuBar(MenuBarState { menu: 0, item: 0 });
+            }
+            _ => {}
+        }
+    }
+
+    /// Run the selected menu entry and close the bar.
+    pub fn activate_menu_entry(&mut self) {
+        let Mode::MenuBar(ref bar) = self.mode else { return };
+        let action = bar.selected_action();
+        self.mode = Mode::Browse;
+        match action {
+            TopMenuAction::NewDer => self.start_new_der(),
+            TopMenuAction::Save => self.save(),
+            TopMenuAction::Help => self.mode = Mode::Help(HelpState { topic: 0, scroll: 0 }),
+            TopMenuAction::Version => {
+                self.mode = Mode::Notice(NoticeState {
+                    title: " VERSION ".to_string(),
+                    lines: crate::version::describe(),
+                    warning: false,
+                })
+            }
+        }
+    }
+
+    /// Leave the help window.
+    pub fn close_help(&mut self) {
+        if matches!(self.mode, Mode::Help(_)) {
+            self.mode = Mode::Browse;
+        }
+    }
+
+    /// "File ▸ New DER": ask where the new document should live. The field is
+    /// filled in with the first `untitled….der` the directory does not already
+    /// hold, so accepting it as offered cannot collide with an existing file.
+    pub fn start_new_der(&mut self) {
+        let suggestion = unused_path(&self.browser.root, "untitled", "der");
+        let path = suggestion
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "untitled.der".to_string());
+        let cursor = path.chars().count();
+        self.mode = Mode::NewFile(NewFileState { path, cursor, error: None });
+    }
+
+    pub fn cancel_new_der(&mut self) {
+        if matches!(self.mode, Mode::NewFile(_)) {
+            self.mode = Mode::Browse;
+        }
+    }
+
+    /// The directory a relative path in the new-file dialog resolves against.
+    pub fn new_file_dir(&self) -> &Path {
+        &self.browser.root
+    }
+
+    /// Create the file the new-file dialog names and open it as an empty
+    /// document. The file is created *now*, not at the first save: that is
+    /// what makes it appear in the browser straight away, and creating it
+    /// exclusively is also how the path is validated — an unwritable
+    /// directory or a name already taken is reported by the attempt itself
+    /// rather than guessed at beforehand. A refusal leaves the dialog open
+    /// with the reason under the field.
+    pub fn commit_new_der(&mut self) {
+        let Mode::NewFile(ref state) = self.mode else { return };
+        let typed = state.path.trim().to_string();
+        if typed.is_empty() {
+            self.set_new_file_error("enter a name for the new file".to_string());
+            return;
+        }
+        // Joining an absolute path replaces the base, so an absolute entry is
+        // taken as it stands and a relative one lands in the browser's
+        // directory.
+        let path = self.browser.root.join(&typed);
+        if let Err(reason) = create_empty_file(&path) {
+            self.set_new_file_error(reason);
+            return;
+        }
+        self.mode = Mode::Browse;
+        self.open_empty_document(path);
+    }
+
+    fn set_new_file_error(&mut self, reason: String) {
+        if let Mode::NewFile(ref mut state) = self.mode {
+            state.error = Some(reason);
+        }
+    }
+
+    /// Adopt the (just created, empty) file at `path` as the open document.
+    fn open_empty_document(&mut self, path: PathBuf) {
+        self.path = path.clone();
+        self.out_path = path.clone();
+        self.container = Container::Raw;
+        self.roots = Vec::new();
+        self.total_len = 0;
+        self.selected = 0;
+        self.content_scroll = 0;
+        self.file_open = true;
+        // The empty file on disk *is* this empty document, so there is nothing
+        // unsaved yet.
+        self.dirty = false;
+        self.quit_confirm = false;
+        self.delete_confirm = false;
+        self.decrypted = None;
+        self.pkcs12 = None;
+        self.cms_reveal = None;
+        self.ident = None;
+        self.sig_status = None;
+        self.path_status = None;
+        self.path_status_botan = None;
+        self.rebuild_rows();
+        // Show it in the browser at once rather than at the next filesystem
+        // poll, and move the browser's selection onto it — otherwise the next
+        // ↑↓ there would preview a different file over this one.
+        self.refresh_filesystem();
+        self.browser.select_path(&path);
+        self.recompute_browser_relations();
+        // Editing is what comes next, so the tree gets the focus.
+        self.focus = Focus::Document;
+        self.status = format!("created {} — 'i' inserts the first element", path.display());
     }
 
     /// '/' in the tree view: give the tree-filter field keyboard focus.
@@ -4276,6 +4836,11 @@ impl App {
     }
 
     pub fn move_by(&mut self, delta: isize) {
+        // An empty document (a new one, before its first element is inserted)
+        // has nothing to move between — and no valid clamp range either.
+        if self.rows.is_empty() {
+            return;
+        }
         let i = self.selected as isize + delta;
         self.select(i.clamp(0, self.rows.len() as isize - 1) as usize);
     }
@@ -5425,6 +5990,43 @@ fn file_name_string(path: &Path) -> String {
 /// document's path against those scanned paths, so the two must be in the same
 /// form. A path with no file component (e.g. a filesystem root) is returned
 /// unchanged, paired with `.`.
+/// `<dir>/<stem>.<ext>`, or the first `<stem>-<n>.<ext>` that does not exist —
+/// so a new document gets a name that saving cannot collide with. A directory
+/// that cannot be inspected yields the plain name; the save then reports the
+/// real error rather than this function guessing at one.
+fn unused_path(dir: &Path, stem: &str, ext: &str) -> PathBuf {
+    let plain = dir.join(format!("{}.{}", stem, ext));
+    if !plain.exists() {
+        return plain;
+    }
+    (1..)
+        .map(|n| dir.join(format!("{}-{}.{}", stem, n, ext)))
+        .find(|p| !p.exists())
+        .expect("an unused name exists in an unbounded sequence")
+}
+
+/// Create `path` as an empty file, failing if anything already occupies it.
+/// An empty file is a valid (if trivial) BER encoding — a forest of zero
+/// elements — so it re-opens as the same empty document it started as.
+fn create_empty_file(path: &Path) -> Result<(), String> {
+    if path.file_name().is_none() {
+        return Err(format!("{} is not a file name", path.display()));
+    }
+    let parent = path.parent().filter(|p| !p.as_os_str().is_empty()).unwrap_or(Path::new("."));
+    if !parent.is_dir() {
+        return Err(format!("{} is not an existing directory", parent.display()));
+    }
+    std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .map(|_| ())
+        .map_err(|e| match e.kind() {
+            std::io::ErrorKind::AlreadyExists => format!("{} already exists", path.display()),
+            _ => format!("cannot create {}: {}", path.display(), e),
+        })
+}
+
 fn normalize_file_path(path: &Path) -> (PathBuf, PathBuf) {
     let dir = path
         .parent()

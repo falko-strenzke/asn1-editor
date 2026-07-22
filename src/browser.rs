@@ -131,16 +131,27 @@ impl FileBrowser {
             let selected_path = self.selected_entry().map(|e| e.path.clone());
             self.rebuild_rows();
             if let Some(path) = selected_path {
-                if let Some(i) = self
-                    .rows
-                    .iter()
-                    .position(|r| entry_at(&self.entries, &r.path).map(|e| &e.path) == Some(&path))
-                {
-                    self.select(i);
-                }
+                self.select_path(&path);
             }
         }
         changed
+    }
+
+    /// Put the selection on the row showing `path`, if one does. Returns
+    /// whether it was found — a path filtered out, or under a collapsed
+    /// directory, has no row to select.
+    pub fn select_path(&mut self, path: &Path) -> bool {
+        let found = self
+            .rows
+            .iter()
+            .position(|r| entry_at(&self.entries, &r.path).map(|e| e.path.as_path()) == Some(path));
+        match found {
+            Some(i) => {
+                self.select(i);
+                true
+            }
+            None => false,
+        }
     }
 
     fn rebuild_rows(&mut self) {
@@ -160,13 +171,7 @@ impl FileBrowser {
         self.filter = filter;
         self.rebuild_rows();
         if let Some(path) = selected_path {
-            if let Some(i) = self
-                .rows
-                .iter()
-                .position(|r| entry_at(&self.entries, &r.path).map(|e| &e.path) == Some(&path))
-            {
-                self.select(i);
-            }
+            self.select_path(&path);
         }
     }
 
